@@ -1,0 +1,19 @@
+# macOS
+.DS_Store
+
+# Build output
+build/
+*.dSYM/
+
+# Editor
+.vscode/
+.idea/
+
+# Agent rules live in global config, never in the repo
+CLAUDE.md
+AGENTS.md
+GEMINI.md
+
+# /brag launch video output
+brag-output/
+brag-output-*/
