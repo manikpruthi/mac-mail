@@ -293,9 +293,14 @@ final class Store {
             }
             guard !listed.isEmpty, listed.contains(where: { $0.role == .inbox }) else { return }
             var stale: [Int64] = []
+            var cached = 0
             db.query("SELECT id, path FROM folders WHERE account=?", [account]) {
+                cached += 1
                 if !keep.contains($0.text(1)) { stale.append($0.int64(0)) }
             }
+            // A partial LIST (truncated or glitching server) can drop most of the cache in one reply;
+            // if more than half the folders vanished, keep them and wait for a good reply.
+            guard stale.count * 2 <= cached else { return }
             for id in stale {
                 db.run("DELETE FROM pending_ops WHERE folder_id=?", [id])
                 // Explicit delete so the FTS/contacts triggers run for every message (B-14).
@@ -385,8 +390,12 @@ final class Store {
             db.run("UPDATE pending_ops SET arg=? WHERE kind='move' AND account=? AND arg=?", [path, account, oldPath])
             guard !delim.isEmpty else { return }
             var children: [(id: Int64, path: String)] = []
-            db.query("SELECT id, path FROM folders WHERE account=? AND path LIKE ? ESCAPE '\\' AND id!=?",
-                     [account, likePrefix(oldPath + delim), id]) { children.append(($0.int64(0), $0.text(1))) }
+            // LIKE is case-insensitive for ASCII ('work/x' would match 'Work'), so the prefix is
+            // matched case-sensitively in Swift instead.
+            db.query("SELECT id, path FROM folders WHERE account=? AND id!=?",
+                     [account, id]) {
+                if $0.text(1).hasPrefix(oldPath + delim) { children.append(($0.int64(0), $0.text(1))) }
+            }
             for child in children {
                 let newChild = path + String(child.path.dropFirst(oldPath.count))
                 db.run("UPDATE folders SET path=? WHERE id=?", [newChild, child.id])
@@ -648,10 +657,18 @@ final class Store {
 
     /// Removes cached bodies that came back empty for messages that clearly have content, so they're fetched again.
     func repairEmptyBodies() {
-        db.run("""
-            DELETE FROM bodies WHERE (html IS NULL OR html = '') AND (text IS NULL OR text = '')
-            AND message_id IN (SELECT id FROM messages WHERE size > 2000)
-            """)
+        db.transaction {
+            // body_fts rows must go with their bodies, or search keeps matching text that is gone.
+            db.run("""
+                DELETE FROM body_fts WHERE rowid IN (
+                    SELECT message_id FROM bodies WHERE (html IS NULL OR html = '') AND (text IS NULL OR text = '')
+                    AND message_id IN (SELECT id FROM messages WHERE size > 2000))
+                """)
+            db.run("""
+                DELETE FROM bodies WHERE (html IS NULL OR html = '') AND (text IS NULL OR text = '')
+                AND message_id IN (SELECT id FROM messages WHERE size > 2000)
+                """)
+        }
     }
 
     /// The prune cutoff: exactly the offline window from Settings, no hidden grace period (B-36).
@@ -818,14 +835,6 @@ final class Store {
         guard !tokens.isEmpty else { conds.append("0"); return }
         conds.append("m.id IN (SELECT rowid FROM fts WHERE fts MATCH ?)")
         args.append(columns + " : (" + tokens.map { "\"\($0)\"*" }.joined(separator: " AND ") + ")")
-    }
-
-    /// LIKE pattern for "starts with", wildcards escaped (used to find the children of a renamed folder).
-    private func likePrefix(_ prefix: String) -> String {
-        var v = prefix.replacingOccurrences(of: "\\", with: "\\\\")
-        v = v.replacingOccurrences(of: "%", with: "\\%")
-        v = v.replacingOccurrences(of: "_", with: "\\_")
-        return v + "%"
     }
 
     func contacts(matching prefix: String, limit: Int = 8) -> [EmailAddress] {

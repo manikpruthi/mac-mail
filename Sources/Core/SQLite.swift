@@ -140,14 +140,26 @@ final class SQLiteDB {
     /// Runs `body` as one transaction. If any statement inside it failed, the whole batch is rolled back:
     /// a half-applied write is worse than none at all (C-10).
     func transaction(_ body: () -> Void) {
-        do { try exec("BEGIN IMMEDIATE") } catch { logError("BEGIN", error.localizedDescription) }
+        do { try exec("BEGIN IMMEDIATE") } catch {
+            logError("BEGIN", error.localizedDescription)
+            // No transaction is open, so the body must not run in autocommit: report the failure
+            // through the same flag a failed statement sets.
+            failedWrite = true
+            return
+        }
         failedWrite = false
         body()
         if failedWrite {
             failedWrite = false
             do { try exec("ROLLBACK") } catch { logError("ROLLBACK", error.localizedDescription) }
         } else {
-            do { try exec("COMMIT") } catch { logError("COMMIT", error.localizedDescription) }
+            do { try exec("COMMIT") } catch {
+                logError("COMMIT", error.localizedDescription)
+                // A failed COMMIT leaves the transaction open: roll back so the next
+                // transaction doesn't silently join it.
+                do { try exec("ROLLBACK") } catch { logError("ROLLBACK", error.localizedDescription) }
+                failedWrite = true
+            }
         }
     }
 

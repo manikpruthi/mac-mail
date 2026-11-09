@@ -595,6 +595,73 @@ MainActor.assumeIsolated {
           && store.folder(account: "r", path: "Work/Sub") == nil)
 }
 
+// F-04: a failed BEGIN must not run the body in autocommit (and a failed COMMIT must roll back).
+do {
+    let db = try SQLiteDB(path: scratchDir("sqlite-beg").appendingPathComponent("t.sqlite").path)
+    try db.exec("CREATE TABLE t(a INTEGER)")
+    // The nested BEGIN fails because a transaction is already open; the nested body must not run.
+    db.transaction {
+        db.transaction {
+            _ = db.run("INSERT INTO t VALUES (1)")
+        }
+    }
+    check("failed BEGIN skips body", (db.scalarInt("SELECT COUNT(*) FROM t") ?? -1) == 0)
+}
+
+// F-11: a partial LIST that drops more than half the cached folders must not cascade-delete them.
+MainActor.assumeIsolated {
+    guard let store = try? Store(path: scratchDir("upsert-\(UUID().uuidString)").appendingPathComponent("s.sqlite").path) else {
+        check("upsert store opens", false); return
+    }
+    store.upsertFolders(account: "f", [ListedFolder(path: "INBOX", delimiter: "/", attributes: []),
+                                       ListedFolder(path: "A", delimiter: "/", attributes: []),
+                                       ListedFolder(path: "B", delimiter: "/", attributes: []),
+                                       ListedFolder(path: "C", delimiter: "/", attributes: [])], isGmail: false)
+    store.upsertFolders(account: "f", [ListedFolder(path: "INBOX", delimiter: "/", attributes: [])], isGmail: false)
+    check("partial LIST keeps folders", store.folder(account: "f", path: "A") != nil && store.folder(account: "f", path: "C") != nil)
+    store.upsertFolders(account: "f", [ListedFolder(path: "INBOX", delimiter: "/", attributes: []),
+                                       ListedFolder(path: "A", delimiter: "/", attributes: []),
+                                       ListedFolder(path: "B", delimiter: "/", attributes: [])], isGmail: false)
+    check("normal LIST prunes stale folder", store.folder(account: "f", path: "C") == nil)
+}
+
+// F-22: repairEmptyBodies must drop the matching body_fts rows, not just the bodies.
+MainActor.assumeIsolated {
+    guard let store = try? Store(path: scratchDir("repair-\(UUID().uuidString)").appendingPathComponent("s.sqlite").path) else {
+        check("repair store opens", false); return
+    }
+    store.upsertFolders(account: "q", [ListedFolder(path: "INBOX", delimiter: "/", attributes: [])], isGmail: false)
+    guard let qin = store.folder(account: "q", role: .inbox) else { check("repair folder", false); return }
+    let big = ParsedHeader(uid: 1, gmailID: 0, threadID: 1, date: Date(), size: 3000, flags: [], subject: "big",
+                           from: EmailAddress(name: "a", email: "a@x.com"), toList: "", ccList: "", replyTo: "",
+                           messageID: "", inReplyTo: "", references: "", listUnsubscribe: "", structureJSON: nil,
+                           hasAttachments: false)
+    store.insert(folderID: qin.id, [big])
+    guard let mid = store.messageID(folderID: qin.id, uid: 1) else { check("repair message", false); return }
+    store.saveBody(mid, html: "<p>indexed words</p>", text: nil)
+    _ = store.db.run("UPDATE bodies SET html='', text='' WHERE message_id=?", [mid])
+    store.repairEmptyBodies()
+    check("repair drops fts with body", store.body(mid) == nil
+          && (store.db.scalarInt("SELECT COUNT(*) FROM body_fts WHERE rowid=?", [mid]) ?? -1) == 0)
+}
+
+// F-31: renaming 'Work' must not swallow a sibling 'work' (LIKE is case-insensitive for ASCII).
+MainActor.assumeIsolated {
+    guard let store = try? Store(path: scratchDir("rename-case-\(UUID().uuidString)").appendingPathComponent("s.sqlite").path) else {
+        check("rename-case store opens", false); return
+    }
+    store.upsertFolders(account: "rc", [ListedFolder(path: "INBOX", delimiter: "/", attributes: []),
+                                        ListedFolder(path: "Work", delimiter: "/", attributes: []),
+                                        ListedFolder(path: "work", delimiter: "/", attributes: []),
+                                        ListedFolder(path: "Work/Sub", delimiter: "/", attributes: [])], isGmail: false)
+    guard let w = store.folder(account: "rc", path: "Work"), let lower = store.folder(account: "rc", path: "work") else {
+        check("rename-case folders", false); return
+    }
+    store.renameFolder(w.id, path: "Work2", name: "Work2")
+    check("rename is case-sensitive", store.folder(account: "rc", path: "work")?.id == lower.id
+          && store.folder(account: "rc", path: "Work2/Sub") != nil)
+}
+
 // W-02 / X-store-9: header filters go through the FTS index; unsearchable words don't hide the rest.
 MainActor.assumeIsolated {
     guard let store = try? Store(path: scratchDir("fts-\(UUID().uuidString)").appendingPathComponent("s.sqlite").path) else {
