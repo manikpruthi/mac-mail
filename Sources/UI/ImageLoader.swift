@@ -18,8 +18,21 @@ final class ImagePage {
     var forced: Set<Int> = []
     var bytesLoaded = 0
     var blocked: [Int: Int] = [:]   // id → bytes (0 if unknown)
+    /// Requests already started for this page (budget is reserved before contacting a host).
+    var requestsStarted = 0
+    var hostRequests: [String: Int] = [:]
     /// Dark placeholders when the page is shown in dark mode.
     var dark = false
+
+    private var cidParts: [String: BodyPart?] = [:]
+
+    /// cid → part, resolved once per message (the detail row and BODYSTRUCTURE JSON are not re-fetched per image).
+    func part(forCID cid: String) -> BodyPart? {
+        if let hit = cidParts[cid] { return hit }
+        let part = MailService.shared.store.detail(messageID)?.structure?.part(withContentID: cid)
+        cidParts[cid] = part
+        return part
+    }
 
     init(generation: Int, messageID: Int64, accountID: String, prepared: PreparedHTML, autoLoad: Bool, ignoreLimits: Bool) {
         self.generation = generation
@@ -43,6 +56,16 @@ final class ImageLoader: NSObject, WKURLSchemeHandler {
     var markBlocked: ((Int) -> Void)?
 
     private var active: [ObjectIdentifier: Task<Void, Never>] = [:]
+    /// No redirects at all: images must come straight from the https host named in the HTML.
+    private final class RedirectBlocker: NSObject, URLSessionDataDelegate {
+        func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse,
+                        newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) {
+            completionHandler(nil)
+        }
+    }
+    private static let redirectBlocker = RedirectBlocker()
+    private static let maxRequestsPerPage = 40
+    private static let maxRequestsPerHost = 8
     private let session: URLSession = {
         let c = URLSessionConfiguration.ephemeral
         c.urlCache = nil
@@ -50,7 +73,7 @@ final class ImageLoader: NSObject, WKURLSchemeHandler {
         c.timeoutIntervalForRequest = 20
         c.httpMaximumConnectionsPerHost = 4
         c.httpAdditionalHeaders = ["User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) MacMail/1.0", "Accept": "image/*,*/*;q=0.5"]
-        return URLSession(configuration: c)
+        return URLSession(configuration: c, delegate: ImageLoader.redirectBlocker, delegateQueue: nil)
     }()
 
     func webView(_ webView: WKWebView, start task: WKURLSchemeTask) {
@@ -105,8 +128,7 @@ final class ImageLoader: NSObject, WKURLSchemeHandler {
 
     private func loadCID(id: Int, page: ImagePage) async -> (Data, String) {
         guard let cid = page.prepared.cids[id],
-              let detail = MailService.shared.store.detail(page.messageID),
-              let part = detail.structure?.part(withContentID: cid),
+              let part = page.part(forCID: cid),
               let engine = MailService.shared.engine(page.accountID),
               let raw = try? await engine.partData(messageID: page.messageID, partID: part.partID) else {
             return (Self.transparentGIF, "image/gif")
@@ -122,49 +144,140 @@ final class ImageLoader: NSObject, WKURLSchemeHandler {
         if !page.autoLoad && !forced {
             return hold(id: id, bytes: 0, isBackground: isBackground, page: page)
         }
+        // Only https to a named host: plain http is never contacted (ATS enforces the same).
+        guard url.scheme?.lowercased() == "https", let host = url.host, !host.isEmpty else {
+            Debug.log("image rejected non-https \(url)")
+            return (Self.transparentGIF, "image/gif")
+        }
         if let cached = Self.cached(url) { return cached }
 
         let perImage = Prefs.imageMaxBytes
         let perMessage = Prefs.imageMessageMaxBytes
         let unlimited = forced || page.ignoreLimits
+        // Budget and request caps are reserved before contacting the host, so a crafted message can't
+        // queue unlimited fetches; user-forced images still get through.
+        if !unlimited {
+            guard page.requestsStarted < Self.maxRequestsPerPage,
+                  (page.hostRequests[host] ?? 0) < Self.maxRequestsPerHost,
+                  page.bytesLoaded < perMessage else {
+                return hold(id: id, bytes: 0, isBackground: isBackground, page: page)
+            }
+            page.requestsStarted += 1
+            page.hostRequests[host, default: 0] += 1
+        }
+        if await Self.resolvesToPrivateAddress(host) {
+            Debug.log("image blocked \(url) (private address)")
+            return (Self.transparentGIF, "image/gif")
+        }
         do {
-            let (bytes, response) = try await session.bytes(from: url)
+            let (byteStream, response) = try await session.bytes(from: url)
             // Error pages (404, 403, HTML) must not be handed to WebKit as images.
             let status = (response as? HTTPURLResponse)?.statusCode ?? 200
             let type = response.mimeType?.lowercased() ?? ""
             guard (200..<300).contains(status), type.hasPrefix("image/") || type == "application/octet-stream" || type.isEmpty else {
-                bytes.task.cancel()
+                byteStream.task.cancel()
                 Debug.log("image rejected \(url) status=\(status) type=\(type)")
                 return (Self.transparentGIF, "image/gif")
             }
             let expected = Int(response.expectedContentLength)
             if !unlimited {
                 if expected > perImage || (expected > 0 && page.bytesLoaded + expected > perMessage) {
-                    bytes.task.cancel()
+                    byteStream.task.cancel()
                     return hold(id: id, bytes: expected, isBackground: isBackground, page: page)
                 }
             }
-            var data = Data()
-            if expected > 0 { data.reserveCapacity(min(expected, 32 * 1_048_576)) }
             let hardCap = unlimited ? 40 * 1_048_576 : perImage
-            for try await b in bytes {
-                data.append(b)
-                if data.count > hardCap {
+            // The byte stream is consumed off the main actor, buffered into 64 KB chunks —
+            // per-element awaits would otherwise stall the UI for seconds on a few MB.
+            enum Download { case ok(Data); case overCap(Int) }
+            let outcome = try await Task.detached(priority: .userInitiated) { () -> Download in
+                var data = Data()
+                if expected > 0 { data.reserveCapacity(min(expected, 32 * 1_048_576)) }
+                let bytes = byteStream
+                var chunk = Data()
+                chunk.reserveCapacity(65_536)
+                do {
+                    for try await b in bytes {
+                        chunk.append(b)
+                        if chunk.count >= 65_536 {
+                            data.append(chunk)
+                            chunk.removeAll(keepingCapacity: true)
+                            if data.count > hardCap { bytes.task.cancel(); return .overCap(data.count) }
+                        }
+                    }
+                } catch {
                     bytes.task.cancel()
+                    throw error
+                }
+                data.append(chunk)
+                return .ok(data)
+            }.value
+            switch outcome {
+            case .overCap(let size):
+                return hold(id: id, bytes: size, isBackground: isBackground, page: page)
+            case .ok(let data):
+                if !unlimited && page.bytesLoaded + data.count > perMessage {
                     return hold(id: id, bytes: data.count, isBackground: isBackground, page: page)
                 }
+                page.bytesLoaded += data.count
+                let mime = type.hasPrefix("image/") ? type : "image/jpeg"
+                let result = await Self.processed(data, fallbackMime: mime)
+                Self.store(url, result)
+                return result
             }
-            if !unlimited && page.bytesLoaded + data.count > perMessage {
-                return hold(id: id, bytes: data.count, isBackground: isBackground, page: page)
-            }
-            page.bytesLoaded += data.count
-            let mime = type.hasPrefix("image/") ? type : "image/jpeg"
-            let result = await Self.processed(data, fallbackMime: mime)
-            Self.store(url, result)
-            return result
         } catch {
             Debug.log("image fetch failed \(url): \(error)")
             return (Self.transparentGIF, "image/gif")
+        }
+    }
+
+    // MARK: Private-address filtering (SSRF)
+
+    /// True if any address the host resolves to is loopback, link-local, private, CGNAT or unroutable.
+    nonisolated private static func resolvesToPrivateAddress(_ host: String) async -> Bool {
+        await Task.detached(priority: .userInitiated) {
+            var info: UnsafeMutablePointer<addrinfo>?
+            // Unresolvable hosts fail closed.
+            guard getaddrinfo(host, nil, nil, &info) == 0, let first = info else { return true }
+            defer { freeaddrinfo(first) }
+            var cur: UnsafeMutablePointer<addrinfo>? = first
+            while let p = cur {
+                let addr = p.pointee.ai_addr
+                if let addr {
+                    let len = Int(addr.pointee.sa_len)
+                    if len >= 8, isBlockedAddress(Array(UnsafeRawBufferPointer(start: addr, count: len))) { return true }
+                }
+                cur = p.pointee.ai_next
+            }
+            return false
+        }.value
+    }
+
+    /// `b` is a raw sockaddr: byte 0 is sa_len, byte 1 sa_family (Darwin layout).
+    nonisolated private static func isBlockedAddress(_ b: [UInt8]) -> Bool {
+        guard b.count > 1 else { return true }
+        switch b[1] {
+        case 2: // AF_INET
+            guard b.count >= 8 else { return true }
+            let a0 = b[4], a1 = b[5]
+            if a0 == 0 || a0 == 10 || a0 == 127 { return true }
+            if a0 == 169 && a1 == 254 { return true }            // link-local
+            if a0 == 172 && (a1 & 0xF0) == 16 { return true }    // 172.16/12
+            if a0 == 192 && a1 == 168 { return true }
+            if a0 == 100 && (a1 & 0xC0) == 64 { return true }    // CGNAT 100.64/10
+            return false
+        case 30: // AF_INET6
+            guard b.count >= 24 else { return true }
+            let a = Array(b[8...23])
+            if a.prefix(15).allSatisfy({ $0 == 0 }) { return true } // :: and ::1
+            if a[0] == 0xfe && (a[1] & 0xC0) == 0x80 { return true } // fe80::/10 link-local
+            if (a[0] & 0xFE) == 0xFC { return true }                 // fc00::/7 unique local
+            if a.prefix(10).allSatisfy({ $0 == 0 }), a[10] == 0xff, a[11] == 0xff { // ::ffff:v4
+                return isBlockedAddress([8, 2, 0, 0, a[12], a[13], a[14], a[15]])
+            }
+            return false
+        default:
+            return true
         }
     }
 
@@ -189,7 +302,9 @@ final class ImageLoader: NSObject, WKURLSchemeHandler {
             let w = props[kCGImagePropertyPixelWidth] as? Int ?? 0
             let h = props[kCGImagePropertyPixelHeight] as? Int ?? 0
             if w > 0, h > 0, w * h <= 4 { return (transparentGIF, "image/gif") }
-            if CGImageSourceGetCount(src) > 1 || max(w, h) <= Prefs.imageMaxPixels { return (data, mime) }
+            // Within the pixel budget everything passes through, animated images included. Anything larger —
+            // animated or not — is downsampled from frame 0 so a huge GIF never decodes at full size.
+            if max(w, h) <= Prefs.imageMaxPixels { return (data, mime) }
             let opts: [CFString: Any] = [
                 kCGImageSourceCreateThumbnailFromImageAlways: true,
                 kCGImageSourceCreateThumbnailWithTransform: true,

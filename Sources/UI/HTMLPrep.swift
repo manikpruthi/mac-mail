@@ -13,20 +13,32 @@ struct PreparedHTML {
 }
 
 enum HTMLPrep {
-    private static let activeContent = try! NSRegularExpression(
-        pattern: "<(script|iframe|object|embed|applet|form)\\b[^>]*>.*?</\\1\\s*>|<(script|iframe|object|embed|meta\\s+http-equiv|base|link)\\b[^>]*>",
-        options: [.caseInsensitive, .dotMatchesLineSeparators])
-    private static let imgTag = try! NSRegularExpression(pattern: "<img\\b[^>]*>", options: [.caseInsensitive])
+    private static let imgTag = try! NSRegularExpression(pattern: "<(?:img|image|input)\\b[^>]*>", options: [.caseInsensitive])
+    // Attributes may follow "/" as well as whitespace (<img/src=x>, <img width=1/src=…>) and be unquoted.
     private static let srcAttr = try! NSRegularExpression(
-        pattern: "\\ssrc\\s*=\\s*(?:\"([^\"]*)\"|'([^']*)'|([^\\s>]+))", options: [.caseInsensitive])
+        pattern: "(?:\\s|/)src\\s*=\\s*(?:\"([^\"]*)\"|'([^']*)'|([^\\s>]+))", options: [.caseInsensitive])
+    // SVG <image> uses href/xlink:href instead of src.
+    private static let hrefAttr = try! NSRegularExpression(
+        pattern: "(?:\\s|/)(?:xlink:)?href\\s*=\\s*(?:\"([^\"]*)\"|'([^']*)'|([^\\s>]+))", options: [.caseInsensitive])
     private static let srcsetAttr = try! NSRegularExpression(
-        pattern: "\\ssrcset\\s*=\\s*(?:\"[^\"]*\"|'[^']*'|[^\\s>]+)", options: [.caseInsensitive])
+        pattern: "(?:\\s|/)(?:srcset|imagesrcset)\\s*=\\s*(?:\"[^\"]*\"|'[^']*'|[^\\s>]+)", options: [.caseInsensitive])
+    private static let posterAttr = try! NSRegularExpression(
+        pattern: "(?:\\s|/)poster\\s*=\\s*(?:\"[^\"]*\"|'[^']*'|[^\\s>]+)", options: [.caseInsensitive])
     private static let dimAttr = try! NSRegularExpression(
-        pattern: "\\s(width|height)\\s*=\\s*[\"']?\\s*(\\d+)", options: [.caseInsensitive])
+        pattern: "(?:\\s|/)(width|height)\\s*=\\s*[\"']?\\s*(\\d+)", options: [.caseInsensitive])
+    private static let styleAttr = try! NSRegularExpression(
+        pattern: "(?:\\s|/)style\\s*=\\s*(?:\"([^\"]*)\"|'([^']*)')", options: [.caseInsensitive])
+    private static let cssDim = try! NSRegularExpression(
+        pattern: "(?:^|[;\\s])(width|height)\\s*:\\s*([0-9.]+)px", options: [.caseInsensitive])
     private static let cssURL = try! NSRegularExpression(
-        pattern: "url\\(\\s*(['\"]?)(https?://[^'\")\\s]+)\\1\\s*\\)", options: [.caseInsensitive])
+        pattern: "url\\(\\s*(['\"]?)([^)'\"]+)\\1\\s*\\)", options: [.caseInsensitive])
+    private static let cssImport = try! NSRegularExpression(
+        pattern: "@import\\s+(?:url\\s*\\(\\s*)?(['\"]?)(?:https?:)?//[^'\"\\s)]+\\1?\\s*\\)?\\s*;?", options: [.caseInsensitive])
     private static let bgAttr = try! NSRegularExpression(
-        pattern: "\\sbackground\\s*=\\s*([\"'])(https?://[^\"']+)\\1", options: [.caseInsensitive])
+        pattern: "(?:\\s|/)background\\s*=\\s*(?:\"([^\"]*)\"|'([^']*)'|([^\\s>]+))", options: [.caseInsensitive])
+    // Bodyless tags that can still trigger loads or rewrites (meta refresh, base, remote styles).
+    private static let voidActive = try! NSRegularExpression(
+        pattern: "<(?:meta\\b[^>]*http-equiv[^>]*|base\\b[^>]*|link\\b[^>]*)>", options: [.caseInsensitive])
     private static let headOpen = try! NSRegularExpression(pattern: "<head\\b[^>]*>", options: [.caseInsensitive])
     private static let urlLink = try! NSRegularExpression(pattern: "(https?://[^\\s<>\"]+)", options: [])
 
@@ -38,8 +50,21 @@ enum HTMLPrep {
         return PreparedHTML(html: wrapPlain(text ?? "", forceLight: forceLight))
     }
 
+    /// Same as prepare(), but the heavy regex passes run off the main actor (large HTML takes real time).
+    static func prepareOffMain(html: String?, text: String?, clip: Bool = true, forceLight: Bool = false, page: Int = 0) async -> PreparedHTML {
+        await Task.detached(priority: .userInitiated) {
+            prepare(html: html, text: text, clip: clip, forceLight: forceLight, page: page)
+        }.value
+    }
+
     /// Matches ReadingPaneView's dark background so the email blends into the app.
     static let darkBackground = "#1e1e1e"
+
+    /// Strict CSP: whatever the regex sanitiser misses fails closed — no script, no remote fonts or styles,
+    /// images only from the app's own loader (lm:) or inline data:.
+    static let cspMeta = "<meta http-equiv=\"Content-Security-Policy\" " +
+        "content=\"default-src 'none'; img-src lm: data:; style-src 'unsafe-inline'; font-src data:; " +
+        "media-src 'none'; form-action 'none'; base-uri 'none'; frame-src 'none'\">"
 
     private static func prepareHTML(_ input: String, clip: Bool, forceLight: Bool, page: Int) -> PreparedHTML {
         var out = PreparedHTML(html: "")
@@ -52,28 +77,48 @@ enum HTMLPrep {
             s = head
             out.clipped = true
         }
-        s = replace(activeContent, in: s) { _, _ in "" }
+        s = stripActive(s)
+        s = replace(voidActive, in: s) { _, _ in "" }
+        s = replace(srcsetAttr, in: s) { _, _ in "" }
+        s = replace(posterAttr, in: s) { _, _ in "" }
+        s = replace(cssImport, in: s) { _, _ in "" }
 
         var nextID = 0
         s = replace(imgTag, in: s) { tag, _ in
             var t = tag
             let tns = t as NSString
-            var w: Int?
-            var h: Int?
-            for m in dimAttr.matches(in: t, range: NSRange(location: 0, length: tns.length)) {
-                let name = tns.substring(with: m.range(at: 1)).lowercased()
-                let v = Int(tns.substring(with: m.range(at: 2)))
-                if name == "width" { w = v } else { h = v }
+            let tlen = tns.length
+            // Dimensions from attributes and inline CSS (width/height in px) — for tracking-pixel detection.
+            var dims: [String: Int] = [:]
+            for m in dimAttr.matches(in: t, range: NSRange(location: 0, length: tlen)) {
+                dims[tns.substring(with: m.range(at: 1)).lowercased()] = Int(tns.substring(with: m.range(at: 2)))
             }
-            t = srcsetAttr.stringByReplacingMatches(in: t, range: NSRange(location: 0, length: (t as NSString).length), withTemplate: "")
+            for m in styleAttr.matches(in: t, range: NSRange(location: 0, length: tlen)) {
+                let raw = m.range(at: 1).location != NSNotFound ? m.range(at: 1) : m.range(at: 2)
+                let style = MIME.decodeEntities(tns.substring(with: raw))
+                let sns = style as NSString
+                for c in cssDim.matches(in: style, range: NSRange(location: 0, length: sns.length)) {
+                    dims[sns.substring(with: c.range(at: 1)).lowercased()] =
+                        Int((Double(sns.substring(with: c.range(at: 2))) ?? 0).rounded())
+                }
+            }
+            let known = [dims["width"], dims["height"]].compactMap { $0 }
+            t = srcsetAttr.stringByReplacingMatches(in: t, range: NSRange(location: 0, length: tlen), withTemplate: "")
+            t = posterAttr.stringByReplacingMatches(in: t, range: NSRange(location: 0, length: tlen), withTemplate: "")
             let tn = t as NSString
-            guard let m = srcAttr.firstMatch(in: t, range: NSRange(location: 0, length: tn.length)) else { return t }
-            var src = ""
-            for g in 1...3 where m.range(at: g).location != NSNotFound { src = tn.substring(with: m.range(at: g)) }
-            src = MIME.decodeEntities(src).trimmingCharacters(in: .whitespaces)
+            let nlen = tn.length
+            func attrMatch(_ re: NSRegularExpression) -> (String, NSRange)? {
+                guard let m = re.firstMatch(in: t, range: NSRange(location: 0, length: nlen)) else { return nil }
+                for g in 1...3 where m.range(at: g).location != NSNotFound {
+                    return (tn.substring(with: m.range(at: g)), m.range(at: g))
+                }
+                return nil
+            }
+            guard let hit = attrMatch(srcAttr) ?? attrMatch(hrefAttr) else { return t }
+            let src = MIME.decodeEntities(hit.0).trimmingCharacters(in: .whitespaces)
             let lower = src.lowercased()
-            // Tracking pixels: 1×1 (or 0×0) remote images. Dropped entirely.
-            if lower.hasPrefix("http"), let w, let h, w <= 2, h <= 2 {
+            // Tracking pixels: remote images whose known dimensions are all ≤ 2px (attrs, CSS, or one of them).
+            if lower.hasPrefix("http"), !known.isEmpty, known.allSatisfy({ $0 <= 2 }) {
                 out.trackersRemoved += 1
                 return ""
             }
@@ -91,10 +136,12 @@ enum HTMLPrep {
             } else {
                 replacement = " data-lm-dropped=\"1\""
             }
-            return tn.replacingCharacters(in: m.range, with: replacement)
+            return tn.replacingCharacters(in: hit.1, with: replacement)
         }
         s = replace(cssURL, in: s) { _, m in
-            guard let url = URL(string: m[2]) else { return "none" }
+            // Entity-encoded URLs (&quot;https://…&quot;) decode to the same thing.
+            let decoded = MIME.decodeEntities(m[2]).trimmingCharacters(in: CharacterSet(charactersIn: " \t\r\n\"'"))
+            guard decoded.lowercased().hasPrefix("http"), let url = URL(string: decoded) else { return m[0] }
             let id = nextID
             nextID += 1
             out.remote[id] = url
@@ -102,7 +149,9 @@ enum HTMLPrep {
             return "url(lm://bg/\(page)/\(id))"
         }
         s = replace(bgAttr, in: s) { _, m in
-            guard let url = URL(string: m[2]) else { return "" }
+            guard var v = [m[1], m[2], m[3]].first(where: { !$0.isEmpty }) else { return m[0] }
+            v = MIME.decodeEntities(v).trimmingCharacters(in: .whitespaces)
+            guard v.lowercased().hasPrefix("http"), let url = URL(string: v) else { return m[0] }
             let id = nextID
             nextID += 1
             out.remote[id] = url
@@ -122,7 +171,7 @@ enum HTMLPrep {
         </style>
         """
         let style = """
-        <meta charset="utf-8"><meta name="color-scheme" content="\(scheme)">
+        \(cspMeta)<meta charset="utf-8"><meta name="color-scheme" content="\(scheme)">
         <style>
         html{background:#fff}
         body{margin:0;padding:16px 20px;font:14px/1.45 -apple-system,BlinkMacSystemFont,Helvetica,sans-serif;color:#1d1d1f;
@@ -144,12 +193,64 @@ enum HTMLPrep {
         return out
     }
 
+    /// Linear removal of <script>/<iframe>/<object>/<embed>/<applet>/<form>: a properly closed tag loses its
+    /// body too, an unclosed one loses only its tag (the leftover content is inert — scripts are disabled and
+    /// the CSP blocks every load). Single pass, no scan to end-of-string per unclosed tag.
+    private static func stripActive(_ s: String) -> String {
+        let names: [[UInt8]] = ["script", "iframe", "object", "embed", "applet", "form"].map { Array($0.utf8) }
+        let b = Array(s.utf8)
+        var out = [UInt8]()
+        out.reserveCapacity(b.count)
+        var pending: [UInt8]?
+        var i = 0
+
+        func isTag(_ at: Int, _ name: [UInt8]) -> Bool {
+            guard at + name.count <= b.count else { return false }
+            for k in 0..<name.count {
+                var c = b[at + k]
+                if c >= 65, c <= 90 { c += 32 }
+                if c != name[k] { return false }
+            }
+            let after = at + name.count
+            if after == b.count { return true }
+            switch b[after] {
+            case 0x3E, 0x2F, 0x20, 0x09, 0x0A, 0x0D: return true
+            default: return false
+            }
+        }
+        func skipToGT(_ from: Int) -> Int {
+            var j = from
+            while j < b.count, b[j] != 0x3E { j += 1 }
+            return j + 1
+        }
+
+        while i < b.count {
+            if b[i] == 0x3C, i + 1 < b.count {
+                if b[i + 1] == 0x2F {
+                    let j = i + 2
+                    if let n = names.first(where: { isTag(j, $0) }) {
+                        i = skipToGT(j + n.count)
+                        if pending == n { pending = nil }
+                        continue
+                    }
+                } else if let n = names.first(where: { isTag(i + 1, $0) }) {
+                    i = skipToGT(i + 1 + n.count)
+                    if pending == nil { pending = n }
+                    continue
+                }
+            }
+            out.append(b[i])
+            i += 1
+        }
+        return String(decoding: out, as: UTF8.self)
+    }
+
     private static func wrapPlain(_ text: String, forceLight: Bool) -> String {
         var escaped = MIME.escapeHTML(text)
         escaped = urlLink.stringByReplacingMatches(in: escaped, range: NSRange(location: 0, length: (escaped as NSString).length),
                                                    withTemplate: "<a href=\"$1\">$1</a>")
         return """
-        <!doctype html><html><head><meta charset="utf-8"><meta name="color-scheme" content="\(forceLight ? "light" : "light dark")">
+        <!doctype html><html><head>\(cspMeta)<meta charset="utf-8"><meta name="color-scheme" content="\(forceLight ? "light" : "light dark")">
         <style>
         html{background:#fff}
         body{margin:0;padding:16px 20px;font:14px/1.5 -apple-system,BlinkMacSystemFont,sans-serif;white-space:pre-wrap;

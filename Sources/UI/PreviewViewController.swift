@@ -10,11 +10,17 @@ final class PreviewViewController: NSViewController, WKNavigationDelegate, WKUID
     /// (content, GPU, networking ≈ 50 MB) exit when you're not reading mail.
     private var webView: WKWebView?
     static var ruleList: WKContentRuleList?
+    /// True once the rule list store failed to provide one; rendering then proceeds with the CSP meta only.
+    static var ruleListFailed = false
     private let loader = ImageLoader()
     private var generation = 0
     private var current: MessageDetail?
     private var currentBody: StoredBody?
     private var showFullClipped = false
+    /// Set when the web view was torn down for good (window closing): no pending work may render into it.
+    private var tornDown = false
+    /// Message whose body is being fetched, so show() doesn't start a second fetch for it.
+    private var fetchingID: Int64?
 
     private let stack = NSStackView()
     private let headerBox = NSView()
@@ -34,9 +40,13 @@ final class PreviewViewController: NSViewController, WKNavigationDelegate, WKUID
     var onEditDraft: ((MessageDetail) -> Void)?
     var showToast: ((String) -> Void)?
 
-    /// Messages shown on a light background even in dark mode ("Show with Light Background", like Outlook's sun button).
-    private var lightMessages: Set<Int64> = []
+    /// "Show with light background" (like Outlook's sun button) — remembered per sender across launches.
     private let lightButton = NSButton()
+
+    private static func lightKey(_ email: String) -> String { "lightBg:" + email.lowercased() }
+    private func lightBackground(_ d: MessageDetail) -> Bool {
+        UserDefaults.standard.bool(forKey: Self.lightKey(d.from.email))
+    }
 
     override func loadView() {
         let root = ReadingPaneView()
@@ -48,7 +58,7 @@ final class PreviewViewController: NSViewController, WKNavigationDelegate, WKUID
             let store = WKContentRuleListStore.default()
             let id = "macmail-block-remote-v1"
             let install: (WKContentRuleList?) -> Void = { [weak self] list in
-                guard let list else { return }
+                guard let list else { Self.ruleListFailed = true; return }
                 Self.ruleList = list
                 self?.webView?.configuration.userContentController.add(list)
             }
@@ -185,6 +195,7 @@ final class PreviewViewController: NSViewController, WKNavigationDelegate, WKUID
     func showEmpty(text: String) {
         current = nil
         currentBody = nil
+        fetchingID = nil
         loader.cancelAll()
         loader.page = nil
         stack.isHidden = true
@@ -210,7 +221,10 @@ final class PreviewViewController: NSViewController, WKNavigationDelegate, WKUID
 
     func show(messageID: Int64) {
         guard let d = store.detail(messageID) else { showEmpty(text: "No message selected"); return }
-        if current?.id == messageID { return }
+        // Already shown, or a body fetch for it is still in flight — but a failed fetch may be retried.
+        if current?.id == messageID, currentBody != nil || fetchingID == messageID { return }
+        tornDown = false
+        spinner.stopAnimation(nil)
         openStarted = Date()
         openWasCached = store.hasBody(messageID)
         current = d
@@ -235,21 +249,23 @@ final class PreviewViewController: NSViewController, WKNavigationDelegate, WKUID
         if let body = store.body(messageID) {
             render(d, body)
         } else {
+            fetchingID = messageID
             ensureWebView().loadHTMLString("", baseURL: nil)
             spinner.startAnimation(nil)
             let id = messageID
             Task {
+                defer { if fetchingID == id { fetchingID = nil } }
                 do {
                     guard let engine = MailService.shared.engine(d.accountID) else { return }
                     let body = try await engine.loadBody(messageID: id)
-                    guard current?.id == id else { return }
+                    guard current?.id == id, !tornDown else { return }
                     spinner.stopAnimation(nil)
                     render(d, body)
                 } catch {
-                    guard current?.id == id else { return }
+                    guard current?.id == id, !tornDown else { return }
                     spinner.stopAnimation(nil)
                     let msg = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
-                    ensureWebView().loadHTMLString(HTMLPrep.prepare(html: nil, text: "Couldn't load this message.\n\n\(msg)").html, baseURL: nil)
+                    ensureWebView().loadHTMLString(HTMLPrep.prepare(html: nil, text: "Couldn't load this message.\n\n\(msg)\n\nSelect it again to retry.").html, baseURL: nil)
                 }
             }
         }
@@ -264,13 +280,32 @@ final class PreviewViewController: NSViewController, WKNavigationDelegate, WKUID
     }()
 
     private func render(_ d: MessageDetail, _ body: StoredBody, forceImages: Bool = false) {
+        // Fail closed: nothing goes on screen until the remote-load block list is attached (CSP meta is the backstop).
+        if Self.ruleList == nil, !Self.ruleListFailed {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.02) { [weak self] in
+                guard let self, self.current?.id == d.id, !self.tornDown else { return }
+                self.render(d, body, forceImages: forceImages)
+            }
+            return
+        }
+        guard !tornDown else { return }
         currentBody = body
         loader.cancelAll()
         // "View entire message" skips the clip but keeps every other protection.
-        let forceLight = lightMessages.contains(d.id)
+        let forceLight = lightBackground(d)
         generation += 1
-        let prepared = HTMLPrep.prepare(html: body.html, text: body.text, clip: !showFullClipped, forceLight: forceLight,
-                                        page: generation)
+        let gen = generation
+        let full = showFullClipped
+        Task {
+            // Large HTML is prepared off the main actor.
+            let prepared = await HTMLPrep.prepareOffMain(html: body.html, text: body.text, clip: !full,
+                                                         forceLight: forceLight, page: gen)
+            guard !tornDown, generation == gen, current?.id == d.id else { return }
+            finishRender(d, prepared: prepared, forceLight: forceLight, forceImages: forceImages)
+        }
+    }
+
+    private func finishRender(_ d: MessageDetail, prepared: PreparedHTML, forceLight: Bool, forceImages: Bool) {
         updateLightButton()
         let senderPref = store.pref("img:" + d.from.email.lowercased())
         let isSpam = d.folderRole == .spam
@@ -288,9 +323,11 @@ final class PreviewViewController: NSViewController, WKNavigationDelegate, WKUID
             showImagesBanner(page)
         }
         pendingNavigation = ensureWebView().loadHTMLString(prepared.html, baseURL: URL(string: "lm://message/\(d.id)/"))
-        if Prefs.markReadOnOpen, !Debug.bench, !d.flags.contains(.seen) {
+        if Prefs.markReadOnOpen, !Debug.bench, !(current?.flags.contains(.seen) ?? true) {
             let rows = store.rows(ids: [d.id])
             MailService.shared.setFlag(rows, flag: .seen, on: true)
+            // Keep the captured flags in sync so later re-renders (theme, zoom, load images) don't mark it read again.
+            current?.flags.insert(.seen)
         }
     }
 
@@ -484,7 +521,19 @@ final class PreviewViewController: NSViewController, WKNavigationDelegate, WKUID
         guard let d = current, let url = unsubscribeURL(d) else { return }
         if url.scheme == "mailto" {
             (NSApp.delegate as? AppDelegate)?.compose(mailto: url)
-        } else {
+            return
+        }
+        // A slipped click shouldn't unsubscribe you or land you on a phishing page — confirm first.
+        let alert = NSAlert()
+        alert.messageText = "Unsubscribe from this mailing list?"
+        alert.informativeText = "This will open \(url.host ?? url.absoluteString) in your browser."
+        alert.addButton(withTitle: "Unsubscribe")
+        alert.addButton(withTitle: "Cancel")
+        if let w = view.window {
+            alert.beginSheetModal(for: w) { resp in
+                if resp == .alertFirstButtonReturn { NSWorkspace.shared.open(url) }
+            }
+        } else if alert.runModal() == .alertFirstButtonReturn {
             NSWorkspace.shared.open(url)
         }
     }
@@ -529,6 +578,7 @@ final class PreviewViewController: NSViewController, WKNavigationDelegate, WKUID
         w.uiDelegate = self
         w.setValue(false, forKey: "drawsBackground")
         w.allowsMagnification = true
+        w.pageZoom = readingZoom
         w.translatesAutoresizingMaskIntoConstraints = false
         w.setContentHuggingPriority(.defaultLow, for: .vertical)
         stack.addArrangedSubview(w)
@@ -539,7 +589,9 @@ final class PreviewViewController: NSViewController, WKNavigationDelegate, WKUID
     }
 
     /// Tears the web view down; WebKit's content/GPU/network processes exit shortly after.
+    /// From here on no pending render or body fetch may create a new web view until the pane is shown again.
     func releaseWebView() {
+        tornDown = true
         guard let w = webView else { return }
         loader.cancelAll()
         w.stopLoading()
@@ -554,9 +606,28 @@ final class PreviewViewController: NSViewController, WKNavigationDelegate, WKUID
 
     /// Brings the open message back after the web view was released.
     func restoreWebViewIfNeeded() {
+        tornDown = false
         guard webView == nil, let d = current, let b = currentBody else { return }
         render(d, b)
     }
+
+    // MARK: Text zoom (View > Larger/Smaller/Actual Text)
+
+    private var readingZoom: CGFloat {
+        get {
+            let v = UserDefaults.standard.double(forKey: "readingZoom")
+            return v > 0 ? CGFloat(v) : 1
+        }
+        set {
+            let clamped = min(max(newValue, 0.5), 3)
+            UserDefaults.standard.set(Double(clamped), forKey: "readingZoom")
+            webView?.pageZoom = clamped
+        }
+    }
+
+    func zoomIn() { readingZoom += 0.1 }
+    func zoomOut() { readingZoom -= 0.1 }
+    func resetZoom() { readingZoom = 1 }
 
     // MARK: Theme
 
@@ -573,14 +644,15 @@ final class PreviewViewController: NSViewController, WKNavigationDelegate, WKUID
 
     private func updateLightButton() {
         lightButton.isHidden = !isDark || current == nil
-        let on = current.map { lightMessages.contains($0.id) } ?? false
+        let on = current.map { lightBackground($0) } ?? false
         lightButton.image = NSImage(systemSymbolName: on ? "moon" : "sun.max", accessibilityDescription: nil)
         lightButton.toolTip = on ? "Show this message in dark mode (⌥⌘L)" : "Show this message with a light background (⌥⌘L)"
     }
 
     @objc func toggleLight() {
         guard let d = current, let b = currentBody, isDark else { NSSound.beep(); return }
-        if lightMessages.contains(d.id) { lightMessages.remove(d.id) } else { lightMessages.insert(d.id) }
+        let key = Self.lightKey(d.from.email)
+        UserDefaults.standard.set(!UserDefaults.standard.bool(forKey: key), forKey: key)
         render(d, b)
     }
 
