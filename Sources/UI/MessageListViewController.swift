@@ -344,6 +344,8 @@ final class MessageListViewController: NSViewController, NSOutlineViewDataSource
                 guard let n = outline.item(atRow: r) as? ListNode else { continue }
                 // Keyed by conversation, not by the header message, which changes when newer mail arrives.
                 if n.children != nil && outline.isItemExpanded(n) { expandedThreads.insert(Self.threadKey(n.row)) }
+                // Only rows that were actually selected are restored (Y-r-list-1).
+                guard outline.selectedRowIndexes.contains(r) else { continue }
                 if outline.parent(forItem: n) != nil { selectedMessages.insert(n.row.id) }
                 else { selectedThreads.insert(n.row.id) }
             }
