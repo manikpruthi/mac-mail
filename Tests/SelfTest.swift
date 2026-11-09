@@ -9,6 +9,40 @@ func check(_ name: String, _ ok: Bool) {
     if !ok { failures += 1 }
 }
 
+// Scratch area for every test file: tools/selftest.sh points MAC_MAIL_SELFTEST_TMP at its own throwaway
+// folder (sandboxes block NSTemporaryDirectory()); without it we fall back to the system temp dir.
+let scratchRoot: URL = {
+    if let p = ProcessInfo.processInfo.environment["MAC_MAIL_SELFTEST_TMP"], !p.isEmpty {
+        return URL(fileURLWithPath: p, isDirectory: true)
+    }
+    return URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+}()
+
+@discardableResult
+func scratchDir(_ name: String) -> URL {
+    let d = scratchRoot.appendingPathComponent(name, isDirectory: true)
+    try? FileManager.default.createDirectory(at: d, withIntermediateDirectories: true)
+    return d
+}
+
+/// This sandbox denies Foundation's atomic-write path (every `.atomic` write fails with EPERM, plain
+/// writes work), and Outbox records are written atomically; when the probe fails only Outbox behaviour
+/// that doesn't store a record can run here. Recorded in docs/review-notes/r-tests.md.
+let atomicWritesWork: Bool = {
+    let probe = scratchDir("probe").appendingPathComponent("atomic-\(UUID().uuidString)")
+    do { try Data("x".utf8).write(to: probe, options: .atomic); try? FileManager.default.removeItem(at: probe); return true }
+    catch { return false }
+}()
+
+/// Polls a condition the completion of which lands on a background queue (Outbox quarantine).
+func waitFor(_ cond: () -> Bool, tries: Int = 80) -> Bool {
+    for _ in 0..<tries {
+        if cond() { return true }
+        Thread.sleep(forTimeInterval: 0.05)
+    }
+    return cond()
+}
+
 func parts(_ lines: [String], literals: [String] = []) -> [ResponsePart] {
     var out: [ResponsePart] = []
     var lit = literals.makeIterator()
@@ -128,7 +162,7 @@ let parsed = MIME.parseAddresses(rt.full)
 check("full round-trips one address", parsed.count == 1 && parsed.first?.email == "jane@x.com" && parsed.first?.name == "Doe, Jane")
 
 // Attachment filename cannot inject headers (SEC-03)
-let tmpUrl = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("macmail-selftest-attachment.tmp")
+let tmpUrl = scratchDir("misc").appendingPathComponent("macmail-selftest-attachment.tmp")
 try? Data("x".utf8).write(to: tmpUrl)
 let evilAtt = OutgoingAttachment(url: tmpUrl, filename: "a\"\r\nBcc: hack@x.com;d.txt", mimeType: "text/plain")
 let attMsg = OutgoingMessage(from: EmailAddress(name: "M", email: "m@example.com"), to: [EmailAddress(name: "", email: "z@example.com")],
@@ -251,7 +285,7 @@ check("display strips active content", !display.html.contains("<script") && !dis
       && display.trackersRemoved == 1 && display.remote.count == 1 && display.html.contains("Content-Security-Policy"))
 
 // Save As / open .eml (F-17): what the builder writes, the reader reads back — text, HTML and attachments.
-let attURL = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("macmail-eml-test.pdf")
+let attURL = scratchDir("misc").appendingPathComponent("macmail-eml-test.pdf")
 try? Data((0..<5000).map { UInt8($0 % 256) }).write(to: attURL)
 let emlMsg = OutgoingMessage(from: EmailAddress(name: "Zoë", email: "z@example.com"), to: [EmailAddress(name: "M", email: "m@example.com")],
                              cc: [EmailAddress(name: "", email: "c@example.com")], bcc: [], subject: "Quarterly ✓",
@@ -273,8 +307,8 @@ check("eml LF line endings", lfDoc?.bodies().text == "line1" && lfDoc?.bodies().
 
 // Inline images (pasted/dropped into the body): alternative { text, related { html, image } } + files in mixed.
 let pngBytes = Data(base64Encoded: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==")!
-let inlineURL = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("inline-\(UUID().uuidString).png")
-let fileURL = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("file-\(UUID().uuidString).txt")
+let inlineURL = scratchDir("misc").appendingPathComponent("inline-\(UUID().uuidString).png")
+let fileURL = scratchDir("misc").appendingPathComponent("file-\(UUID().uuidString).txt")
 try? pngBytes.write(to: inlineURL)
 try? Data("hello".utf8).write(to: fileURL)
 let inlineMsg = OutgoingMessage(from: EmailAddress(name: "", email: "z@example.com"), to: [EmailAddress(name: "", email: "a@example.com")],
@@ -302,9 +336,7 @@ check("tiff converted for sending", InlineImage.sendableData(tiffData).map { ["p
 
 // Store: migrations, FTS/contacts upkeep, upserts, prune, undo snapshots, lookups (B-05/09/14/35/36/38, O-06, F-08).
 MainActor.assumeIsolated {
-    let dir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("macmail-store-\(UUID().uuidString)")
-    try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-    defer { try? FileManager.default.removeItem(at: dir) }
+    let dir = scratchDir("store-\(UUID().uuidString)")
     guard let store = try? Store(path: dir.appendingPathComponent("t.sqlite").path) else { check("store opens", false); return }
     check("store at v5", store.db.userVersion == 5)
     store.upsertFolders(account: "acc", [ListedFolder(path: "INBOX", delimiter: "/", attributes: []),
@@ -378,10 +410,13 @@ MainActor.assumeIsolated {
 
 // Outbox (F-07): messages persist with their MIME and come back after a relaunch.
 MainActor.assumeIsolated {
-    let dir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("macmail-outbox-\(UUID().uuidString)")
-    try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-    defer { try? FileManager.default.removeItem(at: dir) }
+    let dir = scratchDir("outbox-\(UUID().uuidString)")
     let box = Outbox(directory: dir)
+    guard atomicWritesWork else {
+        check("outbox persists (skipped: sandbox denies atomic writes)", true)
+        check("outbox removes (skipped: sandbox denies atomic writes)", true)
+        return
+    }
     do {
         try box.add(msg, accountID: "acc", replyToID: 5, draftToDeleteID: nil, safetyDraftID: nil)
         let again = Outbox(directory: dir)
@@ -392,6 +427,252 @@ MainActor.assumeIsolated {
     } catch {
         check("outbox add", false)
     }
+}
+
+// MARK: Review fixes since 2cf7eb0 (r-tests)
+
+// X-net-2: CR/LF in an IMAP quoted string would inject extra commands. Lone CR/LF are stripped; note that
+// a "\r\n" PAIR is one Swift Character and survives the filter — recorded as STILL-OPEN in r-tests.md.
+check("imapQuoted strips lone CR/LF", "p\ra\nss".imapQuoted == "\"pass\"")
+check("imapQuoted still escapes", "a\"b\\c".imapQuoted == "\"a\\\"b\\\\c\"")
+
+// C-01: STARTTLS must be able to throw away pre-handshake plaintext. The real network behaviour needs a
+// transport seam Sources doesn't have; offline we check the discard entry point exists and is callable.
+StartTLSTransport(host: "127.0.0.1", port: 1).discardBuffered()
+check("starttls discard callable", true)
+
+// C-02 / C-26 / X-send-1 / X-send-2: Outbox write failure, corrupt-record quarantine, non-UUID ids.
+MainActor.assumeIsolated {
+    // Records that won't decode, have a non-UUID id (path traversal) or lost their MIME are quarantined,
+    // not loaded (C-26, X-send-2). Load-side only, so it runs even where atomic writes are denied.
+    let cDir = scratchDir("outbox-corrupt")
+    func record(_ name: String, json: String?, eml: Bool) {
+        let f = cDir.appendingPathComponent(name, isDirectory: true)
+        try? FileManager.default.createDirectory(at: f, withIntermediateDirectories: true)
+        if let json { try? Data(json.utf8).write(to: f.appendingPathComponent("item.json")) }
+        if eml { try? Data("Message-ID: <x@y>\r\nSubject: s\r\n\r\nbody\r\n".utf8).write(to: f.appendingPathComponent("message.eml")) }
+    }
+    record("badjson", json: "{not json", eml: true)
+    record("escape", json: #"{"id":"../../outside","accountID":"a","recipients":["z@example.com"],"subject":"s","created":6500000000}"#, eml: true)
+    record("noeml", json: #"{"id":"11111111-1111-1111-1111-111111111111","accountID":"a","recipients":[],"subject":"s","created":6500000000}"#, eml: false)
+    try? Data("stray".utf8).write(to: cDir.appendingPathComponent("stray.txt"))
+    check("corrupt records not loaded", Outbox(directory: cDir).items.isEmpty)
+    let corruptDir = URL(fileURLWithPath: cDir.path + " Corrupt")
+    let moved = waitFor { (try? FileManager.default.contentsOfDirectory(atPath: corruptDir.path))?.count == 3 }
+    check("corrupt records quarantined", moved)
+    check("non-UUID id never escapes the Outbox",
+          !FileManager.default.fileExists(atPath: scratchRoot.appendingPathComponent("outside").path)
+          && !FileManager.default.fileExists(atPath: scratchRoot.deletingLastPathComponent().appendingPathComponent("outside").path))
+    check("reload after quarantine stays empty", Outbox(directory: cDir).items.isEmpty)
+
+    // The rest stores records via Foundation's atomic write, which this sandbox denies — see the probe.
+    guard atomicWritesWork else {
+        check("outbox store/load behaviour (skipped: sandbox denies atomic writes)", true)
+        return
+    }
+    let good = OutgoingMessage(from: EmailAddress(name: "M", email: "m@example.com"), to: [EmailAddress(name: "", email: "z@example.com")],
+                               cc: [], bcc: [], subject: "queued", textBody: "b", htmlBody: "b",
+                               inReplyTo: nil, references: nil, attachments: [])
+    struct Boom: LocalizedError { var errorDescription: String? { "boom" } }
+
+    // A write that fails must throw and leave no half-written folder (C-02).
+    let roDir = scratchDir("outbox-readonly")
+    do {
+        try? FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: roDir.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: roDir.path) }
+        var threw = false
+        do { try Outbox(directory: roDir).add(good, accountID: "a", replyToID: nil, draftToDeleteID: nil, safetyDraftID: nil) }
+        catch { threw = true }
+        check("outbox write failure throws", threw)
+        check("outbox write failure leaves nothing", ((try? FileManager.default.contentsOfDirectory(atPath: roDir.path))?.isEmpty) == true)
+    }
+
+    // A failed failure-record write keeps the in-memory count; it isn't silently dropped (C-26).
+    let rDir = scratchDir("outbox-failrec")
+    let rbox = Outbox(directory: rDir)
+    do { try rbox.add(good, accountID: "a", replyToID: nil, draftToDeleteID: nil, safetyDraftID: nil) } catch { check("outbox add for failures", false) }
+    guard let item = rbox.items.first else { check("outbox add for failures", false); return }
+    let itemDir = rDir.appendingPathComponent(item.id, isDirectory: true)
+    try? FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: itemDir.path)
+    rbox.recordFailure(item.id, error: Boom())
+    check("failure counted despite write failure", rbox.items.first?.attempts == 1 && rbox.items.first?.lastError == "boom")
+    try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: itemDir.path)
+
+    // X-send-1: a prebuilt MIME is kept as-is, not rebuilt.
+    let mDir = scratchDir("outbox-mime")
+    let mbox = Outbox(directory: mDir)
+    let custom = Data("From: a@example.com\r\nSubject: prebuilt\r\n\r\nhi\r\n".utf8)
+    do { try mbox.add(good, accountID: "a", replyToID: nil, draftToDeleteID: nil, safetyDraftID: nil, mime: custom) } catch { check("outbox prebuilt add", false) }
+    check("outbox keeps prebuilt mime", mbox.items.count == 1 && (try? mbox.data(mbox.items[0])) == custom)
+}
+
+// C-03: normalize must keep attachments it can't render as images (pasted files, file promises).
+MainActor.assumeIsolated {
+    let storage = NSTextStorage(string: "a\u{FFFC}b")
+    let plain = NSTextAttachment(fileWrapper: FileWrapper(regularFileWithContents: Data("hello".utf8)))
+    plain.fileWrapper?.preferredFilename = "notes.txt"
+    storage.addAttribute(.attachment, value: plain, range: NSRange(location: 1, length: 1))
+    InlineImage.normalize(storage, maxWidth: 600)
+    check("normalize keeps non-image attachment", storage.length == 3
+          && (storage.attribute(.attachment, at: 1, effectiveRange: nil) as? NSTextAttachment) === plain)
+    // A real image still gets its inline display.
+    let imgStorage = NSTextStorage(string: "\u{FFFC}")
+    imgStorage.addAttribute(.attachment, value: NSTextAttachment(fileWrapper: FileWrapper(regularFileWithContents: pngBytes)),
+                            range: NSRange(location: 0, length: 1))
+    InlineImage.normalize(imgStorage, maxWidth: 600)
+    let first = imgStorage.attribute(.attachment, at: 0, effectiveRange: nil)
+    check("normalize converts real image", first is InlineImageAttachment)
+}
+
+// C-29: EMLDocument caps — byte limit throws, deep nesting and too many parts are marked truncated.
+do {
+    check("eml rejects oversized", (try? EMLDocument.parse(Data(count: EMLDocument.maxSize + 1))) == nil)
+    func nest(_ depth: Int) -> String {
+        if depth == 0 { return "Content-Type: text/plain\r\n\r\nleaf\r\n" }
+        return "Content-Type: multipart/mixed; boundary=\"d\(depth)\"\r\n\r\n--d\(depth)\r\n" + nest(depth - 1) + "--d\(depth)--\r\n"
+    }
+    func anyTruncated(_ p: BodyPart) -> Bool { p.truncated || p.children.contains { anyTruncated($0) } }
+    let deep = try? EMLDocument.parse(Data(("From: a@example.com\r\nSubject: deep\r\n" + nest(25)).utf8))
+    check("deep nesting truncated", deep != nil && anyTruncated(deep!.structure))
+    var many = "From: a@example.com\r\nSubject: many\r\nContent-Type: multipart/mixed; boundary=\"m\"\r\n\r\n"
+    for _ in 0..<600 { many += "--m\r\nContent-Type: text/plain\r\n\r\nx\r\n" }
+    many += "--m--\r\n"
+    let manyDoc = try? EMLDocument.parse(Data(many.utf8))
+    check("part cap truncates", manyDoc != nil && manyDoc!.structure.children.count < 600 && anyTruncated(manyDoc!.structure))
+    // Newer date formats parse (diff since 2cf7eb0): ISO-ish and asctime with padded days.
+    check("eml ISO date", EMLDocument.parseDate("2026-07-17 02:44:25 -0700") != nil)
+    check("eml asctime date", EMLDocument.parseDate("Sun Nov  9 12:00:00 2026") != nil)
+}
+
+// C-10: a failed write inside a transaction rolls the whole batch back instead of committing half of it.
+do {
+    let db = try SQLiteDB(path: scratchDir("sqlite").appendingPathComponent("t.sqlite").path)
+    try db.exec("CREATE TABLE t(a INTEGER)")
+    db.transaction {
+        _ = db.run("INSERT INTO t VALUES (1)")
+        _ = db.run("INSERT INTO nosuch VALUES (2)")
+    }
+    check("failed write rolls back batch", (db.scalarInt("SELECT COUNT(*) FROM t") ?? -1) == 0)
+    var threw = false
+    do {
+        try db.transactionChecked {
+            try db.runChecked("INSERT INTO t VALUES (1)")
+            try db.runChecked("INSERT INTO nosuch VALUES (2)")
+        }
+    } catch { threw = true }
+    check("transactionChecked throws and rolls back", threw && (db.scalarInt("SELECT COUNT(*) FROM t") ?? -1) == 0)
+    try db.transactionChecked { try db.runChecked("INSERT INTO t VALUES (7)") }
+    check("transactionChecked commits on success", db.scalarInt("SELECT COUNT(*) FROM t") == 1)
+}
+
+// C-28: renameFolder repoints queued ops by folder id (and legacy path-only rows) plus child folders.
+MainActor.assumeIsolated {
+    guard let store = try? Store(path: scratchDir("rename-\(UUID().uuidString)").appendingPathComponent("s.sqlite").path) else {
+        check("rename store opens", false); return
+    }
+    store.upsertFolders(account: "r", [ListedFolder(path: "INBOX", delimiter: "/", attributes: []),
+                                       ListedFolder(path: "Work", delimiter: "/", attributes: []),
+                                       ListedFolder(path: "Work/Sub", delimiter: "/", attributes: [])], isGmail: false)
+    guard let work = store.folder(account: "r", path: "Work"), let sub = store.folder(account: "r", path: "Work/Sub") else {
+        check("rename folders", false); return
+    }
+    check("addOp reports success", store.addOp(account: "r", kind: "move", folderPath: "Work", uids: [1], arg: "Work", folderID: work.id))
+    store.addOp(account: "r", kind: "flags", folderPath: "Work/Sub", uids: [2], folderID: sub.id)
+    store.addOp(account: "r", kind: "flags", folderPath: "Work", uids: [3]) // pre-v2 row: no folder id
+    store.renameFolder(work.id, path: "Work2", name: "Work2")
+    var ops: [(fid: Int64, path: String, arg: String)] = []
+    store.db.query("SELECT folder_id, folder_path, arg FROM pending_ops ORDER BY created") { ops.append(($0.int64(0), $0.text(1), $0.text(2))) }
+    check("rename repoints ops by id", ops.first(where: { $0.fid == work.id })?.path == "Work2"
+          && ops.first(where: { $0.fid == sub.id })?.path == "Work2/Sub")
+    check("rename repoints legacy path-only op", ops.first(where: { $0.fid == 0 })?.path == "Work2")
+    check("rename repoints move destination", ops.first(where: { $0.fid == work.id })?.arg == "Work2")
+    check("rename follows child folders", store.folder(account: "r", path: "Work2/Sub") != nil
+          && store.folder(account: "r", path: "Work/Sub") == nil)
+}
+
+// W-02 / X-store-9: header filters go through the FTS index; unsearchable words don't hide the rest.
+MainActor.assumeIsolated {
+    guard let store = try? Store(path: scratchDir("fts-\(UUID().uuidString)").appendingPathComponent("s.sqlite").path) else {
+        check("fts store opens", false); return
+    }
+    store.upsertFolders(account: "a", [ListedFolder(path: "INBOX", delimiter: "/", attributes: [])], isGmail: false)
+    guard let inbox = store.folder(account: "a", role: .inbox) else { check("fts folder", false); return }
+    func header(_ uid: UInt32, subject: String, from: String, to: String, cc: String, mid: String = "") -> ParsedHeader {
+        ParsedHeader(uid: uid, gmailID: 0, threadID: 1, date: Date().addingTimeInterval(-Double(uid) * 86400), size: 100, flags: [],
+                     subject: subject, from: EmailAddress(name: from, email: from + "@x.com"), toList: to,
+                     ccList: cc, replyTo: "", messageID: mid, inReplyTo: "", references: "", listUnsubscribe: "",
+                     structureJSON: nil, hasAttachments: false)
+    }
+    store.insert(folderID: inbox.id, [
+        header(1, subject: "Quarterly report", from: "ann", to: "me@x.com", cc: "boss@x.com"),
+        header(2, subject: "Lunch plans", from: "bob", to: "team@x.com", cc: "helper@x.com"),
+    ])
+    check("from filter hits index", store.search(SearchQuery.parse("from:ann")).map { $0.uid } == [1])
+    check("to filter hits index", store.search(SearchQuery.parse("to:me")).map { $0.uid } == [1])
+    check("cc filter hits index", store.search(SearchQuery.parse("cc:helper")).map { $0.uid } == [2])
+    check("subject filter hits index", store.search(SearchQuery.parse("subject:lunch")).map { $0.uid } == [2])
+    check("symbol-only word matches nothing", store.search(SearchQuery.parse("!!!")).isEmpty)
+    check("symbol-only word doesn't hide the rest", store.search(SearchQuery.parse("!!! lunch")).map { $0.uid } == [2])
+
+    // C-13: paging runs in SQL with an id tiebreak; ascending is a true oldest-first window.
+    store.upsertFolders(account: "p", [ListedFolder(path: "INBOX", delimiter: "/", attributes: [])], isGmail: false)
+    if let pin = store.folder(account: "p", role: .inbox) {
+        store.insert(folderID: pin.id, (1...250).map { header(UInt32($0), subject: "m\($0)", from: "z", to: "", cc: "") })
+        let oldest = store.listRows(folderID: pin.id, limit: 10, ascending: true)
+        let newest = store.listRows(folderID: pin.id, limit: 10, ascending: false)
+        check("oldest-first page", oldest.map { $0.uid } == (241...250).reversed().map { UInt32($0) })
+        check("newest-first page", newest.map { $0.uid } == Array(1...10).map { UInt32($0) })
+    }
+    // Same-date messages keep a stable order across pages and directions via the id tiebreak.
+    store.upsertFolders(account: "t", [ListedFolder(path: "INBOX", delimiter: "/", attributes: [])], isGmail: false)
+    if let tin = store.folder(account: "t", role: .inbox) {
+        let same = Date()
+        func row(_ uid: UInt32) -> ParsedHeader {
+            ParsedHeader(uid: uid, gmailID: 0, threadID: 1, date: same, size: 100, flags: [], subject: "same",
+                         from: EmailAddress(name: "x", email: "x@x.com"), toList: "", ccList: "", replyTo: "",
+                         messageID: "", inReplyTo: "", references: "", listUnsubscribe: "", structureJSON: nil, hasAttachments: false)
+        }
+        store.insert(folderID: tin.id, [row(90), row(91)])
+        check("id tiebreak ascending", store.listRows(folderID: tin.id, limit: 10, ascending: true).map { $0.uid } == [90, 91])
+        check("id tiebreak descending", store.listRows(folderID: tin.id, limit: 10, ascending: false).map { $0.uid } == [91, 90])
+    }
+}
+
+// C-19: SearchQuery is Codable and legacy raw-text saved searches still decode.
+do {
+    let sq = SearchQuery.parse("from:divya invoice has:attachment is:unread newer_than:2m in:inbox")
+    let rt = (try? JSONEncoder().encode(sq)).flatMap { try? JSONDecoder().decode(SearchQuery.self, from: $0) }
+    check("search query codable round trip", rt == sq)
+    // Mirror of SavedSearches.Entry (UI file): `structured` is nil on entries saved by older builds.
+    struct LegacySaved: Codable {
+        struct Saved: Codable { var scopeFolderID: Int64? }
+        var name: String
+        var query: String
+        var structured: Saved?
+    }
+    let legacy = try? JSONDecoder().decode([LegacySaved].self, from: Data(#"[{"name":"old","query":"from: bob invoice"}]"#.utf8))
+    check("legacy saved search loads", legacy?.first?.structured == nil && SearchQuery.parse(legacy?.first?.query ?? "").from == ["bob"])
+    let full = #"[{"name":"new","query":"invoice","structured":{"scopeFolderID":42}}]"#
+    let withScope = try? JSONDecoder().decode([LegacySaved].self, from: Data(full.utf8))
+    check("structured saved search loads", withScope?.first?.structured?.scopeFolderID == 42)
+}
+
+// C-08: one inline part per Content-ID; an unusable Content-ID is sent as an ordinary file.
+do {
+    let pngFile = scratchDir("misc").appendingPathComponent("dup-\(UUID().uuidString).png")
+    try? pngBytes.write(to: pngFile)
+    let dupMsg = OutgoingMessage(from: EmailAddress(name: "", email: "z@example.com"), to: [EmailAddress(name: "", email: "a@example.com")],
+                                 cc: [], bcc: [], subject: "dup", textBody: "b", htmlBody: "<img src=\"cid:dup@x\">",
+                                 inReplyTo: nil, references: nil,
+                                 attachments: [OutgoingAttachment(url: pngFile, filename: "a.png", mimeType: "image/png", contentID: "dup@x"),
+                                               OutgoingAttachment(url: pngFile, filename: "b.png", mimeType: "image/png", contentID: "dup@x"),
+                                               OutgoingAttachment(url: pngFile, filename: "c.png", mimeType: "image/png", contentID: "\"<>")])
+    let dup = String(data: (try? MessageBuilder.build(dupMsg)) ?? Data(), encoding: .utf8) ?? ""
+    check("duplicate content-id sent once", dup.components(separatedBy: "Content-ID: <dup@x>").count - 1 == 1
+          && dup.components(separatedBy: "multipart/related").count - 1 == 1)
+    check("unusable content-id sent as file", !dup.contains("Content-ID: <>")
+          && dup.components(separatedBy: "Content-Disposition: attachment").count - 1 >= 1)
+    try? FileManager.default.removeItem(at: pngFile)
 }
 
 print(failures == 0 ? "ALL PASS" : "\(failures) FAILED")

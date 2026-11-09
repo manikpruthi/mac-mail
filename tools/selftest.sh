@@ -11,6 +11,9 @@ TEST_FILES=(Sources/UI/HTMLPrep.swift Sources/UI/InlineImages.swift Sources/Sync
 OUT="$(mktemp -d "${TMPDIR:-/tmp}/macmail-selftest.XXXXXX")"
 trap 'rm -rf "$OUT"' EXIT
 
+# Tests write only under here: the sandbox forbids NSTemporaryDirectory(), so point every test at $OUT.
+export MAC_MAIL_SELFTEST_TMP="$OUT"
+
 SOURCES=()
 while IFS= read -r f; do SOURCES+=("$f"); done < <(find "${TEST_DIRS[@]}" -name '*.swift' | sort)
 SOURCES+=("${TEST_FILES[@]}")
