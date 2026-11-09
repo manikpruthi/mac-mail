@@ -2,11 +2,26 @@ import Foundation
 
 /// Minimal SMTP submission over implicit TLS (port 465), with AUTH PLAIN.
 enum SMTPClient {
+    /// Refuses addresses that could break out of the envelope commands (injection, splitting).
+    static func validateAddresses(from: String, recipients: [String]) throws {
+        guard MailSafety.isValidAddrSpec(from) else { throw NetError.protocolError("invalid sender address") }
+        guard recipients.allSatisfy({ MailSafety.isValidAddrSpec($0) }) else {
+            throw NetError.protocolError("invalid recipient address")
+        }
+    }
+
     static func send(host: String, port: UInt16, username: String, password: String,
                      from: String, recipients: [String], message: Data) async throws {
+        try validateAddresses(from: from, recipients: recipients)
         let s = TLSStream(host: host, port: port)
         try await s.open()
         defer { Task { await s.close() } }
+        // One-shot watchdog so a silent server can never hang the send.
+        let watchdog = Task { [weak s] in
+            try? await Task.sleep(nanoseconds: 120_000_000_000)
+            await s?.close()
+        }
+        defer { watchdog.cancel() }
 
         func reply() async throws -> (Int, String) {
             var text = ""

@@ -64,22 +64,34 @@ enum ResponsePart {
 enum IMAPParser {
     private static let statusWords: Set<String> = ["OK", "NO", "BAD", "BYE", "PREAUTH"]
 
+    /// No server literal larger than this is ever read (DoS cap; downloads stream their own parts).
+    static let maxLiteralSize = 64 * 1024 * 1024
+    /// Cap on nested parens in a response; hostile nesting must not overflow the stack.
+    static let maxDepth = 100
+
     /// Length of a trailing literal marker "{123}" or "{123+}", if the line ends with one.
+    /// Oversized lengths are clamped to maxLiteralSize instead of trapping.
     static func literalLength(_ line: [UInt8]) -> Int? {
         guard let last = line.last, last == UInt8(ascii: "}") else { return nil }
         var i = line.count - 2
         if i >= 0 && line[i] == UInt8(ascii: "+") { i -= 1 }
         var digits = 0
         var value = 0
-        var mul = 1
+        var weight = 1
+        var clamped = false
         while i >= 0, line[i] >= 48, line[i] <= 57 {
-            value += Int(line[i] - 48) * mul
-            mul *= 10
             digits += 1
+            if digits > 9 { // more digits than any cap-sized literal: clamp, keep consuming
+                clamped = true
+            } else {
+                value += Int(line[i] - 48) * weight
+                if value > maxLiteralSize { clamped = true }
+                weight *= 10
+            }
             i -= 1
         }
         guard digits > 0, i >= 0, line[i] == UInt8(ascii: "{") else { return nil }
-        return value
+        return clamped ? maxLiteralSize : value
     }
 
     static func parse(_ parts: [ResponsePart]) -> IMAPResponse {
@@ -164,13 +176,14 @@ enum IMAPParser {
         }
 
         /// Reads one value; nil at end of response or at a closing paren (which it consumes).
-        mutating func readValue() -> IMAPValue? {
+        mutating func readValue(_ depth: Int = 0) -> IMAPValue? {
             skipSpaces()
             let l = line
             guard pos < l.count else { return nil }
             let c = l[pos]
             switch c {
             case UInt8(ascii: "("):
+                guard depth < IMAPParser.maxDepth else { return nil } // hostile nesting: truncate this branch
                 pos += 1
                 var items: [IMAPValue] = []
                 while true {
@@ -181,7 +194,7 @@ enum IMAPParser {
                         if partIndex + 1 >= parts.count { break }
                     }
                     if pos < cur.count, cur[pos] == UInt8(ascii: ")") { pos += 1; break }
-                    guard let v = readValue() else { break }
+                    guard let v = readValue(depth + 1) else { break }
                     items.append(v)
                 }
                 return .list(items)
@@ -304,11 +317,17 @@ enum MailboxName {
                     var b64 = inner.replacingOccurrences(of: ",", with: "/")
                     while b64.count % 4 != 0 { b64 += "=" }
                     if let d = Data(base64Encoded: b64) {
-                        var units: [UInt16] = []
-                        var j = 0
                         let bytes = [UInt8](d)
-                        while j + 1 < bytes.count { units.append(UInt16(bytes[j]) << 8 | UInt16(bytes[j + 1])); j += 2 }
-                        out += String(decoding: units, as: UTF16.self)
+                        if bytes.count % 2 == 0 {
+                            var units: [UInt16] = []
+                            var j = 0
+                            while j + 1 < bytes.count { units.append(UInt16(bytes[j]) << 8 | UInt16(bytes[j + 1])); j += 2 }
+                            out += String(decoding: units, as: UTF16.self)
+                        } else {
+                            out += String(s[i...dash]) // malformed segment: keep it verbatim, don't drop
+                        }
+                    } else {
+                        out += String(s[i...dash]) // malformed segment: keep it verbatim, don't drop
                     }
                 }
                 i = s.index(after: dash)

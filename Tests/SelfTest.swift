@@ -87,5 +87,100 @@ check("quoted + server-only", sq3.subject == ["q4 budget"] && sq3.serverOnly == 
 check("gmail raw", sq2.gmailRaw == "invoice from:divya has:attachment is:unread newer_than:60d")
 check("imap criteria", SearchQuery.parse("from: bob is:starred").imapCriteria == "FROM \"bob\" FLAGGED")
 
+// MARK: Security hardening
+
+// Strict addr-spec validation
+check("addr valid", MailSafety.isValidAddrSpec("jane@example.com"))
+check("addr rejects CRLF", !MailSafety.isValidAddrSpec("a\r\nBcc: evil@x.com"))
+check("addr rejects space/angle/quote/comma", !MailSafety.isValidAddrSpec("a b@x.com") && !MailSafety.isValidAddrSpec("<a@x.com>")
+    && !MailSafety.isValidAddrSpec("\"a\"@x.com") && !MailSafety.isValidAddrSpec("a,b@x.com"))
+check("addr rejects no-at/two-at", !MailSafety.isValidAddrSpec("nowhere") && !MailSafety.isValidAddrSpec("a@b@c"))
+check("stripControls", MailSafety.stripControls("a\r\nB\u{7f}c") == "aBc")
+
+// cleanEmail no longer percent-decodes, so %0D%0A stays inert and fails validation
+let pctAddr = MIME.cleanEmail("%6Aane%40x.com%0D%0A")
+check("cleanEmail keeps percent-encoding", pctAddr.contains("%") && !MailSafety.isValidAddrSpec(pctAddr))
+check("smtp refuses injected envelope", (try? SMTPClient.validateAddresses(from: "m@example.com", recipients: ["a\r\nBcc: evil@x.com"])) == nil)
+check("smtp accepts real envelope", (try? SMTPClient.validateAddresses(from: "m@example.com", recipients: ["a@example.com"])) != nil)
+
+// Header injection through display names, In-Reply-To and References
+let evil = EmailAddress(name: "Evil\r\nBcc: hacker@x.com", email: "evil@example.com")
+let inj = EmailAddress(name: "Doe, Jane <jane@x.com>; bob@y.org", email: "jane@x.com")
+let injMsg = OutgoingMessage(from: EmailAddress(name: "Manik", email: "m@example.com"), to: [evil, inj],
+                             cc: [], bcc: [], subject: "hi", textBody: "b", htmlBody: "b",
+                             inReplyTo: "<a@x>\r\nBcc: hacker@x.com", references: "<ok@x> <bad\r\nBcc: h@x>", attachments: [])
+let built2 = String(data: (try? MessageBuilder.build(injMsg)) ?? Data(), encoding: .utf8) ?? ""
+check("no injected Bcc header", !built2.contains("\r\nBcc:") && !built2.contains("\r\nReferences: hacker"))
+check("recipients written safely", built2.contains("To:"))
+check("in-reply-to sanitized", built2.contains("In-Reply-To: <a@x>"))
+check("references sanitized", built2.contains("References: <ok@x>"))
+
+// Comma-laden display names round-trip to ONE address (V2-02)
+let rt = EmailAddress(name: "Doe, Jane", email: "jane@x.com")
+let parsed = MIME.parseAddresses(rt.full)
+check("full round-trips one address", parsed.count == 1 && parsed.first?.email == "jane@x.com" && parsed.first?.name == "Doe, Jane")
+
+// Attachment filename cannot inject headers (SEC-03)
+let tmpUrl = URL(fileURLWithPath: ".selftest-attachment.tmp") // TMPDIR writes are restricted here
+try? Data("x".utf8).write(to: tmpUrl)
+defer { try? FileManager.default.removeItem(at: tmpUrl) }
+let evilAtt = OutgoingAttachment(url: tmpUrl, filename: "a\"\r\nBcc: hack@x.com;d.txt", mimeType: "text/plain")
+let attMsg = OutgoingMessage(from: EmailAddress(name: "M", email: "m@example.com"), to: [EmailAddress(name: "", email: "z@example.com")],
+                             cc: [], bcc: [], subject: "s", textBody: "b", htmlBody: "b",
+                             inReplyTo: nil, references: nil, attachments: [evilAtt])
+let built3 = String(data: (try? MessageBuilder.build(attMsg)) ?? Data(), encoding: .utf8) ?? ""
+check("filename injection blocked", !built3.contains("\r\nBcc:") && built3.contains("filename*=UTF-8''")
+    && built3.contains("filename=\"a_"))
+
+// Header folding + encoded-word splitting (BUG-23)
+let longSubject = String(repeating: "wörd ", count: 40)
+let longMsg = OutgoingMessage(from: EmailAddress(name: "M", email: "m@example.com"), to: [EmailAddress(name: "", email: "z@example.com")],
+                              cc: [], bcc: [], subject: longSubject, textBody: "b", htmlBody: "b",
+                              inReplyTo: nil, references: nil, attachments: [])
+let built4 = String(data: (try? MessageBuilder.build(longMsg)) ?? Data(), encoding: .utf8) ?? ""
+let subjectLines = built4.components(separatedBy: "\r\n").filter { !$0.hasPrefix(" ") }
+check("encoded words folded", built4.contains("=?UTF-8?B?") && subjectLines.contains { $0.hasPrefix("Subject: =?UTF-8?B?") })
+let b64chunks = built4.components(separatedBy: "=?UTF-8?B?").dropFirst().map { String($0.prefix(while: { $0 != "?" })) }
+check("encoded words short", !b64chunks.isEmpty && b64chunks.allSatisfy { $0.count <= 63 })
+
+// DoS: 20-digit literal length must not trap (SEC-07)
+check("huge literal clamped", IMAPParser.literalLength(Array("x {99999999999999999999}".utf8)) == IMAPParser.maxLiteralSize)
+check("normal literal intact", IMAPParser.literalLength(Array("BODY[] {42}".utf8)) == 42)
+
+// DoS: 20000 nested parens must not crash the parser or BodyStructure (V2-17)
+let deep = "* 1 FETCH (UID 7 BODYSTRUCTURE " + String(repeating: "(", count: 20000) + String(repeating: ")", count: 20000) + ")"
+let deepResp = IMAPParser.parse([.text(Array(deep.utf8))])
+check("deep parens survive", deepResp.values.count >= 1)
+var deepVal = IMAPValue.atom("TEXT")
+for _ in 0..<5000 { deepVal = .list([deepVal]) }
+let deepParsed = BodyPart.parse(deepVal)
+check("deep bodystructure survives", deepParsed == nil || deepParsed != nil) // must not SIGSEGV
+
+// DoS: huge BODYSTRUCTURE / RFC822.SIZE values must not trap (V2-16)
+let hugeBS = FetchResult.from(IMAPParser.parse(parts(["* 1 FETCH (UID 1 RFC822.SIZE 18446744073709551615 BODYSTRUCTURE (\"TEXT\" \"PLAIN\" (\"CHARSET\" \"UTF-8\") NIL NIL \"BASE64\" 18446744073709551615 1 NIL NIL NIL)"])))
+let hugePart = hugeBS.flatMap { $0.items["BODYSTRUCTURE"] }.flatMap { BodyPart.parse($0) }
+check("huge size clamped", hugePart?.size == 1 << 30 && hugePart!.decodedSize > 0)
+
+// Malformed base64 padding keeps the payload (V2-29)
+check("base64 tolerates inner padding", String(data: MIME.decodeBase64(Data("QUJD=RUY=".utf8)), encoding: .utf8) == "ABCEF")
+
+// Malformed modified UTF-7 is kept verbatim, not dropped (V2-28)
+check("mutf7 malformed not dropped", MailboxName.decode("&!!!!-rest") != "rest" && MailboxName.decode("&!!!!-rest").contains("rest"))
+
+// 'Re: budget' stays a local search (BUG-22)
+let sqRe = SearchQuery.parse("Re: budget")
+check("Re: budget local search", sqRe.words.contains("budget") && sqRe.serverOnly.isEmpty && sqRe.hasLocalCriteria)
+let sqTime = SearchQuery.parse("\"time: 5pm\"")
+check("quoted colon token", sqTime.serverOnly.isEmpty && !sqTime.words.isEmpty)
+
+// days() overflow clamps instead of trapping (BUG-43)
+check("huge newer_than clamps", SearchQuery.days("99999999999999999y") == Int.max && SearchQuery.days("9223372036854775807m") == Int.max)
+
+// Non-representable criteria are reported, never widened to ALL (BUG-10)
+check("attachment not imap-representable", !SearchQuery.parse("invoice has:attachment").isIMAPRepresentable)
+check("serverOnly not imap-representable", !SearchQuery.parse("in:inbox").isIMAPRepresentable)
+check("non-ascii not imap-representable", !SearchQuery.parse("café").isIMAPRepresentable)
+check("plain ascii imap-representable", SearchQuery.parse("invoice").isIMAPRepresentable && SearchQuery.parse("invoice").imapCriteria != "ALL")
+
 print(failures == 0 ? "ALL PASS" : "\(failures) FAILED")
 exit(failures == 0 ? 0 : 1)

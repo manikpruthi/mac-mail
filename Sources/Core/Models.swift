@@ -108,7 +108,17 @@ struct EmailAddress: Hashable, Codable {
     var email: String
 
     var display: String { name.isEmpty ? email : name }
-    var full: String { name.isEmpty ? email : "\(name) <\(email)>" }
+    /// Header form. Names containing separators/controls are quoted and escaped so this round-trips
+    /// through MIME.parseAddresses as exactly one address.
+    var full: String {
+        guard !name.isEmpty else { return email }
+        let risky = name.contains { c in
+            ",;\"<>@".contains(c) || c.unicodeScalars.contains { $0.value < 0x20 || $0.value == 0x7f }
+        }
+        guard risky else { return "\(name) <\(email)>" }
+        let escaped = name.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
+        return "\"\(escaped)\" <\(email)>"
+    }
 }
 
 /// One row in the message list. A class, because NSOutlineView items must be objects.

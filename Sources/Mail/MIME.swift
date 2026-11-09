@@ -17,7 +17,8 @@ enum MIME {
     static func decodeBase64(_ data: Data) -> Data {
         var clean = [UInt8]()
         clean.reserveCapacity(data.count)
-        for b in data where isBase64Char(b) { clean.append(b) }
+        // Ignore every '=' (valid or misplaced) and re-pad, so malformed padding can't blank the payload.
+        for b in data where isBase64Char(b) && b != UInt8(ascii: "=") { clean.append(b) }
         while clean.count % 4 != 0 { clean.append(UInt8(ascii: "=")) }
         return Data(base64Encoded: Data(clean)) ?? Data()
     }
@@ -232,11 +233,11 @@ enum MIME {
 
     /// Senders sometimes put a link in an address header ("<mailto:help@bank.in.>"); Gmail rejects that as not
     /// RFC 5321. Strip a mailto: scheme and any ?query, and the trailing dots of a fully-qualified domain.
+    /// Percent-encoding is deliberately NOT decoded: "%0D%0A" must stay inert, never become CRLF.
     static func cleanEmail(_ raw: String) -> String {
         var e = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         if e.lowercased().hasPrefix("mailto:") { e = String(e.dropFirst(7)) }
         if let q = e.firstIndex(of: "?") { e = String(e[..<q]) }
-        e = e.removingPercentEncoding ?? e
         while e.hasSuffix(".") { e.removeLast() }
         return e.trimmingCharacters(in: CharacterSet(charactersIn: "<> \t"))
     }

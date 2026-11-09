@@ -22,8 +22,8 @@ struct BodyPart: Codable, Equatable {
         MIME.parameter("filename", in: dispositionParams) ?? MIME.parameter("name", in: params)
     }
 
-    /// Approximate decoded size (base64 inflates by 4/3).
-    var decodedSize: Int { encoding.lowercased() == "base64" ? size * 3 / 4 : size }
+    /// Approximate decoded size (base64 inflates by 4/3). Written without overflow for hostile sizes.
+    var decodedSize: Int { encoding.lowercased() == "base64" ? size - size / 4 : size }
 
     var isAttachmentDisposition: Bool { disposition?.lowercased() == "attachment" }
 
@@ -31,18 +31,18 @@ struct BodyPart: Codable, Equatable {
 
     static func parse(_ value: IMAPValue) -> BodyPart? {
         guard let list = value.list else { return nil }
-        return parse(list, partID: "")
+        return parse(list, partID: "", depth: 0)
     }
 
-    private static func parse(_ v: [IMAPValue], partID: String) -> BodyPart? {
-        guard !v.isEmpty else { return nil }
+    private static func parse(_ v: [IMAPValue], partID: String, depth: Int) -> BodyPart? {
+        guard !v.isEmpty, depth < 64 else { return nil }
         if v.first?.list != nil {
             // Multipart: (child)(child)... "SUBTYPE" [params [disposition [language [location]]]]
             var children: [BodyPart] = []
             var i = 0
             while i < v.count, let childList = v[i].list {
                 let childID = partID.isEmpty ? "\(i + 1)" : "\(partID).\(i + 1)"
-                if let child = parse(childList, partID: childID) { children.append(child) }
+                if let child = parse(childList, partID: childID, depth: depth + 1) { children.append(child) }
                 i += 1
             }
             var part = BodyPart(partID: partID.isEmpty ? "TEXT" : partID, type: "multipart",
@@ -59,7 +59,7 @@ struct BodyPart: Codable, Equatable {
         if v.count > 2 { part.params = pairs(v[2]) }
         if v.count > 3, let cid = v[3].text { part.contentID = cid.trimmingCharacters(in: CharacterSet(charactersIn: "<> ")) }
         if v.count > 5, let enc = v[5].text { part.encoding = enc.lowercased() }
-        if v.count > 6, let size = v[6].number { part.size = Int(size) }
+        if v.count > 6, let size = v[6].number { part.size = Int(clamping: min(size, UInt64(1 << 30))) }
         var extStart = 7
         if part.type == "text" { extStart = 8 }
         if part.type == "message" && part.subtype == "rfc822" { extStart = 10 }

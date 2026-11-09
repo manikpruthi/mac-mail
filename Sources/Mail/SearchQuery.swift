@@ -27,6 +27,14 @@ struct SearchQuery: Equatable {
 
     // MARK: Parsing
 
+    /// Operators the parser understands; anything else with a colon is plain text, so subjects like
+    /// "Re: budget" or "time: 10am" stay searchable locally instead of becoming server-only.
+    private static let knownOperators: Set<String> = [
+        "from", "to", "cc", "bcc", "subject", "has", "is", "in", "label", "list", "category",
+        "filename", "newer_than", "older_than", "after", "before", "around", "larger", "smaller",
+        "deliveredto", "rfc822msgid",
+    ]
+
     /// Accepts Gmail syntax, including a space after the colon ("from: divya") and quoted values (from:"divya k").
     static func parse(_ raw: String) -> SearchQuery {
         var q = SearchQuery()
@@ -35,7 +43,9 @@ struct SearchQuery: Equatable {
         while i < tokens.count {
             var token = tokens[i]
             // "from:" followed by a separate value token.
-            if token.hasSuffix(":"), token.count > 1, i + 1 < tokens.count, !tokens[i + 1].contains(":") || tokens[i + 1].hasPrefix("\"") {
+            if token.hasSuffix(":"), token.count > 1,
+               knownOperators.contains(token.dropLast().lowercased()),
+               i + 1 < tokens.count, !tokens[i + 1].contains(":") || tokens[i + 1].hasPrefix("\"") {
                 token += tokens[i + 1]
                 i += 1
             }
@@ -47,10 +57,11 @@ struct SearchQuery: Equatable {
             }
             let key = token[..<colon].lowercased()
             let value = unquote(String(token[token.index(after: colon)...]))
-            guard !value.isEmpty else { continue }
+            guard !value.isEmpty else { continue } // bare "Re:" carries nothing to search for
             switch key {
             case "from": q.from.append(value)
             case "to", "cc": q.to.append(value)
+            case "bcc": q.serverOnly.append("bcc:\(quoteIfNeeded(value))")
             case "subject": q.subject.append(value)
             case "has" where value.lowercased().hasPrefix("attachment"): q.hasAttachment = true
             case "is":
@@ -64,6 +75,11 @@ struct SearchQuery: Equatable {
             case "http", "https", "mailto":
                 q.words.append(token)
             default:
+                guard knownOperators.contains(key) else {
+                    let w = unquote(token)
+                    if !w.isEmpty { q.words.append(w) }
+                    continue
+                }
                 q.serverOnly.append("\(key):\(quoteIfNeeded(value))")
             }
         }
@@ -92,13 +108,13 @@ struct SearchQuery: Equatable {
 
     private static func quoteIfNeeded(_ s: String) -> String { s.contains(" ") ? "\"\(s)\"" : s }
 
-    /// "7d" → 7, "2m" → 60, "1y" → 365.
+    /// "7d" → 7, "2m" → 60, "1y" → 365. Huge values clamp instead of trapping.
     static func days(_ s: String) -> Int? {
         guard let unit = s.last, let n = Int(s.dropLast()) else { return nil }
         switch unit {
         case "d": return n
-        case "m": return n * 30
-        case "y": return n * 365
+        case "m": return n > Int.max / 30 ? Int.max : n * 30
+        case "y": return n > Int.max / 365 ? Int.max : n * 365
         default: return nil
         }
     }
@@ -117,6 +133,15 @@ struct SearchQuery: Equatable {
         if let d = withinDays { parts.append("newer_than:\(d)d") }
         parts += serverOnly
         return parts.joined(separator: " ")
+    }
+
+    /// Whether the query is fully expressible as plain IMAP SEARCH for non-Gmail servers: no has:attachment,
+    /// no server-only operators, and ASCII-only values. When false, the server search must be skipped
+    /// (or its results post-filtered) rather than silently widened to "ALL".
+    var isIMAPRepresentable: Bool {
+        guard serverOnly.isEmpty && !hasAttachment else { return false }
+        let all = words + from + to + subject
+        return all.allSatisfy { $0.unicodeScalars.allSatisfy(\.isASCII) }
     }
 
     /// Plain IMAP SEARCH criteria for non-Gmail servers (ASCII values only; others are left to the local search).

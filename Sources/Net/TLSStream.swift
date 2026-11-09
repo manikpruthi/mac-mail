@@ -39,6 +39,11 @@ private final class OnceFlag: @unchecked Sendable {
 
 /// A buffered TLS byte stream on Network.framework with line and byte-count reads.
 actor TLSStream {
+    /// A single response line longer than this is a protocol error, not data.
+    static let maxLineLength = 1024 * 1024
+    /// A single literal read larger than this is refused (matches IMAPParser.maxLiteralSize).
+    static let maxReadSize = 64 * 1024 * 1024
+
     private let connection: NWConnection
     private var buffer: [UInt8] = []
     private var start = 0
@@ -113,7 +118,7 @@ actor TLSStream {
         buffer.append(contentsOf: chunk)
     }
 
-    /// Reads one line without its CRLF.
+    /// Reads one line without its CRLF. Lines past maxLineLength abort the connection.
     func readLine() async throws -> [UInt8] {
         var scanned = 0
         while true {
@@ -128,11 +133,13 @@ actor TLSStream {
                 i += 1
             }
             scanned = buffer.count - start
+            guard scanned <= Self.maxLineLength else { throw NetError.protocolError("line too long") }
             try await fill()
         }
     }
 
     func readBytes(_ n: Int) async throws -> Data {
+        guard n >= 0, n <= Self.maxReadSize else { throw NetError.protocolError("read too large") }
         while buffer.count - start < n { try await fill() }
         let d = Data(buffer[start..<start + n])
         start += n
