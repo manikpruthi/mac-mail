@@ -345,7 +345,8 @@ extension String {
     /// so they are stripped rather than sent verbatim.
     var imapQuoted: String {
         let escaped = replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
-        return "\"" + escaped.filter { $0 != "\r" && $0 != "\n" } + "\""
+        // Scalars, not Characters: Swift folds "\r\n" into one Character, which a Character filter lets through.
+        return "\"" + String(String.UnicodeScalarView(escaped.unicodeScalars.filter { $0 != "\r" && $0 != "\n" })) + "\""
     }
 }
 

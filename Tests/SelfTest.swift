@@ -434,6 +434,7 @@ MainActor.assumeIsolated {
 // X-net-2: CR/LF in an IMAP quoted string would inject extra commands. Lone CR/LF are stripped; note that
 // a "\r\n" PAIR is one Swift Character and survives the filter — recorded as STILL-OPEN in r-tests.md.
 check("imapQuoted strips lone CR/LF", "p\ra\nss".imapQuoted == "\"pass\"")
+check("imapQuoted strips a CRLF pair", "a\r\nb".imapQuoted == "\"ab\"")
 check("imapQuoted still escapes", "a\"b\\c".imapQuoted == "\"a\\\"b\\\\c\"")
 
 // C-01: STARTTLS must be able to throw away pre-handshake plaintext. The real network behaviour needs a
@@ -531,7 +532,7 @@ do {
         if depth == 0 { return "Content-Type: text/plain\r\n\r\nleaf\r\n" }
         return "Content-Type: multipart/mixed; boundary=\"d\(depth)\"\r\n\r\n--d\(depth)\r\n" + nest(depth - 1) + "--d\(depth)--\r\n"
     }
-    func anyTruncated(_ p: BodyPart) -> Bool { p.truncated || p.children.contains { anyTruncated($0) } }
+    func anyTruncated(_ p: BodyPart) -> Bool { (p.truncated ?? false) || p.children.contains { anyTruncated($0) } }
     let deep = try? EMLDocument.parse(Data(("From: a@example.com\r\nSubject: deep\r\n" + nest(25)).utf8))
     check("deep nesting truncated", deep != nil && anyTruncated(deep!.structure))
     var many = "From: a@example.com\r\nSubject: many\r\nContent-Type: multipart/mixed; boundary=\"m\"\r\n\r\n"

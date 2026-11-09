@@ -729,7 +729,6 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSSearc
             return list.focusedRow != nil || rows.count == 1
         case #selector(archiveMessages(_:)), #selector(deleteMessages(_:)), #selector(toggleSpam(_:)),
              #selector(toggleFlag(_:)), #selector(toggleRead(_:)), #selector(markUnread(_:)), #selector(moveToFolder(_:)):
-            if action == #selector(toggleConversations(_:)) { return true }
             return !rows.isEmpty
         case #selector(toggleConversations(_:)):
             item?.state = list.grouped ? .on : .off

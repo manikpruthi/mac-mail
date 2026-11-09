@@ -110,6 +110,17 @@ final class Outbox {
         NotificationCenter.default.post(name: .mailOutboxChanged, object: nil)
     }
 
+    /// Clears a refusal so the next flush tries the message again (C-26).
+    func resetFailure(_ id: String) {
+        guard let i = items.firstIndex(where: { $0.id == id }) else { return }
+        items[i].attempts = 0
+        items[i].lastError = nil
+        do { try write(items[i]) } catch {
+            DiagnosticsLog.record("Outbox: couldn't reset the failure record for a queued message: \(error.localizedDescription)")
+        }
+        NotificationCenter.default.post(name: .mailOutboxChanged, object: nil)
+    }
+
     func remove(account: String) {
         for i in items where i.accountID == account { remove(i.id) }
     }

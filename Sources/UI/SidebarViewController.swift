@@ -140,6 +140,30 @@ final class SidebarViewController: NSViewController, NSOutlineViewDataSource, NS
     @objc private func statusNote() { updateStatus() }
 
     @objc private func statusClicked() {
+        // A refused outbox message never goes out by itself: offer to retry or delete it (C-26).
+        let outbox = MailService.shared.outbox
+        if let failed = outbox.items.first(where: { $0.lastError != nil }), let window = view.window,
+           window.attachedSheet == nil {
+            let alert = NSAlert()
+            alert.messageText = "“\(failed.subject.isEmpty ? "(No Subject)" : failed.subject)” wasn't sent"
+            alert.informativeText = (failed.lastError ?? "") + "\n\nRetry sends it again. Delete removes it from the Outbox; a copy stays in Drafts if one was saved."
+            alert.addButton(withTitle: "Retry")
+            alert.addButton(withTitle: "Cancel")
+            alert.addButton(withTitle: "Delete").hasDestructiveAction = true
+            let id = failed.id
+            alert.beginSheetModal(for: window) { [weak self] response in
+                switch response {
+                case .alertFirstButtonReturn:
+                    outbox.resetFailure(id)
+                    MailService.shared.flushOutbox()
+                case .alertThirdButtonReturn:
+                    outbox.remove(id)
+                default: break
+                }
+                self?.updateStatus()
+            }
+            return
+        }
         MailService.shared.flushAll()
         MailService.shared.flushOutbox()
         updateStatus()

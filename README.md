@@ -180,7 +180,7 @@ tools/selftest.sh
 - **Message → Move to…:** pick a folder with the keyboard.
 - **⌘+ / ⌘- / ⌘0:** reading-pane zoom (works wherever focus is in the window).
 - **⌥⌘F:** search all mail.
-- **⌥⌘R:** sync now. **Click the sidebar status** to retry queued actions or messages in the Outbox.
+- **⌥⌘R:** sync now. **Click the sidebar status** to retry queued actions or messages in the Outbox; when the server refused a message, the click offers Retry or Delete for it.
 - **⌘,:** Settings (accounts, signatures, appearance, offline window, image limits, Undo Send delay, default email app).
 - **Double-click a draft:** continue editing it.
 
@@ -238,7 +238,7 @@ Timings can be reproduced with `MAC_MAIL_DEBUG=1 MAC_MAIL_BENCH=1`, which opens 
 - Encrypted mail (S/MIME, PGP) and calendar aren't included.
 - An image whose server offers no https version can't be shown (plain http is never used).
 - Default builds are ad-hoc signed with the hardened runtime and no secure timestamp; they aren't sandboxed or notarized. A Developer ID build can be notarized with `package.sh`. The local cache, autosaves and outbox aren't encrypted (they're readable only by your user account).
-- The Outbox has no per-message Retry or Delete yet: clicking the sidebar status retries messages that haven't already failed five times, and a message the server keeps refusing stays there.
+- A message the server refuses stays in the Outbox until you act on it: click the sidebar status and choose Retry or Delete.
 - Local search returns at most 2,000 matches, shown 1,000 at a time.
 - The SQLite cache is still read and written on the main thread (bulk work such as pruning, clearing the text cache and the Storage figures runs off it).
 
