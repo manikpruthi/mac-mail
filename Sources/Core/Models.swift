@@ -12,17 +12,40 @@ enum Provider: String, Codable {
     }
 }
 
+/// How a connection is secured (F-01): implicit TLS from the first byte (993 / 465), or a plain connection
+/// upgraded with STARTTLS before anything secret is sent (143 / 587). Plain text is never offered.
+enum ConnectionSecurity: String, Codable, CaseIterable {
+    case tls, startTLS
+
+    var label: String {
+        switch self {
+        case .tls: return "SSL/TLS"
+        case .startTLS: return "STARTTLS"
+        }
+    }
+
+    /// The usual mode for a port, used when an older saved account has none recorded.
+    static func defaultFor(port: UInt16) -> ConnectionSecurity {
+        port == 143 || port == 587 || port == 25 ? .startTLS : .tls
+    }
+}
+
 struct Account: Codable, Equatable, Identifiable {
     var id: String
     var email: String
     var displayName: String
     var provider: Provider
+    /// IMAP login (often the email address, but not always: F-03).
     var username: String
     var imapHost: String
     var imapPort: UInt16
     var smtpHost: String
     var smtpPort: UInt16
     var signature: String
+    var imapSecurity: ConnectionSecurity = .tls
+    var smtpSecurity: ConnectionSecurity = .tls
+    /// SMTP login when it differs from the IMAP one; empty means "same as IMAP".
+    var smtpUsername: String = ""
 
     static func gmail(email: String, name: String) -> Account {
         Account(id: UUID().uuidString, email: email, displayName: name, provider: .gmail, username: email,
@@ -30,6 +53,48 @@ struct Account: Codable, Equatable, Identifiable {
     }
 
     var fromHeader: EmailAddress { EmailAddress(name: displayName, email: email) }
+    var smtpLogin: String { smtpUsername.isEmpty ? username : smtpUsername }
+
+    /// Whether a change needs the live connections and cached password dropped (B-11).
+    func connectionDiffers(from other: Account) -> Bool {
+        username != other.username || imapHost != other.imapHost || imapPort != other.imapPort
+            || smtpHost != other.smtpHost || smtpPort != other.smtpPort || imapSecurity != other.imapSecurity
+            || smtpSecurity != other.smtpSecurity || smtpUsername != other.smtpUsername
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, email, displayName, provider, username, imapHost, imapPort, smtpHost, smtpPort, signature
+        case imapSecurity, smtpSecurity, smtpUsername
+    }
+
+    init(id: String, email: String, displayName: String, provider: Provider, username: String, imapHost: String,
+         imapPort: UInt16, smtpHost: String, smtpPort: UInt16, signature: String,
+         imapSecurity: ConnectionSecurity? = nil, smtpSecurity: ConnectionSecurity? = nil, smtpUsername: String = "") {
+        self.id = id; self.email = email; self.displayName = displayName; self.provider = provider
+        self.username = username; self.imapHost = imapHost; self.imapPort = imapPort
+        self.smtpHost = smtpHost; self.smtpPort = smtpPort; self.signature = signature
+        self.imapSecurity = imapSecurity ?? .defaultFor(port: imapPort)
+        self.smtpSecurity = smtpSecurity ?? .defaultFor(port: smtpPort)
+        self.smtpUsername = smtpUsername
+    }
+
+    /// Accounts saved by older builds have no security or SMTP-login fields; they decode with the defaults.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(String.self, forKey: .id)
+        email = try c.decode(String.self, forKey: .email)
+        displayName = try c.decode(String.self, forKey: .displayName)
+        provider = try c.decode(Provider.self, forKey: .provider)
+        username = try c.decode(String.self, forKey: .username)
+        imapHost = try c.decode(String.self, forKey: .imapHost)
+        imapPort = try c.decode(UInt16.self, forKey: .imapPort)
+        smtpHost = try c.decode(String.self, forKey: .smtpHost)
+        smtpPort = try c.decode(UInt16.self, forKey: .smtpPort)
+        signature = try c.decodeIfPresent(String.self, forKey: .signature) ?? ""
+        imapSecurity = try c.decodeIfPresent(ConnectionSecurity.self, forKey: .imapSecurity) ?? .defaultFor(port: imapPort)
+        smtpSecurity = try c.decodeIfPresent(ConnectionSecurity.self, forKey: .smtpSecurity) ?? .defaultFor(port: smtpPort)
+        smtpUsername = try c.decodeIfPresent(String.self, forKey: .smtpUsername) ?? ""
+    }
 }
 
 enum FolderRole: String {
@@ -222,6 +287,8 @@ extension Notification.Name {
     static let mailCountsChanged = Notification.Name("MacMail.countsChanged")
     static let mailAccountsChanged = Notification.Name("MacMail.accountsChanged")
     static let themeChanged = Notification.Name("MacMail.themeChanged")
+    /// The offline outbox gained or lost a message (F-07).
+    static let mailOutboxChanged = Notification.Name("MacMail.outboxChanged")
 }
 
 /// What changed in the cached mail (the typed payload of `.mailDataChanged`, ARC-09).

@@ -17,6 +17,8 @@ enum Prefs {
             "undoSendSeconds": 10,
             "notifyNewMail": true,
             "theme": "system",
+            "sortOrder": "dateDesc",
+            "compactRows": false,
         ])
     }
 
@@ -67,6 +69,39 @@ enum Prefs {
         set { d.set(newValue, forKey: "notifyNewMail") }
     }
 
+    /// Message list order (F-24).
+    enum SortOrder: String, CaseIterable {
+        case dateDesc, dateAsc, sender, subject
+        var label: String {
+            switch self {
+            case .dateDesc: return "Newest First"
+            case .dateAsc: return "Oldest First"
+            case .sender: return "Sender"
+            case .subject: return "Subject"
+            }
+        }
+    }
+
+    static var sortOrder: SortOrder {
+        get { SortOrder(rawValue: d.string(forKey: "sortOrder") ?? "") ?? .dateDesc }
+        set { d.set(newValue.rawValue, forKey: "sortOrder") }
+    }
+
+    /// Two-line rows instead of three (F-24).
+    static var compactRows: Bool {
+        get { d.bool(forKey: "compactRows") }
+        set { d.set(newValue, forKey: "compactRows") }
+    }
+
+    /// Per-account new-mail notifications (F-23); accounts are on unless switched off.
+    static func notifications(for accountID: String) -> Bool {
+        d.object(forKey: "notify." + accountID) == nil || d.bool(forKey: "notify." + accountID)
+    }
+
+    static func setNotifications(_ on: Bool, for accountID: String) {
+        d.set(on, forKey: "notify." + accountID)
+    }
+
     enum Theme: String, CaseIterable {
         case system, light, dark
         var label: String {
@@ -108,25 +143,53 @@ enum Prefs {
 enum AppPaths {
     static let isDemo = ProcessInfo.processInfo.environment["MAC_MAIL_DEMO"] == "1"
 
-    static var support: URL {
-        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-        let dir = base.appendingPathComponent(isDemo ? "MacMailDemo" : "MacMail", isDirectory: true)
+    /// Resolved and created once (O-22): these used to run createDirectory on every access, including per image.
+    /// MAC_MAIL_SUPPORT_DIR / MAC_MAIL_CACHE_DIR redirect them for the offline tests.
+    static let support: URL = {
+        let env = ProcessInfo.processInfo.environment
+        let dir: URL
+        if let custom = env["MAC_MAIL_SUPPORT_DIR"], !custom.isEmpty {
+            dir = URL(fileURLWithPath: custom, isDirectory: true)
+        } else {
+            let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            dir = base.appendingPathComponent(isDemo ? "MacMailDemo" : "MacMail", isDirectory: true)
+        }
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir
-    }
+    }()
 
-    static var caches: URL {
-        let base = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
-        let dir = base.appendingPathComponent("com.manikpruthi.macmail", isDirectory: true)
+    static let caches: URL = {
+        let env = ProcessInfo.processInfo.environment
+        let dir: URL
+        if let custom = env["MAC_MAIL_CACHE_DIR"], !custom.isEmpty {
+            dir = URL(fileURLWithPath: custom, isDirectory: true)
+        } else {
+            let base = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+            dir = base.appendingPathComponent("com.manikpruthi.macmail", isDirectory: true)
+        }
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir
-    }
+    }()
 
-    static var imageCache: URL {
+    static let imageCache: URL = {
         let dir = caches.appendingPathComponent("images", isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir
-    }
+    }()
+
+    /// Unsent composers are autosaved here so a crash or forced quit can't lose them (F-06).
+    static let autosave: URL = {
+        let dir = support.appendingPathComponent("Autosave", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir
+    }()
+
+    /// Messages waiting to be sent while offline (F-07): one folder per message with its MIME and metadata.
+    static let outbox: URL = {
+        let dir = support.appendingPathComponent("Outbox", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir
+    }()
 
     static func tempDir(_ name: String) -> URL {
         let dir = FileManager.default.temporaryDirectory
@@ -134,5 +197,16 @@ enum AppPaths {
             .appendingPathComponent(name + "-" + UUID().uuidString.prefix(8), isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir
+    }
+
+    /// Total size of the files under a directory (diagnostics).
+    static func directorySize(_ url: URL) -> Int64 {
+        guard let e = FileManager.default.enumerator(at: url, includingPropertiesForKeys: [.fileSizeKey, .isRegularFileKey]) else { return 0 }
+        var total: Int64 = 0
+        for case let f as URL in e {
+            let v = try? f.resourceValues(forKeys: [.fileSizeKey, .isRegularFileKey])
+            if v?.isRegularFile == true { total += Int64(v?.fileSize ?? 0) }
+        }
+        return total
     }
 }

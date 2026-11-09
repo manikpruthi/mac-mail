@@ -23,3 +23,7 @@ brag-output-*/
 
 # Release DMGs are build output (see package.sh)
 release/
+
+# Selftest leftovers and other agents' local state
+.selftest-attachment.tmp
+.commandcode/

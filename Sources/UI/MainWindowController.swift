@@ -56,6 +56,7 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSSearc
         ])
 
         sidebar.onSelect = { [weak self] source in self?.showSource(source) }
+        sidebar.onSavedSearch = { [weak self] q in self?.runSearch(q) }
         list.onSelectionChange = { [weak self] rows, userInitiated in self?.selectionChanged(rows, userInitiated: userInitiated) }
         list.onOpen = { [weak self] row in self?.openRow(row) }
         list.showToast = { [weak self] s in self?.toast.show(s) }
@@ -104,12 +105,17 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSSearc
         searchField?.stringValue = ""
         list.show(source)
         preview.showEmpty(text: "No message selected")
+        syncSource(source)
+        list.selectFirst()
+    }
+
+    private func syncSource(_ source: MailSource) {
         switch source {
         case .folder(let id): MailService.shared.sync(folderID: id)
         case .unified: MailService.shared.syncAllInboxes()
-        case .search: break
+        case .unifiedRole(let role): MailService.shared.syncAll(role: role)
+        case .flagged, .search: break
         }
-        list.selectFirst()
     }
 
     private func selectionChanged(_ rows: [MessageRow], userInitiated: Bool) {
@@ -158,11 +164,7 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSSearc
 
     /// Re-sync when the user comes back to the app (cheap: a delta check).
     func appBecameActive() {
-        switch list.source {
-        case .folder(let id): MailService.shared.sync(folderID: id)
-        case .unified: MailService.shared.syncAllInboxes()
-        case .search: break
-        }
+        syncSource(list.source)
     }
 
     // MARK: Toolbar
@@ -258,10 +260,30 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSSearc
             menu.addItem(item)
         }
         if !recentSearches.isEmpty { menu.addItem(.separator()) }
+        let save = NSMenuItem(title: "Save This Search…", action: #selector(saveCurrentSearch(_:)), keyEquivalent: "")
+        save.target = self
+        menu.addItem(save)
         let help = NSMenuItem(title: "Search syntax help", action: #selector(showSearchHelp(_:)), keyEquivalent: "")
         help.target = self
         menu.addItem(help)
         return menu
+    }
+
+    /// Keeps the current query as a sidebar smart folder (F-29).
+    @objc func saveCurrentSearch(_ sender: Any?) {
+        let q = searchField?.stringValue.trimmingCharacters(in: .whitespaces) ?? ""
+        guard !q.isEmpty, let w = window else { NSSound.beep(); return }
+        let alert = NSAlert()
+        alert.messageText = "Save search"
+        alert.informativeText = "“\(q)” will appear under Saved Searches in the sidebar."
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 260, height: 24))
+        field.stringValue = q
+        alert.accessoryView = field
+        alert.addButton(withTitle: "Save")
+        alert.addButton(withTitle: "Cancel")
+        alert.beginSheetModal(for: w) { r in
+            if r == .alertFirstButtonReturn { SavedSearches.add(name: field.stringValue, query: q) }
+        }
     }
 
     @objc private func useRecentSearch(_ sender: NSMenuItem) {
@@ -406,9 +428,10 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSSearc
         guard !rows.isEmpty, let acct = rows.first?.accountID, rows.allSatisfy({ $0.accountID == acct }) else {
             NSSound.beep(); return
         }
-        folderPicker = FolderPicker(account: acct) { [weak self] path in
+        // One picker at a time, released when its sheet ends (B-25).
+        folderPicker = FolderPicker(account: acct, onPick: { [weak self] path in
             self?.move(rows, to: .folder(path))
-        }
+        }, onFinish: { [weak self] in self?.folderPicker = nil })
         folderPicker?.beginSheet(on: window)
     }
 
@@ -482,7 +505,9 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSSearc
         // Only move the cursor when the open/selected message is the one that left the list.
         let selectedIDs = Set(list.selectedRows.map { $0.id })
         let touchesSelection = rows.contains { selectedIDs.contains($0.id) }
-        if let label = MailService.shared.move(rows, to: target) {
+        // MailService.move posts a full data change; this reload already covers it (B-24 / O-18).
+        list.skipNextFullReload = true
+        if let result = MailService.shared.move(rows, to: target) {
             if touchesSelection {
                 list.reload(keepSelection: false)
                 // The cursor move after archive/delete never marks the next message read.
@@ -490,8 +515,16 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSSearc
             } else {
                 list.reload(keepSelection: true)
             }
-            toast.show(label)
+            if let undoID = result.undoID {
+                // The server isn't told until the Undo window closes (F-08).
+                toast.show(result.label, action: ("Undo", { [weak self] in
+                    if MailService.shared.undo(undoID) { self?.list.reload(keepSelection: true) }
+                }), duration: MailService.undoWindow)
+            } else {
+                toast.show(result.label)
+            }
         } else {
+            list.skipNextFullReload = false
             NSSound.beep()
         }
     }
@@ -519,6 +552,29 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSSearc
 
     @objc func saveAttachments(_ sender: Any?) {
         preview.saveAllAttachments()
+    }
+
+    /// File ▸ Save As… (F-17): the original message as a standard .eml file that Mac Mail, Apple Mail,
+    /// Outlook and Thunderbird all open.
+    @objc func saveMessageAs(_ sender: Any?) {
+        guard let row = list.focusedRow ?? targets.first else { NSSound.beep(); return }
+        MessageActions.saveAs(row, in: window) { [weak self] s in self?.toast.show(s) }
+    }
+
+    @objc func printMessage(_ sender: Any?) {
+        guard list.focusedRow != nil else { NSSound.beep(); return }
+        preview.printMessage()
+    }
+
+    /// Mailbox ▸ Empty Trash / Empty Spam for the selected folder's account (F-10).
+    @objc func emptyTrash(_ sender: Any?) { emptyRole(.trash) }
+    @objc func emptySpam(_ sender: Any?) { emptyRole(.spam) }
+
+    private func emptyRole(_ role: FolderRole) {
+        let store = MailService.shared.store
+        let account = sidebar.selectedFolder?.accountID ?? list.focusedRow?.accountID ?? MailService.shared.defaultAccount?.id
+        guard let account, let f = store.folder(account: account, role: role) else { NSSound.beep(); return }
+        SidebarViewController.confirmEmpty(f, in: window)
     }
 
     @objc func syncNow(_ sender: Any?) {
@@ -553,6 +609,11 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSSearc
             return true
         case #selector(newMessage(_:)):
             return !MailService.shared.accounts.isEmpty
+        case #selector(saveMessageAs(_:)), #selector(printMessage(_:)):
+            return list.focusedRow != nil
+        case #selector(saveCurrentSearch(_:)):
+            if case .search = list.source { return true }
+            return false
         default:
             return true
         }
@@ -581,14 +642,16 @@ extension MainWindowController: NSMenuDelegate {
 @MainActor
 final class FolderPicker: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     private let onPick: (String) -> Void
+    private let onFinish: () -> Void
     private let field = NSSearchField()
     private let table = NSTableView()
     private var all: [Folder]
     private var shown: [Folder] = []
     private var sheet: NSWindow?
 
-    init(account: String, onPick: @escaping (String) -> Void) {
+    init(account: String, onPick: @escaping (String) -> Void, onFinish: @escaping () -> Void = {}) {
         self.onPick = onPick
+        self.onFinish = onFinish
         all = MailService.shared.store.folders(account: account).filter { $0.selectable }
         super.init()
         shown = all
@@ -656,11 +719,13 @@ final class FolderPicker: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         s.sheetParent?.endSheet(s)
         sheet = nil
         onPick(f.path)
+        onFinish()
     }
 
     @objc private func dismiss() {
-        sheet?.sheetParent?.endSheet(sheet!)
+        if let s = sheet { s.sheetParent?.endSheet(s) }
         sheet = nil
+        onFinish()
     }
 
     private var selected: Folder? {

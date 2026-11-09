@@ -15,6 +15,8 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
         case reply(MessageDetail, StoredBody?, all: Bool)
         case forward(MessageDetail, StoredBody?)
         case draft(MessageDetail, StoredBody?)
+        /// A composer recovered from its autosave after a crash or forced quit (F-06).
+        case restored(ComposerAutosave)
     }
 
     private static var open: Set<ComposeWindowController> = []
@@ -53,6 +55,11 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
     private var sentOrDiscarded = false
     private var pendingSendID: UUID?
     private var tempDirs: [URL] = []
+    /// Autosave identity (F-06): one file per composer, removed when it's sent, saved or discarded.
+    private var autosaveID = UUID().uuidString
+    private var autosaveWork: DispatchWorkItem?
+    /// Attachment sizes, read once when added (O-24).
+    private var attachmentSizes: [URL: Int] = [:]
 
     init(kind: Kind) {
         self.kind = kind
@@ -69,6 +76,47 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
         w.center()
         w.cascadeTopLeft(from: NSPoint(x: w.frame.minX + CGFloat(Self.open.count * 22), y: w.frame.maxY - CGFloat(Self.open.count * 22)))
         dirty = false
+        if case .restored = kind { dirty = true }
+    }
+
+    // MARK: Autosave and crash recovery (F-06)
+
+    /// Re-opens composers whose autosave survived a crash or forced quit. Called once at launch.
+    static func restoreAutosaved() {
+        for record in ComposerAutosave.all() {
+            guard MailService.shared.account(record.accountID) != nil || !MailService.shared.accounts.isEmpty else { continue }
+            open(.restored(record))
+        }
+    }
+
+    private func scheduleAutosave() {
+        guard !sentOrDiscarded else { return }
+        autosaveWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in self?.autosaveNow() }
+        autosaveWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3, execute: work)
+    }
+
+    private func autosaveNow() {
+        guard dirty, !sentOrDiscarded, let account else { return }
+        commitEditing()
+        let attr = textView.attributedString()
+        // RTFD keeps inline images; old autosaves are plain RTF and still load.
+        let rtf = InlineImage.rtfd(attr)
+        let record = ComposerAutosave(
+            id: autosaveID, accountID: account.id,
+            to: (toField.objectValue as? [String]) ?? [], cc: (ccField.objectValue as? [String]) ?? [],
+            bcc: (bccField.objectValue as? [String]) ?? [], subject: subjectField.stringValue,
+            bodyRTF: rtf, attachments: attachments.map { $0.url.path }, inReplyTo: inReplyTo, references: references,
+            quotedHTML: quotedHTML, quotedText: quotedText, includeOriginal: includeOriginal.state == .on,
+            draftRowID: draftRow?.id, replyRowID: replyRow?.id, saved: Date(),
+            imageWidths: InlineImage.widths(attr).map { Double($0) })
+        record.write()
+    }
+
+    private func discardAutosave() {
+        autosaveWork?.cancel()
+        ComposerAutosave.remove(autosaveID)
     }
 
     required init?(coder: NSCoder) { fatalError() }
@@ -133,7 +181,6 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
         textView.usesFindBar = true
         textView.delegate = self
         textView.onDropFiles = { [weak self] urls in self?.addAttachments(urls) }
-        textView.onPasteImage = { [weak self] data in self?.addPastedImage(data) }
         textView.isVerticallyResizable = true
         textView.isHorizontallyResizable = false
         textView.autoresizingMask = [.width]
@@ -321,7 +368,39 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
             references = d.references.isEmpty ? nil : d.references
             draftRow = MailService.shared.store.rows(ids: [d.id]).first
             loadDraftBody(d, body)
+            // A saved draft's attachments come back too; Send/Save wait until they're downloaded, and the
+            // old draft is only replaced once the new one (with them) is on the server (B-01).
+            fetchMessageAttachments(d)
             window?.title = d.subject.isEmpty ? "Draft" : d.subject
+            window?.makeFirstResponder(textView)
+        case .restored(let r):
+            autosaveID = r.id
+            selectAccount(r.accountID)
+            toField.objectValue = r.to
+            ccField.objectValue = r.cc
+            bccField.objectValue = r.bcc
+            subjectField.stringValue = r.subject
+            inReplyTo = r.inReplyTo
+            references = r.references
+            if let rtf = r.bodyRTF,
+               let attr = NSAttributedString(rtfd: rtf, documentAttributes: nil) ?? NSAttributedString(rtf: rtf, documentAttributes: nil) {
+                textView.textStorage?.setAttributedString(attr)
+                if let storage = textView.textStorage {
+                    InlineImage.normalize(storage, maxWidth: 640, widths: r.imageWidths?.map { CGFloat($0) })
+                }
+            }
+            let urls = r.attachments.map { URL(fileURLWithPath: $0) }.filter { FileManager.default.fileExists(atPath: $0.path) }
+            addAttachments(urls)
+            if !r.quotedHTML.isEmpty {
+                quotedHTML = r.quotedHTML
+                quotedText = r.quotedText
+                includeOriginal.isHidden = false
+                includeOriginal.state = r.includeOriginal ? .on : .off
+            }
+            draftRow = r.draftRowID.flatMap { MailService.shared.store.rows(ids: [$0]).first }
+            replyRow = r.replyRowID.flatMap { MailService.shared.store.rows(ids: [$0]).first }
+            status.stringValue = "Recovered unsent message from \(Self.quoteDate(r.saved))"
+            window?.title = r.subject.isEmpty ? "Recovered Message" : r.subject
             window?.makeFirstResponder(textView)
         }
     }
@@ -356,42 +435,63 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
     /// True while a draft's body is still being fetched: Send/Save wait for it rather than writing a blank.
     private var waitingForDraftBody = false
 
-    /// Changing the From account replaces the signature at the end of the body with the new account's one.
+    /// Changing the From account replaces the old signature with the new account's one — wherever it is,
+    /// even when text was typed after it (B-20). Only when the old signature was edited away is the new
+    /// one appended instead.
     private func swapSignature() {
         let newSig = account?.signature ?? ""
         guard newSig != currentSignature else { return }
         let storage = textView.textStorage
+        let text = textView.string as NSString
+        var replaced = false
         if let old = currentSignature, !old.isEmpty {
-            let tail = "\n\n" + old
-            let text = textView.string
-            if text.hasSuffix(tail) {
-                let len = (text as NSString).length
-                storage?.replaceCharacters(in: NSRange(location: len - (tail as NSString).length,
-                                                       length: (tail as NSString).length), with: "")
+            let r = text.range(of: "\n\n" + old, options: .backwards)
+            if r.location != NSNotFound {
+                storage?.replaceCharacters(in: r, with: newSig.isEmpty ? "" : "\n\n" + newSig)
+                replaced = true
             }
         }
-        if !newSig.isEmpty {
+        if !replaced, !newSig.isEmpty {
             let len = (textView.string as NSString).length
             storage?.replaceCharacters(in: NSRange(location: len, length: 0), with: "\n\n" + newSig)
         }
         currentSignature = newSig
     }
 
+    /// Alerts attach to the composer as a sheet; if the window is gone (an async error arriving late), they
+    /// fall back to an app-modal alert instead of crashing on a nil window (B-21).
+    private func present(_ alert: NSAlert, then: ((NSApplication.ModalResponse) -> Void)? = nil) {
+        if let w = window, w.isVisible || w.isMiniaturized {
+            alert.beginSheetModal(for: w, completionHandler: then)
+        } else {
+            let r = alert.runModal()
+            then?(r)
+        }
+    }
+
+    private func alert(_ text: String, info: String? = nil) {
+        let a = NSAlert()
+        a.messageText = text
+        if let info { a.informativeText = info }
+        present(a)
+    }
+
     /// Fills the editor with a draft's cached body; when it isn't cached yet, fetches it instead of
     /// opening a blank editor that a later save would turn into a real empty draft (V2-04).
-    private func loadDraftBody(_ d: MessageDetail, _ body: StoredBody?) {
+    private func loadDraftBody(_ d: MessageDetail, _ body: StoredBody?, fetched: Bool = false) {
         let hasContent = !(body?.html ?? "").isEmpty || !(body?.text ?? "").isEmpty
-        guard hasContent else {
+        // One fetch only: a draft that really is empty opens empty instead of re-fetching forever (B-02).
+        guard hasContent || fetched else {
             waitingForDraftBody = true
             status.stringValue = "Loading draft…"
             let id = d.id
             Task { [weak self] in
                 do {
-                    guard let engine = MailService.shared.engine(d.accountID) else { return }
+                    guard let engine = MailService.shared.engine(d.accountID) else { throw NetError.server("Account unavailable") }
                     let fetched = try await engine.loadBody(messageID: id)
                     guard let self, !self.sentOrDiscarded else { return }
                     self.status.stringValue = ""
-                    self.loadDraftBody(d, fetched)
+                    self.loadDraftBody(d, fetched, fetched: true)
                 } catch {
                     guard let self, !self.sentOrDiscarded else { return }
                     self.waitingForDraftBody = false
@@ -401,11 +501,51 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
             return
         }
         waitingForDraftBody = false
-        if let html = body?.html, let data = html.data(using: .utf8),
-           let attr = NSAttributedString(html: data, documentAttributes: nil) {
-            textView.textStorage?.setAttributedString(attr)
+        if let html = body?.html {
+            let (tokenized, cids) = InlineImage.tokenizeCIDImages(html)
+            if let data = tokenized.data(using: .utf8), let attr = NSAttributedString(html: data, documentAttributes: nil) {
+                textView.textStorage?.setAttributedString(attr)
+            }
+            if !cids.isEmpty { loadDraftInlineImages(d, cids) }
         } else {
             setBody(body?.text ?? "", signature: false)
+        }
+    }
+
+    /// Downloads a reopened draft's inline images and puts them back where their tokens are (Send waits).
+    private func loadDraftInlineImages(_ d: MessageDetail, _ cids: [(cid: String, width: CGFloat?)]) {
+        guard let engine = MailService.shared.engine(d.accountID) else { removeInlineTokens(); return }
+        let dir = AppPaths.tempDir("draft-inline")
+        tempDirs.append(dir)
+        pipelineBegan()
+        let task = Task { [weak self] in
+            defer { self?.pipelineEnded() }
+            for (n, item) in cids.enumerated() {
+                let cid = item.cid
+                guard !Task.isCancelled, let self else { return }
+                var att: NSTextAttachment?
+                if let part = d.structure?.part(withContentID: cid) {
+                    let url = dir.appendingPathComponent("\(n)")
+                    if (try? await engine.download(messageID: d.id, part: part, to: url)) != nil {
+                        att = InlineImage.attachment(file: url, maxWidth: self.textView.inlineImageWidth, width: item.width)
+                    }
+                }
+                guard let storage = self.textView.textStorage else { return }
+                let r = (storage.string as NSString).range(of: InlineImage.token(n))
+                guard r.location != NSNotFound else { continue }
+                if let att { storage.replaceCharacters(in: r, with: NSAttributedString(attachment: att)) }
+                else { storage.deleteCharacters(in: r) }
+            }
+            self?.removeInlineTokens()
+        }
+        zipTasks.append(task)
+    }
+
+    private func removeInlineTokens() {
+        guard let storage = textView.textStorage,
+              let re = try? NSRegularExpression(pattern: "\u{2063}\\[inline-image-\\d+\\]\u{2063}") else { return }
+        for m in re.matches(in: storage.string, range: NSRange(location: 0, length: storage.length)).reversed() {
+            storage.deleteCharacters(in: m.range)
         }
     }
 
@@ -437,16 +577,21 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
         web.navigationDelegate = self
         web.uiDelegate = self
         web.setValue(false, forKey: "drawsBackground")
-        let prepared = HTMLPrep.prepare(html: body?.html, text: body?.text, page: 1)
-        // Same image policy as the reading pane, including the per-sender choice (SEC-A10).
+        // Same image policy as the reading pane, including the per-sender choice (SEC-A10); Spam never auto-loads.
         let spam = d.folderRole == .spam
         let senderPref = MailService.shared.store.pref("img:" + d.from.email.lowercased())
-        let autoLoad = senderPref == "always" || (!spam && !Prefs.askBeforeImages && senderPref != "ask" && senderPref != "never")
-        quoteLoader.page = ImagePage(generation: 1, messageID: d.id, accountID: d.accountID, prepared: prepared,
-                                     autoLoad: autoLoad, ignoreLimits: senderPref == "always")
-        quoteLoader.page?.dark = view.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
-        web.loadHTMLString(prepared.html, baseURL: URL(string: "lm://quote/\(d.id)/"))
+        let autoLoad = !spam && (senderPref == "always" || (!Prefs.askBeforeImages && senderPref != "ask" && senderPref != "never"))
+        let dark = view.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
         quoteWeb = web
+        // The regex passes over a large original run off the main thread (O-10).
+        Task { [weak self, weak web] in
+            let prepared = await HTMLPrep.prepareOffMain(html: body?.html, text: body?.text, page: 1)
+            guard let self, let web, self.quoteWeb === web else { return }
+            self.quoteLoader.page = ImagePage(generation: 1, messageID: d.id, accountID: d.accountID, prepared: prepared,
+                                              autoLoad: autoLoad, ignoreLimits: senderPref == "always")
+            self.quoteLoader.page?.dark = dark
+            web.loadHTMLString(prepared.html, baseURL: URL(string: "lm://quote/\(d.id)/"))
+        }
         let sep = NSBox()
         sep.boxType = .separator
         for v in [sep, label, web] as [NSView] {
@@ -583,6 +728,7 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
                 continue
             }
             attachments.append(OutgoingAttachment(url: url, filename: url.lastPathComponent, mimeType: MessageBuilder.mimeType(for: url)))
+            attachmentSizes[url] = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
         }
         refreshAttachments()
         Debug.log("compose attachments: \(attachments.map { $0.filename })")
@@ -614,7 +760,7 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
         attachmentStack.arrangedSubviews.forEach { $0.removeFromSuperview() }
         var total = 0
         for (i, a) in attachments.enumerated() {
-            let size = (try? a.url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+            let size = attachmentSizes[a.url] ?? 0
             total += size
             let b = NSButton(title: "\(a.filename)  ·  \(MIME.formatSize(size))  ✕", target: self, action: #selector(removeAttachment(_:)))
             b.bezelStyle = .rounded
@@ -641,8 +787,11 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
 
     @objc private func removeAttachment(_ sender: NSButton) {
         guard sender.tag < attachments.count else { return }
-        attachments.remove(at: sender.tag)
+        let removed = attachments.remove(at: sender.tag)
+        attachmentSizes[removed.url] = nil
         refreshAttachments()
+        dirty = true
+        scheduleAutosave()
     }
 
     @objc func attachFiles(_ sender: Any?) {
@@ -657,27 +806,6 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
         }
     }
 
-    private static let attachmentStamp: DateFormatter = {
-        let f = DateFormatter()
-        f.dateStyle = .none
-        f.timeStyle = .medium
-        return f
-    }()
-
-    /// A screenshot pasted into the body becomes a PNG attachment (UX-08).
-    private func addPastedImage(_ data: Data) {
-        let dir = AppPaths.tempDir("paste")
-        tempDirs.append(dir)
-        let url = dir.appendingPathComponent("Pasted image \(Self.attachmentStamp.string(from: Date())).png")
-        do {
-            try data.write(to: url)
-        } catch {
-            status.stringValue = "Couldn't save the pasted image"
-            return
-        }
-        addAttachments([url])
-    }
-
     // MARK: Building the message
 
     private func addresses(_ field: NSTokenField) -> [EmailAddress] {
@@ -689,8 +817,14 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
         commitEditing()
         guard let account else { return nil }
         let attr = textView.attributedString()
-        var html = RichText.html(from: attr)
-        var text = attr.string
+        // Inline images (pasted or dropped into the body) go out as cid: parts in multipart/related.
+        var inline: [OutgoingAttachment] = []
+        var html = RichText.html(from: attr) { att in
+            guard let out = self.inlinePart(for: att) else { return nil }
+            inline.append(out)
+            return out.contentID
+        }
+        var text = attr.string.replacingOccurrences(of: "\u{FFFC}", with: "")
         if includeOriginal.state == .on, !quotedHTML.isEmpty {
             html += "<br>" + quotedHTML
             text += "\n\n" + quotedText
@@ -698,7 +832,29 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
         let doc = "<!doctype html><html><head><meta charset=\"utf-8\"></head><body style=\"font-family:-apple-system,Helvetica,Arial,sans-serif;font-size:14px\">\(html)</body></html>"
         return OutgoingMessage(from: account.fromHeader, to: addresses(toField), cc: addresses(ccField), bcc: addresses(bccField),
                                subject: subjectField.stringValue, textBody: text, htmlBody: doc,
-                               inReplyTo: inReplyTo, references: references, attachments: attachments)
+                               inReplyTo: inReplyTo, references: references, attachments: attachments + inline)
+    }
+
+    /// Inline image files written for sending, one per attachment object (reused across draft saves).
+    private var inlineParts: [ObjectIdentifier: OutgoingAttachment] = [:]
+    private var inlineDir: URL?
+
+    private func inlinePart(for att: NSTextAttachment) -> OutgoingAttachment? {
+        if let p = inlineParts[ObjectIdentifier(att)] { return p }
+        guard let data = InlineImage.bytes(att) else { return nil }
+        let dir = inlineDir ?? {
+            let d = AppPaths.tempDir("inline")
+            tempDirs.append(d)
+            inlineDir = d
+            return d
+        }()
+        let name = BodyPart.safeFilename(att.fileWrapper?.preferredFilename ?? "image.png") ?? "image.png"
+        let url = dir.appendingPathComponent("\(inlineParts.count)-" + name)
+        do { try data.write(to: url) } catch { return nil }
+        let part = OutgoingAttachment(url: url, filename: name, mimeType: InlineImage.mimeType(data),
+                                      contentID: "\(UUID().uuidString.lowercased())@macmail")
+        inlineParts[ObjectIdentifier(att)] = part
+        return part
     }
 
     /// Commits in-progress field editing so a half-typed recipient or subject reaches the message (BUG-18).
@@ -710,9 +866,7 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
 
     @objc func send(_ sender: Any?) {
         guard !waitingForDraftBody else {
-            let a = NSAlert()
-            a.messageText = "The draft is still loading — try again in a moment."
-            a.beginSheetModal(for: window!, completionHandler: nil)
+            alert("The draft is still loading — try again in a moment.")
             return
         }
         guard pipelineTasks == 0 else {
@@ -722,16 +876,12 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
         }
         guard let message = buildMessage(), let account else { return }
         if message.allRecipients.isEmpty {
-            let a = NSAlert()
-            a.messageText = "Add at least one recipient."
-            a.beginSheetModal(for: window!, completionHandler: nil)
+            alert("Add at least one recipient.")
             return
         }
         let invalid = (addresses(toField) + addresses(ccField) + addresses(bccField)).filter { !$0.email.contains(".") }
         if !invalid.isEmpty {
-            let a = NSAlert()
-            a.messageText = "Check the address \(invalid[0].email)."
-            a.beginSheetModal(for: window!, completionHandler: nil)
+            alert("Check the address \(invalid[0].email).")
             return
         }
         if message.subject.trimmingCharacters(in: .whitespaces).isEmpty {
@@ -739,7 +889,7 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
             a.messageText = "Send without a subject?"
             a.addButton(withTitle: "Send")
             a.addButton(withTitle: "Cancel")
-            a.beginSheetModal(for: window!) { [weak self] r in if r == .alertFirstButtonReturn { self?.queueSend(message, account: account) } }
+            present(a) { [weak self] r in if r == .alertFirstButtonReturn { self?.queueSend(message, account: account) } }
             return
         }
         queueSend(message, account: account)
@@ -751,39 +901,55 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
         let main = (NSApp.delegate as? AppDelegate)?.mainWindow
         let pending = MailService.PendingSend(accountID: account.id, message: message, replyTo: replyRow,
                                               draftToDelete: draftRow)
-        let id = MailService.shared.queueSend(pending) { [weak self] error in
+        let id = MailService.shared.queueSend(pending, onUndo: { [weak self] in self?.reopenAfterUndo() }) { [weak self] outcome in
             guard let self else { return }
             // The pending id is dead either way; leaving it set would block cleanup on close (V2-11).
             self.pendingSendID = nil
-            if let error {
+            switch outcome {
+            case .sent:
+                main?.showToast("Message sent")
+                self.discardAutosave()
+                self.cleanUpAndForget()
+            case .queued:
+                // Offline: the finished message waits in the outbox and goes out when the network is back (F-07).
+                main?.showToast("You're offline — message saved to the Outbox and will be sent automatically")
+                self.discardAutosave()
+                self.cleanUpAndForget()
+            case .failed(let error):
                 self.sentOrDiscarded = false
                 self.status.stringValue = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
                 self.status.textColor = .systemRed
                 self.showWindow(nil)
-                let a = NSAlert()
-                a.messageText = "Your message wasn't sent"
-                a.informativeText = self.status.stringValue
-                a.beginSheetModal(for: self.window!, completionHandler: nil)
-            } else {
-                main?.showToast("Message sent")
-                self.cleanUpAndForget()
+                self.alert("Your message wasn't sent", info: self.status.stringValue)
             }
         }
         pendingSendID = id
         let seconds = Prefs.undoSendSeconds
         if seconds > 0 {
-            main?.showToast("Sending…", action: ("Undo", { [weak self] in self?.undoSend() }), duration: Double(max(seconds, 1)))
+            main?.showToast("Sending… (⌘Z or Esc to undo)", action: ("Undo", { [weak self] in self?.undoSend() }),
+                            duration: Double(max(seconds, 1)))
         } else {
             main?.showToast("Sending…")
         }
     }
 
+    /// Toast button: only succeeds while the send is still waiting; once the upload has started the
+    /// toast says so instead of pretending (B-04).
     private func undoSend() {
-        guard let id = pendingSendID, MailService.shared.cancelSend(id) else { return }
+        guard let id = pendingSendID else { return }
+        if MailService.shared.cancelSend(id) {
+            reopenAfterUndo()
+        } else {
+            (NSApp.delegate as? AppDelegate)?.mainWindow?.showToast("Too late to undo — the message is already being sent")
+        }
+    }
+
+    private func reopenAfterUndo() {
         pendingSendID = nil
         sentOrDiscarded = false
         showWindow(nil)
         window?.makeKeyAndOrderFront(nil)
+        (NSApp.delegate as? AppDelegate)?.mainWindow?.showToast("Sending undone")
     }
 
     // MARK: Closing / drafts
@@ -802,6 +968,7 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
             case .alertFirstButtonReturn: self.saveDraftAndClose()
             case .alertSecondButtonReturn:
                 self.sentOrDiscarded = true
+                self.discardAutosave()
                 self.window?.close()
             default: break
             }
@@ -815,13 +982,19 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
     /// and, at quit time, to keep the app alive until the save lands.
     private func saveDraft(_ done: @escaping (Bool) -> Void) {
         guard !waitingForDraftBody else {
-            let a = NSAlert()
-            a.messageText = "The draft is still loading — try again in a moment."
-            a.beginSheetModal(for: window!, completionHandler: nil)
+            alert("The draft is still loading — try again in a moment.")
             done(false)
             return
         }
-        guard let message = buildMessage(), let account, let engine = MailService.shared.engine(account.id) else { done(false); return }
+        guard pipelineTasks == 0 else {
+            alert("Attachments are still being downloaded — try again in a moment.")
+            done(false)
+            return
+        }
+        guard var message = buildMessage(), let account, let engine = MailService.shared.engine(account.id) else { done(false); return }
+        // A fresh Message-ID identifies the replacement draft on the server (B-09).
+        let messageID = MessageBuilder.newMessageID(for: message.from)
+        message.messageID = messageID
         sentOrDiscarded = true
         window?.orderOut(nil)
         let old = draftRow
@@ -829,22 +1002,20 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
         Task { [weak self] in
             guard let self else { done(false); return }
             do {
-                try await engine.saveDraft(try MessageBuilder.build(message))
-                // The replacement row arrived with the sync inside saveDraft; tag it with the Bcc line,
-                // which never travels in the draft MIME (BUG-19).
-                if let drafts = MailService.shared.store.folder(account: account.id, role: .drafts) {
-                    let ids = MailService.shared.store.rows(folderID: drafts.id)
-                        .filter { $0.subject == message.subject && $0.id != old?.id }
-                        .map { $0.id }
-                    MailService.shared.store.setBcc(ids: ids, bcc: bccLine)
-                }
-                // Never expunge the previous draft if the replacement came out empty (V2-04).
+                let data = try await Task.detached { try MessageBuilder.build(message) }.value
+                let newID = try await engine.saveDraft(data, messageID: messageID)
+                // The replacement row is found by its Message-ID, never by subject; tag it with the Bcc
+                // line, which never travels in the draft MIME (BUG-19 / B-09).
+                if let newID { MailService.shared.store.setBcc(ids: [newID], bcc: bccLine) }
+                // The old draft goes only once its replacement is confirmed on the server, and never if
+                // the replacement came out empty (V2-04, B-01).
                 let hasContent = !message.textBody.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                     || !message.attachments.isEmpty
-                if let old, hasContent {
+                if let old, hasContent, newID != nil || engine.isDemo {
                     engine.queue(.expunge, rows: [old]); MailService.shared.store.deleteMessages(ids: [old.id])
                 }
                 (NSApp.delegate as? AppDelegate)?.mainWindow?.showToast("Draft saved")
+                self.discardAutosave()
                 self.cleanUpAndForget()
                 done(true)
             } catch {
@@ -852,7 +1023,7 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
                 self.showWindow(nil)
                 let a = NSAlert(error: error)
                 a.messageText = "Couldn't save the draft"
-                a.beginSheetModal(for: self.window!, completionHandler: nil)
+                self.present(a)
                 done(false)
             }
         }
@@ -874,6 +1045,7 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
             case .alertFirstButtonReturn: self.saveDraft(done)
             case .alertSecondButtonReturn:
                 self.sentOrDiscarded = true
+                self.discardAutosave()
                 done(true)
             default: done(false)
             }
@@ -900,8 +1072,85 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
                        + " drag To→Cc moves the address (to=\(to) cc=\(cc))")
             out.append((window?.title == "Lunch plans" ? "PASS" : "FAIL") + " window title follows subject (\(window?.title ?? "nil"))")
             out.append((Self.composersNeedingSave.contains(self) ? "PASS" : "FAIL") + " dirty composer is asked on quit")
+            out += inlineImageSelfTest()
             done(out)
         }
+    }
+
+    /// Pastes a copied image file and a text file the way Finder / Mac Explorer put them on the pasteboard
+    /// (file URLs plus an icon TIFF), then checks the image is inline, the text file attached, the sent
+    /// message has a cid part, and an autosave keeps the image.
+    private func inlineImageSelfTest() -> [String] {
+        var out: [String] = []
+        let dir = AppPaths.tempDir("selftest-inline")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let png = dir.appendingPathComponent("photo.png"), txt = dir.appendingPathComponent("notes.txt")
+        let img = NSImage(size: NSSize(width: 1600, height: 900), flipped: false) { r in NSColor.systemTeal.setFill(); r.fill(); return true }
+        guard let tiff = img.tiffRepresentation, let rep = NSBitmapImageRep(data: tiff),
+              let pngData = rep.representation(using: .png, properties: [:]) else { return ["FAIL inline: test image"] }
+        try? pngData.write(to: png)
+        try? Data("hello".utf8).write(to: txt)
+        let pb = NSPasteboard(name: NSPasteboard.Name("MacMailSelfTest-\(UUID().uuidString)"))
+        defer { pb.releaseGlobally() }
+        pb.clearContents()
+        pb.writeObjects([png as NSURL, txt as NSURL])
+        pb.addTypes([.tiff], owner: nil)
+        pb.setData(NSWorkspace.shared.icon(forFile: png.path).tiffRepresentation, forType: .tiff)
+        textView.setSelectedRange(NSRange(location: textView.string.count, length: 0))
+        _ = textView.paste(from: pb)
+        var inline: [NSTextAttachment] = []
+        let storage = textView.textStorage!
+        storage.enumerateAttribute(.attachment, in: NSRange(location: 0, length: storage.length)) { v, _, _ in
+            if let a = v as? NSTextAttachment { inline.append(a) }
+        }
+        let shown = inline.first?.bounds.size ?? .zero
+        out.append((inline.count == 1 && attachments.map { $0.filename } == ["notes.txt"] && shown.width <= textView.inlineImageWidth + 1
+                    && inline.first is InlineImageAttachment ? "PASS" : "FAIL")
+                   + " copied image file pastes inline, other file attaches (inline=\(inline.count) shown=\(Int(shown.width))x\(Int(shown.height)) files=\(attachments.map { $0.filename }))")
+        if let m = buildMessage(), let data = try? MessageBuilder.build(m), let doc = try? EMLDocument.parse(data),
+           let cid = m.attachments.first(where: { $0.contentID != nil })?.contentID {
+            let part = doc.structure.part(withContentID: cid)
+            let same = part.flatMap { doc.data(for: $0) } == pngData
+            let inHTML = doc.bodies().html?.contains("cid:\(cid)") == true
+            let chips = doc.structure.attachments().compactMap { $0.filename }
+            out.append((same && inHTML && chips == ["notes.txt"] ? "PASS" : "FAIL")
+                       + " inline image is sent as a cid part (bytes=\(same) html=\(inHTML) chips=\(chips))")
+        } else {
+            out.append("FAIL inline image is sent as a cid part (no message)")
+        }
+        // Resize: Image Size → 200 pt, the sent HTML follows, the handle frame matches, and Undo puts it back.
+        var idx = -1
+        storage.enumerateAttribute(.attachment, in: NSRange(location: 0, length: storage.length)) { v, r, _ in if v != nil { idx = r.location } }
+        if let att = inline.first, idx >= 0 {
+            let before = att.bounds.width
+            // In a scripted run every change shares the event's undo group; nest the resize so only it is undone.
+            textView.undoManager?.beginUndoGrouping()
+            textView.setImageWidth(att, index: idx, width: 200)
+            textView.undoManager?.endUndoGrouping()
+            textView.setSelectedRange(NSRange(location: idx, length: 1))
+            let frame = textView.selectedImage?.rect ?? .zero
+            let html = buildMessage()?.htmlBody ?? ""
+            let resized = att.bounds.width == 200 && html.contains("width=\"200\"") && frame.width == 200 && frame.height == att.bounds.height
+            textView.undoManager?.undoNestedGroup()
+            out.append((resized && att.bounds.width == before ? "PASS" : "FAIL")
+                       + " inline image resizes and undoes (\(Int(before))→200→\(Int(att.bounds.width)), frame \(Int(frame.width))x\(Int(frame.height)))")
+            textView.setImageWidth(att, index: idx, width: 240)
+        }
+        let attr = textView.attributedString()
+        let rtfd = InlineImage.rtfd(attr)
+        let restored = rtfd.flatMap { NSAttributedString(rtfd: $0, documentAttributes: nil) }.map { NSTextStorage(attributedString: $0) }
+        if let restored { InlineImage.normalize(restored, maxWidth: 640, widths: InlineImage.widths(attr)) }
+        var kept = 0
+        var seen: [String] = []
+        restored?.enumerateAttribute(.attachment, in: NSRange(location: 0, length: restored?.length ?? 0)) { v, _, _ in
+            if let a = v as? NSTextAttachment {
+                seen.append("\(type(of: a)) same=\(InlineImage.bytes(a) == pngData) n=\(InlineImage.bytes(a)?.count ?? -1)/\(pngData.count) w=\(a.bounds.width)")
+            }
+            if let a = v as? NSTextAttachment, InlineImage.bytes(a) == pngData, a is InlineImageAttachment,
+               a.bounds.width == 240 { kept += 1 }
+        }
+        out.append((kept == 1 ? "PASS" : "FAIL") + " autosave keeps the inline image and its size (\(kept) rtfd=\(rtfd?.count ?? -1) \(seen))")
+        return out
     }
 
     static var composersNeedingSave: [ComposeWindowController] {
@@ -933,7 +1182,11 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
     }
 
     func windowWillClose(_ notification: Notification) {
-        if pendingSendID == nil { cleanUpAndForget() }
+        if pendingSendID == nil {
+            // Closed without changes (or after Don't Save): nothing to recover.
+            if !dirty || sentOrDiscarded { discardAutosave() }
+            cleanUpAndForget()
+        }
     }
 
     private func cleanUpAndForget() {
@@ -954,9 +1207,13 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
     @objc private func fromChanged() {
         dirty = true
         swapSignature()
+        scheduleAutosave()
     }
 
-    func textDidChange(_ notification: Notification) { dirty = true }
+    func textDidChange(_ notification: Notification) {
+        dirty = true
+        scheduleAutosave()
+    }
 
     // MARK: Address completion
 
@@ -1016,6 +1273,7 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
 
     func controlTextDidChange(_ obj: Notification) {
         dirty = true
+        scheduleAutosave()
         if (obj.object as? NSControl) === subjectField {
             window?.title = subjectField.stringValue.isEmpty ? "New Message" : subjectField.stringValue
         }
@@ -1024,45 +1282,338 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
 
 extension ComposeWindowController: NSTextFieldDelegate {}
 
-/// Body text view that turns dropped files and pasted screenshots into attachments instead of inline images.
+/// Body text view. Like Outlook: images (pasted pictures, or image files copied/dropped from Finder or Mac Explorer)
+/// go into the body inline; other files become attachments.
 final class ComposeTextView: NSTextView {
     var onDropFiles: (([URL]) -> Void)?
-    var onPasteImage: ((Data) -> Void)?
 
-    override func paste(_ sender: Any?) {
-        let pb = NSPasteboard.general
-        if let data = pb.data(forType: .png) { onPasteImage?(data); return }
-        if let tiff = pb.data(forType: .tiff), let rep = NSBitmapImageRep(data: tiff),
-           let png = rep.representation(using: .png, properties: [:]) {
-            onPasteImage?(png)
+    /// Width an inline image may take: the editor's text width.
+    var inlineImageWidth: CGFloat {
+        let inset = textContainerInset.width * 2 + (textContainer?.lineFragmentPadding ?? 5) * 2
+        return max(200, bounds.width - inset)
+    }
+
+    // MARK: Resizing inline images (drag a corner handle, or right-click → Image Size)
+
+    private static let handle: CGFloat = 8
+
+    /// The selected inline image and its frame in view coordinates (an image is selected by clicking it).
+    var selectedImage: (att: NSTextAttachment, index: Int, rect: NSRect)? {
+        let r = selectedRange()
+        guard r.length == 1 else { return nil }
+        return image(at: r.location)
+    }
+
+    private func image(at index: Int) -> (att: NSTextAttachment, index: Int, rect: NSRect)? {
+        guard let storage = textStorage, index < storage.length,
+              let att = storage.attribute(.attachment, at: index, effectiveRange: nil) as? NSTextAttachment,
+              att is InlineImageAttachment, let lm = layoutManager, let tc = textContainer else { return nil }
+        let glyphs = lm.glyphRange(forCharacterRange: NSRange(location: index, length: 1), actualCharacterRange: nil)
+        guard glyphs.length > 0 else { return nil }
+        _ = tc
+        let line = lm.lineFragmentRect(forGlyphAt: glyphs.location, effectiveRange: nil)
+        let loc = lm.location(forGlyphAt: glyphs.location)
+        let size = att.bounds.size
+        // The image's bottom sits on the baseline (flipped view: baseline y = line top + glyph y).
+        var rect = NSRect(x: line.minX + loc.x, y: line.minY + loc.y - size.height - att.bounds.minY,
+                          width: size.width, height: size.height)
+        rect.origin.x += textContainerOrigin.x
+        rect.origin.y += textContainerOrigin.y
+        return (att, index, rect)
+    }
+
+    private func imageHit(_ point: NSPoint) -> (att: NSTextAttachment, index: Int, rect: NSRect)? {
+        let i = characterIndexForInsertion(at: point)
+        for c in [i, i - 1] where c >= 0 {
+            if let hit = image(at: c), hit.rect.insetBy(dx: -Self.handle, dy: -Self.handle).contains(point) { return hit }
+        }
+        return nil
+    }
+
+    private func handleRects(_ r: NSRect) -> [NSRect] {
+        let h = Self.handle
+        return [NSPoint(x: r.minX, y: r.minY), NSPoint(x: r.maxX, y: r.minY),
+                NSPoint(x: r.minX, y: r.maxY), NSPoint(x: r.maxX, y: r.maxY)]
+            .map { NSRect(x: $0.x - h / 2, y: $0.y - h / 2, width: h, height: h) }
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        guard let sel = selectedImage else { return }
+        drawnImageRect = sel.rect
+        NSColor.controlAccentColor.setStroke()
+        let border = NSBezierPath(rect: sel.rect.insetBy(dx: -0.5, dy: -0.5))
+        border.lineWidth = 1
+        border.stroke()
+        for h in handleRects(sel.rect) {
+            NSColor.white.setFill()
+            NSBezierPath(rect: h).fill()
+            NSColor.controlAccentColor.setStroke()
+            NSBezierPath(rect: h).stroke()
+        }
+    }
+
+    /// Where the selection frame was last drawn. Deleting or resizing the image can move or remove it before the
+    /// next draw, so this old area is repainted explicitly; otherwise a piece of the image and handles stays on screen.
+    private var drawnImageRect: NSRect?
+
+    private func refreshImageSelection() {
+        let now = selectedImage?.rect
+        guard now != drawnImageRect else { return }
+        if let old = drawnImageRect { setNeedsDisplay(old.insetBy(dx: -Self.handle - 2, dy: -Self.handle - 2)) }
+        if let now { setNeedsDisplay(now.insetBy(dx: -Self.handle - 2, dy: -Self.handle - 2)) }
+        drawnImageRect = now
+        window?.invalidateCursorRects(for: self)
+    }
+
+    override func setSelectedRanges(_ ranges: [NSValue], affinity: NSSelectionAffinity, stillSelecting: Bool) {
+        super.setSelectedRanges(ranges, affinity: affinity, stillSelecting: stillSelecting)
+        refreshImageSelection()
+    }
+
+    /// Images about to be deleted or replaced: their area is repainted once the change is in.
+    private var staleImageRects: [NSRect] = []
+
+    override func shouldChangeText(in affectedCharRange: NSRange, replacementString: String?) -> Bool {
+        guard super.shouldChangeText(in: affectedCharRange, replacementString: replacementString) else { return false }
+        if affectedCharRange.length > 0, let storage = textStorage, NSMaxRange(affectedCharRange) <= storage.length {
+            storage.enumerateAttribute(.attachment, in: affectedCharRange) { v, r, _ in
+                if v is InlineImageAttachment, let hit = image(at: r.location) { staleImageRects.append(hit.rect) }
+            }
+        }
+        return true
+    }
+
+    override func didChangeText() {
+        super.didChangeText()
+        for r in staleImageRects { setNeedsDisplay(r.insetBy(dx: -Self.handle - 2, dy: -Self.handle - 2)) }
+        staleImageRects.removeAll()
+        refreshImageSelection()
+    }
+
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        guard let sel = selectedImage else { return }
+        let hs = handleRects(sel.rect)
+        let cursors: [NSCursor]
+        if #available(macOS 15.0, *) {
+            cursors = [NSCursor.frameResize(position: .topLeft, directions: .all), NSCursor.frameResize(position: .topRight, directions: .all),
+                       NSCursor.frameResize(position: .bottomLeft, directions: .all), NSCursor.frameResize(position: .bottomRight, directions: .all)]
+        } else {
+            cursors = Array(repeating: NSCursor.crosshair, count: 4)
+        }
+        for (r, c) in zip(hs, cursors) { addCursorRect(r, cursor: c) }
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        let point = convert(event.locationInWindow, from: nil)
+        if let sel = selectedImage, let corner = handleRects(sel.rect).firstIndex(where: { $0.insetBy(dx: -3, dy: -3).contains(point) }) {
+            trackResize(sel, corner: corner, from: point)
             return
         }
-        super.paste(sender)
+        // First click selects the image (handles appear); a click on the selected image drags it to move it.
+        if event.clickCount == 1, let hit = imageHit(point), hit.rect.contains(point),
+           selectedRange() != NSRange(location: hit.index, length: 1) {
+            window?.makeFirstResponder(self)
+            setSelectedRange(NSRange(location: hit.index, length: 1))
+            return
+        }
+        super.mouseDown(with: event)
+    }
+
+    /// Drags a corner: the image keeps its aspect ratio; left-hand corners grow it when dragged left.
+    private func trackResize(_ sel: (att: NSTextAttachment, index: Int, rect: NSRect), corner: Int, from start: NSPoint) {
+        let startWidth = sel.att.bounds.width
+        let sign: CGFloat = corner % 2 == 0 ? -1 : 1
+        let range = NSRange(location: sel.index, length: 1)
+        undoManager?.beginUndoGrouping()
+        registerResizeUndo(sel.att, index: sel.index, width: startWidth)
+        while let e = window?.nextEvent(matching: [.leftMouseDragged, .leftMouseUp]) {
+            let p = convert(e.locationInWindow, from: nil)
+            let width = startWidth + sign * (p.x - start.x)
+            InlineImage.previewResize(sel.att, width: width, maxWidth: inlineImageWidth)
+            imageSizeChanged(range)
+            if e.type == .leftMouseUp { break }
+        }
+        undoManager?.endUndoGrouping()
+        InlineImage.applyDisplay(sel.att, maxWidth: inlineImageWidth, width: sel.att.bounds.width)
+        imageSizeChanged(range)
+    }
+
+    func setImageWidth(_ att: NSTextAttachment, index: Int, width: CGFloat?) {
+        registerResizeUndo(att, index: index, width: att.bounds.width)
+        InlineImage.applyDisplay(att, maxWidth: inlineImageWidth, width: width)
+        imageSizeChanged(NSRange(location: index, length: 1))
+    }
+
+    private func registerResizeUndo(_ att: NSTextAttachment, index: Int, width: CGFloat) {
+        undoManager?.registerUndo(withTarget: self) { tv in tv.setImageWidth(att, index: index, width: width) }
+        undoManager?.setActionName("Resize Image")
+    }
+
+    private func imageSizeChanged(_ range: NSRange) {
+        guard let storage = textStorage, NSMaxRange(range) <= storage.length else { return }
+        storage.edited(.editedAttributes, range: range, changeInLength: 0)
+        layoutManager?.invalidateLayout(forCharacterRange: range, actualCharacterRange: nil)
+        needsDisplay = true
+        refreshImageSelection()
+        delegate?.textDidChange?(Notification(name: NSText.didChangeNotification, object: self))
+    }
+
+    override func menu(for event: NSEvent) -> NSMenu? {
+        let menu = super.menu(for: event) ?? NSMenu()
+        let point = convert(event.locationInWindow, from: nil)
+        guard let hit = imageHit(point) else { return menu }
+        setSelectedRange(NSRange(location: hit.index, length: 1))
+        let sub = NSMenu()
+        let natural = InlineImage.naturalSize(hit.att)?.width ?? hit.att.bounds.width
+        let options: [(String, CGFloat?)] = [("Small", 160), ("Medium", 320), ("Large", 480),
+                                             ("Fit to Window", inlineImageWidth), ("Original Size", natural)]
+        for (title, width) in options {
+            let item = NSMenuItem(title: title, action: #selector(imageSizeMenu(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = width.map { NSNumber(value: Double($0)) }
+            item.tag = hit.index
+            if let width, abs(min(width, inlineImageWidth) - hit.att.bounds.width) < 1 { item.state = .on }
+            sub.addItem(item)
+        }
+        let parent = NSMenuItem(title: "Image Size", action: nil, keyEquivalent: "")
+        parent.submenu = sub
+        menu.insertItem(parent, at: 0)
+        menu.insertItem(.separator(), at: 1)
+        return menu
+    }
+
+    @objc private func imageSizeMenu(_ sender: NSMenuItem) {
+        guard let hit = image(at: sender.tag), let w = sender.representedObject as? NSNumber else { return }
+        setImageWidth(hit.att, index: hit.index, width: CGFloat(w.doubleValue))
+    }
+
+    /// HTML and web archives are never read: they would make AppKit fetch remote images while pasting.
+    override var readablePasteboardTypes: [NSPasteboard.PasteboardType] {
+        super.readablePasteboardTypes.filter { $0 != .html && $0.rawValue != "Apple Web Archive pasteboard type"
+            && $0.rawValue != "com.apple.webarchive" }
+    }
+
+    override func paste(_ sender: Any?) {
+        if !paste(from: NSPasteboard.general) { super.paste(sender) }
+        if let storage = textStorage { InlineImage.normalize(storage, maxWidth: inlineImageWidth) }
+    }
+
+    /// Files and pictures on `pb` go in as inline images / attachments; false when it holds neither.
+    func paste(from pb: NSPasteboard) -> Bool {
+        if let urls = Self.fileURLs(pb), !urls.isEmpty {
+            insertFiles(urls)
+            return true
+        }
+        if let data = Self.imageData(pb) {
+            insertImages([(data, "Pasted image.png")])
+            return true
+        }
+        return false
     }
 
     override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
-        let opts: [NSPasteboard.ReadingOptionKey: Any] = [.urlReadingFileURLsOnly: true]
-        if let urls = sender.draggingPasteboard.readObjects(forClasses: [NSURL.self], options: opts) as? [URL], !urls.isEmpty {
-            onDropFiles?(urls)
-            return true
+        // Moving text (and images) within the body is AppKit's own drag.
+        if (sender.draggingSource as AnyObject?) !== self {
+            let pb = sender.draggingPasteboard
+            let point = convert(sender.draggingLocation, from: nil)
+            if let urls = Self.fileURLs(pb), !urls.isEmpty {
+                setSelectedRange(NSRange(location: characterIndexForInsertion(at: point), length: 0))
+                insertFiles(urls)
+                return true
+            }
+            if let data = Self.imageData(pb) {
+                setSelectedRange(NSRange(location: characterIndexForInsertion(at: point), length: 0))
+                insertImages([(data, "Image.png")])
+                return true
+            }
         }
-        return super.performDragOperation(sender)
+        let ok = super.performDragOperation(sender)
+        if let storage = textStorage { InlineImage.normalize(storage, maxWidth: inlineImageWidth) }
+        return ok
     }
 
     override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
-        if sender.draggingPasteboard.canReadObject(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) {
-            return .copy
-        }
+        if Self.fileURLs(sender.draggingPasteboard) != nil || Self.imageData(sender.draggingPasteboard) != nil { return .copy }
         return super.draggingEntered(sender)
+    }
+
+    override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation {
+        let op = super.draggingUpdated(sender)
+        if (sender.draggingSource as AnyObject?) !== self,
+           Self.fileURLs(sender.draggingPasteboard) != nil || Self.imageData(sender.draggingPasteboard) != nil { return .copy }
+        return op
+    }
+
+    /// Image files go inline at the insertion point; everything else (and images over the size limit) is attached.
+    private func insertFiles(_ urls: [URL]) {
+        var images: [URL] = []
+        var others: [URL] = []
+        for u in urls { if InlineImage.isCandidate(u) { images.append(u) } else { others.append(u) } }
+        var failed: [URL] = []
+        let atts = images.compactMap { u -> NSTextAttachment? in
+            let a = InlineImage.attachment(file: u, maxWidth: inlineImageWidth)
+            if a == nil { failed.append(u) }
+            return a
+        }
+        insert(atts)
+        if !(others + failed).isEmpty { onDropFiles?(others + failed) }
+    }
+
+    private func insertImages(_ items: [(Data, String)]) {
+        insert(items.compactMap { InlineImage.attachment(data: $0.0, name: $0.1, maxWidth: inlineImageWidth) })
+    }
+
+    private func insert(_ atts: [NSTextAttachment]) {
+        guard !atts.isEmpty else { return }
+        let out = NSMutableAttributedString()
+        for (i, a) in atts.enumerated() {
+            if i > 0 { out.append(NSAttributedString(string: "\n", attributes: typingAttributes)) }
+            out.append(NSAttributedString(attachment: a))
+        }
+        let range = selectedRange()
+        guard shouldChangeText(in: range, replacementString: out.string) else { return }
+        textStorage?.replaceCharacters(in: range, with: out)
+        didChangeText()
+        setSelectedRange(NSRange(location: range.location + out.length, length: 0))
+    }
+
+    /// File URLs on a pasteboard (Finder and Mac Explorer copy files this way), nil when there are none.
+    static func fileURLs(_ pb: NSPasteboard) -> [URL]? {
+        let opts: [NSPasteboard.ReadingOptionKey: Any] = [.urlReadingFileURLsOnly: true]
+        guard let urls = pb.readObjects(forClasses: [NSURL.self], options: opts) as? [URL], !urls.isEmpty else { return nil }
+        return urls
+    }
+
+    /// Picture data (screenshots, images copied in Preview, Photos or a browser).
+    static func imageData(_ pb: NSPasteboard) -> Data? {
+        for t in [NSPasteboard.PasteboardType.png, NSPasteboard.PasteboardType(UTType.jpeg.identifier),
+                  NSPasteboard.PasteboardType(UTType.gif.identifier), NSPasteboard.PasteboardType(UTType.heic.identifier)] {
+            if let d = pb.data(forType: t) { return d }
+        }
+        if let tiff = pb.data(forType: .tiff), let rep = NSBitmapImageRep(data: tiff) {
+            return rep.representation(using: .png, properties: [:])
+        }
+        return nil
     }
 }
 
 /// Minimal attributed-string → HTML for outgoing mail: bold, italic, underline, strike, links, colours and sizes.
 enum RichText {
-    static func html(from attr: NSAttributedString) -> String {
+    /// `image` returns the content id for an inline image attachment (nil leaves it out).
+    static func html(from attr: NSAttributedString, image: ((NSTextAttachment) -> String?)? = nil) -> String {
         var out = ""
         let full = NSRange(location: 0, length: attr.length)
         attr.enumerateAttributes(in: full) { attrs, range, _ in
+            if let att = attrs[.attachment] as? NSTextAttachment {
+                if let cid = image?(att) {
+                    let w = Int(att.bounds.width.rounded()), h = Int(att.bounds.height.rounded())
+                    let size = w > 0 && h > 0 ? " width=\"\(w)\" height=\"\(h)\"" : ""
+                    out += "<img src=\"cid:\(MIME.escapeHTML(cid))\"\(size) alt=\"\" style=\"max-width:100%;height:auto\">"
+                }
+                return
+            }
             var text = MIME.escapeHTML((attr.string as NSString).substring(with: range))
             text = text.replacingOccurrences(of: "\n", with: "<br>")
             var styles: [String] = []
@@ -1093,5 +1644,45 @@ enum RichText {
             out += text
         }
         return out
+    }
+}
+
+/// One composer's unsent state, written to Application Support/…/Autosave every few seconds while it's
+/// being edited, so a crash or forced quit can't lose it (F-06). Removed on send, save or discard.
+struct ComposerAutosave: Codable {
+    var id: String
+    var accountID: String
+    var to: [String]
+    var cc: [String]
+    var bcc: [String]
+    var subject: String
+    var bodyRTF: Data?
+    var attachments: [String]
+    var inReplyTo: String?
+    var references: String?
+    var quotedHTML: String
+    var quotedText: String
+    var includeOriginal: Bool
+    var draftRowID: Int64?
+    var replyRowID: Int64?
+    var saved: Date
+    /// Inline image widths in document order (RTFD keeps the images but not their sizes).
+    var imageWidths: [Double]? = nil
+
+    private static func file(_ id: String) -> URL { AppPaths.autosave.appendingPathComponent(id + ".json") }
+
+    func write() {
+        guard let data = try? JSONEncoder().encode(self) else { return }
+        try? data.write(to: Self.file(id), options: [.atomic])
+        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: Self.file(id).path)
+    }
+
+    static func remove(_ id: String) { try? FileManager.default.removeItem(at: file(id)) }
+
+    static func all() -> [ComposerAutosave] {
+        let files = (try? FileManager.default.contentsOfDirectory(at: AppPaths.autosave, includingPropertiesForKeys: nil)) ?? []
+        return files.filter { $0.pathExtension == "json" }.compactMap {
+            (try? Data(contentsOf: $0)).flatMap { try? JSONDecoder().decode(ComposerAutosave.self, from: $0) }
+        }.sorted { $0.saved < $1.saved }
     }
 }

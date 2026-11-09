@@ -45,6 +45,7 @@ actor IMAPClient {
     let port: UInt16
     let username: String
     private let password: String
+    let security: ConnectionSecurity
 
     private var stream: TLSStream?
     private var tagCounter = 0
@@ -79,11 +80,12 @@ actor IMAPClient {
         if commandWaiters.isEmpty { commandBusy = false } else { commandWaiters.removeFirst().resume() }
     }
 
-    init(host: String, port: UInt16, username: String, password: String) {
+    init(host: String, port: UInt16, username: String, password: String, security: ConnectionSecurity = .tls) {
         self.host = host
         self.port = port
         self.username = username
         self.password = password
+        self.security = security
     }
 
     /// True only while the stream is actually open (a dropped connection shows up as isClosed).
@@ -103,13 +105,25 @@ actor IMAPClient {
     /// TLS, then LOGIN. Gmail (and most servers) send their capabilities in the LOGIN reply, so the separate
     /// CAPABILITY round trip is only made when they don't; CONDSTORE turns on with the first SELECT (CONDSTORE).
     func connect() async throws {
-        let s = TLSStream(host: host, port: port)
+        let s = TLSStream(host: host, port: port, security: security)
         try await s.open()
         stream = s
         do {
             let greeting = try await withReadTimeout(Limits.greetingTimeout) { try await self.readResponse() }
             guard greeting.status == "OK" || greeting.status == "PREAUTH" else {
                 throw NetError.protocolError(greeting.text)
+            }
+            if security == .startTLS {
+                // Fail closed: without STARTTLS the password would cross the network in the clear (F-01).
+                try await refreshCapabilities()
+                guard capabilities.contains("STARTTLS") else {
+                    throw NetError.server("\(host) doesn't offer STARTTLS on port \(port). Use SSL/TLS (usually port 993).")
+                }
+                _ = try await run("STARTTLS", timeout: 30)
+                try await s.startTLS()
+                // Capabilities seen before TLS can't be trusted (RFC 3501 §6.2.1); ask again.
+                capabilities = []
+                try await refreshCapabilities()
             }
             do {
                 _ = try await run("LOGIN \(username.imapQuoted) \(password.imapQuoted)", timeout: 30)
@@ -119,18 +133,20 @@ actor IMAPClient {
             if let code = lastTaggedCode, code.uppercased().hasPrefix("CAPABILITY ") {
                 capabilities = Set(code.split(separator: " ").dropFirst().map { $0.uppercased() })
             }
-            if capabilities.isEmpty {
-                let caps = try await run("CAPABILITY", timeout: 20)
-                for r in caps where r.isUntagged {
-                    if let first = r.values.first?.text, first.uppercased() == "CAPABILITY" {
-                        capabilities = Set(r.values.dropFirst().compactMap { $0.text?.uppercased() })
-                    }
-                }
-            }
+            if capabilities.isEmpty { try await refreshCapabilities() }
         } catch {
             await s.close()
             stream = nil
             throw error
+        }
+    }
+
+    private func refreshCapabilities() async throws {
+        let caps = try await run("CAPABILITY", timeout: 20)
+        for r in caps where r.isUntagged {
+            if let first = r.values.first?.text, first.uppercased() == "CAPABILITY" {
+                capabilities = Set(r.values.dropFirst().compactMap { $0.text?.uppercased() })
+            }
         }
     }
 
@@ -274,6 +290,77 @@ actor IMAPClient {
         return out
     }
 
+    /// Folder list plus unread counts in one command where the server supports LIST-STATUS (O-07);
+    /// the counts map is empty when it doesn't, and the caller falls back to STATUS per folder.
+    func listWithStatus() async throws -> ([ListedFolder], [String: Int]) {
+        guard capabilities.contains("LIST-STATUS") else { return (try await list(), [:]) }
+        let rs = try await run("LIST \"\" \"*\" RETURN (STATUS (UNSEEN))")
+        var out: [ListedFolder] = []
+        var counts: [String: Int] = [:]
+        for r in rs where r.isUntagged {
+            let word = r.values.first?.text?.uppercased()
+            if word == "LIST", r.values.count >= 4 {
+                let attrs = r.values[1].list?.compactMap { $0.text } ?? []
+                let delim = r.values[2].text ?? "/"
+                guard let rawName = r.values[3].text else { throw NetError.protocolError("truncated LIST response") }
+                out.append(ListedFolder(path: MailboxName.decode(rawName), delimiter: delim, attributes: attrs))
+            } else if word == "STATUS", r.values.count >= 3, let raw = r.values[1].text, let n = Self.unseen(from: [r]) {
+                counts[MailboxName.decode(raw)] = n
+            }
+        }
+        return (out, counts)
+    }
+
+    // MARK: Folder management (F-12, F-14)
+
+    func createMailbox(_ path: String) async throws {
+        try await run("CREATE \(MailboxName.encode(path).imapQuoted)")
+        _ = try? await run("SUBSCRIBE \(MailboxName.encode(path).imapQuoted)")
+    }
+
+    func renameMailbox(_ from: String, to: String) async throws {
+        if selectedPath == from { selectedPath = nil }
+        try await run("RENAME \(MailboxName.encode(from).imapQuoted) \(MailboxName.encode(to).imapQuoted)")
+        _ = try? await run("SUBSCRIBE \(MailboxName.encode(to).imapQuoted)")
+    }
+
+    func deleteMailbox(_ path: String) async throws {
+        if selectedPath == path {
+            // A selected mailbox can't be deleted on some servers; leave it first.
+            _ = try? await run("CLOSE")
+            selectedPath = nil
+        }
+        try await run("DELETE \(MailboxName.encode(path).imapQuoted)")
+    }
+
+    func setSubscribed(_ path: String, _ on: Bool) async throws {
+        try await run("\(on ? "SUBSCRIBE" : "UNSUBSCRIBE") \(MailboxName.encode(path).imapQuoted)")
+    }
+
+    /// Marks every message in the selected mailbox deleted and expunges (Empty Trash / Empty Spam, F-10).
+    func expungeAll() async throws {
+        guard lastSelectInfo.exists > 0 else { return }
+        try await run("UID STORE 1:* +FLAGS.SILENT (\\Deleted)")
+        try await run("EXPUNGE", timeout: 300)
+    }
+
+    /// Storage quota for the account's root (F-27): (used KB, limit KB), nil when the server has no QUOTA.
+    func quota() async throws -> (used: Int, limit: Int)? {
+        guard capabilities.contains("QUOTA") else { return nil }
+        let rs = try await run("GETQUOTAROOT INBOX")
+        for r in rs where r.isUntagged {
+            guard r.values.first?.text?.uppercased() == "QUOTA", r.values.count >= 3, let items = r.values[2].list else { continue }
+            var i = 0
+            while i + 2 < items.count {
+                if items[i].text?.uppercased() == "STORAGE", let used = items[i + 1].number, let limit = items[i + 2].number {
+                    return (Int(clamping: used), Int(clamping: limit))
+                }
+                i += 3
+            }
+        }
+        return nil
+    }
+
     /// The server's unread count for a mailbox (STATUS … (UNSEEN)); nil if the server didn't report it.
     func unseenCount(_ path: String) async throws -> Int? {
         Self.unseen(from: try await run("STATUS \(MailboxName.encode(path).imapQuoted) (UNSEEN)"))
@@ -361,10 +448,11 @@ actor IMAPClient {
         return out
     }
 
-    func fetch(_ set: String, items: String, uid: Bool = true, changedSince: UInt64? = nil) async throws -> [FetchResult] {
+    func fetch(_ set: String, items: String, uid: Bool = true, changedSince: UInt64? = nil,
+               timeout: TimeInterval = 180) async throws -> [FetchResult] {
         var cmd = (uid ? "UID FETCH " : "FETCH ") + set + " " + items
         if let m = changedSince { cmd += " (CHANGEDSINCE \(m))" }
-        let rs = try await run(cmd, timeout: 180)
+        let rs = try await run(cmd, timeout: timeout)
         return rs.compactMap { FetchResult.from($0) }
     }
 
@@ -403,8 +491,14 @@ actor IMAPClient {
         try await run("EXPUNGE")
     }
 
-    func append(_ path: String, flags: String, message: Data) async throws {
+    /// Appends a message; returns the new UID when the server reports it (APPENDUID, UIDPLUS).
+    @discardableResult
+    func append(_ path: String, flags: String, message: Data) async throws -> UInt32? {
         try await run("APPEND \(MailboxName.encode(path).imapQuoted) (\(flags)) {\(message.count)}", literals: [message], timeout: 300)
+        // Tagged OK [APPENDUID <uidvalidity> <uid>]
+        let parts = (lastTaggedCode ?? "").split(separator: " ")
+        if parts.count >= 3, parts[0].uppercased() == "APPENDUID" { return UInt32(parts[2]) }
+        return nil
     }
 
     /// Waits in IDLE until the server reports a change or the time limit passes. Returns true on change.
@@ -488,7 +582,12 @@ actor IMAPClient {
         let subject = h["subject"] ?? ""
         let gmsgid = r.items["X-GM-MSGID"]?.number.map { Int64(bitPattern: $0) } ?? 0
         var thrid = r.items["X-GM-THRID"]?.number.map { Int64(bitPattern: $0) } ?? 0
-        if !gmail || thrid == 0 { thrid = MIME.stableHash(MIME.normalizedSubject(subject)) }
+        if !gmail || thrid == 0 {
+            let people = ([from.email] + MIME.parseAddresses(h["to"] ?? "").map { $0.email }
+                          + MIME.parseAddresses(h["cc"] ?? "").map { $0.email })
+            thrid = MIME.threadKey(messageID: h["message-id"] ?? "", inReplyTo: h["in-reply-to"] ?? "",
+                                   references: h["references"] ?? "", subject: subject, participants: people)
+        }
         return ParsedHeader(
             uid: uid, gmailID: gmsgid, threadID: thrid, date: date,
             size: Int(r.items["RFC822.SIZE"]?.number ?? 0), flags: flags, subject: subject, from: from,
@@ -527,14 +626,14 @@ actor IMAPClient {
         return out
     }
 
-    /// Streams one part to a file in 2 MB chunks, decoding as it goes.
+    /// Streams one part to a file in 8 MB chunks (O-21: a 25 MB file is 4 round trips, not 13), decoding as it goes.
     func downloadPart(uid: UInt32, part: BodyPart, to url: URL) async throws {
         FileManager.default.createFile(atPath: url.path, contents: nil)
         let handle = try FileHandle(forWritingTo: url)
         // A truncated or failed download must not leave a broken file behind.
         defer { try? handle.close() }
         do {
-            let chunk = 2 * 1024 * 1024
+            let chunk = 8 * 1024 * 1024
             // A server that keeps sending past the advertised size (with a small margin) is cut off here.
             let maxBytes = max(part.size, part.decodedSize) + 1024 * 1024
             var offset = 0

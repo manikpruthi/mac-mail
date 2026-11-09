@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Hardened runtime with no exceptions. Mac Mail is deliberately not sandboxed (sandboxing would move the
+  mail cache and Keychain items), so it needs no network/file entitlements. Each exception added here must
+  be documented in docs/security.md.
+-->
+<plist version="1.0">
+<dict/>
+</plist>

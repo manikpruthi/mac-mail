@@ -17,8 +17,48 @@ enum MessageActions {
         }
         showProgress("Loading message…")
         Task {
-            let body = try? await MailService.shared.engine(row.accountID)?.loadBody(messageID: row.id)
-            open(kind, d, body)
+            do {
+                guard let engine = MailService.shared.engine(row.accountID) else { throw NetError.server("Account not found") }
+                open(kind, d, try await engine.loadBody(messageID: row.id))
+            } catch {
+                // Never open a reply silently missing the original (B-22): say why, and let the user choose.
+                let msg = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                showProgress("Couldn't load the original message")
+                let alert = NSAlert()
+                alert.messageText = "The original message couldn't be loaded"
+                alert.informativeText = msg
+                alert.addButton(withTitle: kind == .forward ? "Forward Without Text" : "Reply Without Original")
+                alert.addButton(withTitle: "Cancel")
+                if alert.runModal() == .alertFirstButtonReturn { open(kind, d, nil) }
+            }
+        }
+    }
+
+    /// Save As (F-17): fetches the original RFC 822 source and writes it as .eml, which opens in Mac Mail
+    /// (offline, see EMLWindowController) and in any other mail app.
+    static func saveAs(_ row: MessageRow, in window: NSWindow?, toast: @escaping (String) -> Void) {
+        guard let window else { return }
+        let panel = NSSavePanel()
+        let base = row.subject.isEmpty ? "Message" : String(row.subject.prefix(80))
+        panel.nameFieldStringValue = (BodyPart.safeFilename(base) ?? "Message") + ".eml"
+        panel.allowedContentTypes = [EMLDocument.type]
+        panel.canCreateDirectories = true
+        panel.message = "Saved messages open in Mac Mail, Apple Mail, Outlook and Thunderbird."
+        panel.beginSheetModal(for: window) { resp in
+            guard resp == .OK, let url = panel.url else { return }
+            toast("Saving \(url.lastPathComponent)…")
+            Task {
+                do {
+                    guard let engine = MailService.shared.engine(row.accountID) else { throw NetError.server("Account not found") }
+                    let data = try await engine.rawMessage(messageID: row.id)
+                    try data.write(to: url, options: .atomic)
+                    toast("Saved \(url.lastPathComponent)")
+                } catch {
+                    let a = NSAlert(error: error)
+                    a.messageText = "Couldn't save the message"
+                    a.beginSheetModal(for: window, completionHandler: nil)
+                }
+            }
         }
     }
 

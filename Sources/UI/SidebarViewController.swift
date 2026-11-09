@@ -1,13 +1,31 @@
 import AppKit
 
 enum MailSource: Equatable {
+    /// All Inboxes.
     case unified
+    /// Every account's folder with this role, merged (unified Sent, Drafts, Archive, Trash — F-13).
+    case unifiedRole(FolderRole)
+    /// Flagged messages across every account (F-13).
+    case flagged
     case folder(Int64)
     case search(String)
+
+    var isUnified: Bool {
+        switch self {
+        case .unified, .unifiedRole, .flagged: return true
+        default: return false
+        }
+    }
 }
 
 final class SidebarItem: NSObject {
-    enum Kind: Equatable { case unified, account(String), folder(Int64) }
+    enum Kind: Equatable {
+        case unified, account(String), folder(Int64)
+        /// Unified role sources (F-13) and the group rows that hold them.
+        case unifiedRole(FolderRole), flagged, group(String)
+        /// A saved search (F-29), keyed by its name.
+        case saved(String)
+    }
     let kind: Kind
     let title: String
     let symbol: String
@@ -36,6 +54,8 @@ final class SidebarViewController: NSViewController, NSOutlineViewDataSource, NS
     private let status = NSTextField(labelWithString: "")
     private let statusSpinner = NSProgressIndicator()
     var onSelect: ((MailSource) -> Void)?
+    /// A saved search was picked: run it in the search field (F-29).
+    var onSavedSearch: ((String) -> Void)?
     private var suppressSelection = false
 
     override func loadView() {
@@ -64,6 +84,7 @@ final class SidebarViewController: NSViewController, NSOutlineViewDataSource, NS
         status.font = .systemFont(ofSize: 11)
         status.textColor = .secondaryLabelColor
         status.lineBreakMode = .byTruncatingTail
+        status.setContentCompressionResistancePriority(.defaultLow, for: .vertical)
         status.maximumNumberOfLines = 2
         status.cell?.wraps = true
         status.translatesAutoresizingMaskIntoConstraints = false
@@ -84,7 +105,9 @@ final class SidebarViewController: NSViewController, NSOutlineViewDataSource, NS
             status.leadingAnchor.constraint(equalTo: statusSpinner.trailingAnchor, constant: 6),
             status.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -10),
             status.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -8),
-            status.heightAnchor.constraint(greaterThanOrEqualToConstant: 16),
+            // Fixed height (two lines): the status text changes with every sync, and a label that grew
+            // and shrank between one and two lines nudged the whole folder list up and down.
+            status.heightAnchor.constraint(equalToConstant: 30),
         ])
         view = root
         reload()
@@ -97,6 +120,8 @@ final class SidebarViewController: NSViewController, NSOutlineViewDataSource, NS
         nc.addObserver(self, selector: #selector(countsNote), name: .mailDataChanged, object: nil)
         nc.addObserver(self, selector: #selector(countsNote), name: .mailCountsChanged, object: nil)
         nc.addObserver(self, selector: #selector(statusNote), name: .mailStatusChanged, object: nil)
+        nc.addObserver(self, selector: #selector(statusNote), name: .mailOutboxChanged, object: nil)
+        nc.addObserver(self, selector: #selector(reloadNote), name: .mailSavedSearchesChanged, object: nil)
     }
 
     @objc private func reloadNote() { reload() }
@@ -113,6 +138,7 @@ final class SidebarViewController: NSViewController, NSOutlineViewDataSource, NS
 
     @objc private func statusClicked() {
         MailService.shared.flushAll()
+        MailService.shared.flushOutbox()
         updateStatus()
     }
 
@@ -122,7 +148,23 @@ final class SidebarViewController: NSViewController, NSOutlineViewDataSource, NS
         let selected = selectedKind
         var items: [SidebarItem] = []
         if service.accounts.count > 1 {
-            items.append(SidebarItem(kind: .unified, title: "All Inboxes", symbol: "tray.2"))
+            // Smart folders across every account (F-13).
+            let smart = SidebarItem(kind: .group("smart"), title: "All Accounts", symbol: "tray.2")
+            smart.children = [
+                SidebarItem(kind: .unified, title: "All Inboxes", symbol: "tray.2"),
+                SidebarItem(kind: .flagged, title: "Flagged", symbol: "flag"),
+                SidebarItem(kind: .unifiedRole(.sent), title: "Sent", symbol: FolderRole.sent.symbol),
+                SidebarItem(kind: .unifiedRole(.drafts), title: "Drafts", symbol: FolderRole.drafts.symbol),
+                SidebarItem(kind: .unifiedRole(.archive), title: "Archive", symbol: FolderRole.archive.symbol),
+                SidebarItem(kind: .unifiedRole(.trash), title: "Trash", symbol: FolderRole.trash.symbol),
+            ]
+            items.append(smart)
+        }
+        let saved = SavedSearches.all
+        if !saved.isEmpty {
+            let group = SidebarItem(kind: .group("saved"), title: "Saved Searches", symbol: "magnifyingglass")
+            group.children = saved.map { SidebarItem(kind: .saved($0.name), title: $0.name, symbol: "magnifyingglass") }
+            items.append(group)
         }
         for a in service.accounts {
             let acct = SidebarItem(kind: .account(a.id), title: a.email, symbol: "person.crop.circle")
@@ -145,19 +187,25 @@ final class SidebarViewController: NSViewController, NSOutlineViewDataSource, NS
     private func refreshCounts(reloadOutline: Bool = true) {
         let service = MailService.shared
         let store = service.store
+        // Two aggregate queries instead of several per folder (O-06).
+        let counts = store.unreadCounts()
+        let ops = store.opCounts()
         for r in roots {
-            if r.kind == .unified { r.unread = store.unifiedUnreadCount() }
             switch r.kind {
             case .account(let id):
                 // Broken account / offline queue state surfaces on the account row.
                 r.hasError = service.engines[id]?.lastError != nil
-                r.pendingOps = store.ops(account: id).count
+                r.pendingOps = ops[id] ?? 0
             default: break
             }
             for c in r.children {
-                if case .folder(let id) = c.kind {
+                switch c.kind {
+                case .folder(let id):
                     // Server unread count (STATUS) adjusted by local changes; no network per refresh.
-                    c.unread = store.unreadCount(folderID: id)
+                    c.unread = counts[id] ?? 0
+                case .unified:
+                    c.unread = store.unifiedUnreadCount()
+                default: break
                 }
             }
         }
@@ -177,11 +225,19 @@ final class SidebarViewController: NSViewController, NSOutlineViewDataSource, NS
     private func updateStatus() {
         let service = MailService.shared
         let store = service.store
-        let pending = service.accounts.reduce(0) { $0 + store.ops(account: $1.id).count }
+        let pending = store.opCounts().values.reduce(0, +)
+        let outbox = service.outbox.items
         let last = status.stringValue
         if let err = service.statusError {
             status.stringValue = err
             status.textColor = .systemRed
+        } else if let failed = outbox.first(where: { $0.lastError != nil }) {
+            status.stringValue = "Outbox: “\(failed.subject)” wasn't sent — \(failed.lastError ?? "")"
+            status.textColor = .systemRed
+        } else if !outbox.isEmpty {
+            // Offline outbox (F-07): sent automatically when the connection is back.
+            status.stringValue = "\(outbox.count) message\(outbox.count == 1 ? "" : "s") in Outbox — Retry"
+            status.textColor = .systemOrange
         } else if pending > 0 {
             // Offline queue: "N actions waiting — click to retry" (the queue is flushed after syncs too).
             status.stringValue = "\(pending) action\(pending == 1 ? "" : "s") waiting — Retry"
@@ -193,6 +249,7 @@ final class SidebarViewController: NSViewController, NSOutlineViewDataSource, NS
             status.stringValue = service.accounts.isEmpty ? "" : "Up to date"
             status.textColor = .secondaryLabelColor
         }
+        status.toolTip = status.stringValue
         if service.isSyncing { statusSpinner.startAnimation(nil) } else { statusSpinner.stopAnimation(nil) }
         if status.stringValue != last {
             NSAccessibility.post(element: status, notification: .announcementRequested,
@@ -211,12 +268,30 @@ final class SidebarViewController: NSViewController, NSOutlineViewDataSource, NS
                 return
             }
         }
+        // The folder vanished (deleted or renamed elsewhere): fall back instead of leaving a stale
+        // list on screen with nothing highlighted (B-37).
+        selectDefault()
     }
 
     /// Picks All Inboxes, or the first account's Inbox.
     func selectDefault() {
-        if roots.first?.kind == .unified { select(kind: .unified); return }
-        if let first = roots.first?.children.first { select(kind: first.kind) }
+        if roots.first?.kind == .group("smart") { selectIfPresent(.unified); return }
+        if let acct = roots.first(where: { $0.accountID != nil }), let first = acct.children.first { selectIfPresent(first.kind) }
+    }
+
+    private func selectIfPresent(_ kind: SidebarItem.Kind) {
+        for row in 0..<outline.numberOfRows {
+            if let item = outline.item(atRow: row) as? SidebarItem, item.kind == kind {
+                outline.selectRowIndexes([row], byExtendingSelection: false)
+                return
+            }
+        }
+    }
+
+    /// The selected folder, for menu commands (Empty Trash, folder actions).
+    var selectedFolder: Folder? {
+        guard case .folder(let id) = selectedKind else { return nil }
+        return MailService.shared.store.folder(id)
     }
 
     func clearSelectionForSearch() {
@@ -233,7 +308,7 @@ final class SidebarViewController: NSViewController, NSOutlineViewDataSource, NS
     /// The nth selectable folder in display order, for the ⌘1…⌘9 Go-to-folder shortcuts.
     func folderSource(at index: Int) -> MailSource? {
         var folders: [Int64] = []
-        for root in roots {
+        for root in roots where root.accountID != nil {
             for child in root.children {
                 if case .folder(let id) = child.kind { folders.append(id) }
             }
@@ -254,7 +329,106 @@ final class SidebarViewController: NSViewController, NSOutlineViewDataSource, NS
     }
 
     @objc private func signInAgain(_ sender: NSMenuItem) {
-        (NSApp.delegate as? AppDelegate)?.showSettings(addAccount: false)
+        guard let id = sender.representedObject as? String else { return }
+        (NSApp.delegate as? AppDelegate)?.showSettings(addAccount: false, editAccount: id)
+    }
+
+    @objc private func toggleNotifications(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String else { return }
+        Prefs.setNotifications(!Prefs.notifications(for: id), for: id)
+    }
+
+    // MARK: Folder management (F-10, F-12)
+
+    private func ask(_ title: String, value: String = "", button: String, then: @escaping (String) -> Void) {
+        guard let w = view.window else { return }
+        let alert = NSAlert()
+        alert.messageText = title
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 260, height: 24))
+        field.stringValue = value
+        alert.accessoryView = field
+        alert.addButton(withTitle: button)
+        alert.addButton(withTitle: "Cancel")
+        alert.window.initialFirstResponder = field
+        alert.beginSheetModal(for: w) { r in
+            if r == .alertFirstButtonReturn { then(field.stringValue) }
+        }
+    }
+
+    private func run(_ what: String, _ work: @escaping () async throws -> Void) {
+        Task {
+            do { try await work() } catch {
+                let msg = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                (NSApp.delegate as? AppDelegate)?.mainWindow?.showToast("\(what) failed: \(msg)")
+            }
+        }
+    }
+
+    @objc private func newFolder(_ sender: NSMenuItem) {
+        let service = MailService.shared
+        let parent = (sender.representedObject as? NSNumber).flatMap { service.store.folder($0.int64Value) }
+        guard let acct = parent?.accountID ?? (sender.representedObject as? String), let e = service.engine(acct) else { return }
+        ask(parent.map { "New folder inside “\($0.name)”" } ?? "New folder", button: "Create") { [weak self] name in
+            self?.run("Creating the folder") { _ = try await e.createFolder(name: name, parent: parent) }
+        }
+    }
+
+    @objc private func renameFolder(_ sender: NSMenuItem) {
+        guard let id = (sender.representedObject as? NSNumber)?.int64Value, let f = MailService.shared.store.folder(id),
+              let e = MailService.shared.engine(f.accountID) else { return }
+        let leaf = f.path.components(separatedBy: f.delimiter).last ?? f.name
+        ask("Rename “\(f.name)”", value: leaf, button: "Rename") { [weak self] name in
+            self?.run("Renaming the folder") { try await e.renameFolder(f, to: name) }
+        }
+    }
+
+    @objc private func deleteFolder(_ sender: NSMenuItem) {
+        guard let id = (sender.representedObject as? NSNumber)?.int64Value, let f = MailService.shared.store.folder(id),
+              let e = MailService.shared.engine(f.accountID), let w = view.window else { return }
+        let alert = NSAlert()
+        alert.messageText = "Delete the folder “\(f.name)”?"
+        alert.informativeText = "The folder and every message in it are deleted from the server. This can't be undone."
+        alert.addButton(withTitle: "Delete")
+        alert.addButton(withTitle: "Cancel")
+        alert.buttons.first?.hasDestructiveAction = true
+        alert.beginSheetModal(for: w) { [weak self] r in
+            guard r == .alertFirstButtonReturn else { return }
+            self?.run("Deleting the folder") { try await e.deleteFolder(f) }
+        }
+    }
+
+    @objc func emptyFolder(_ sender: NSMenuItem) {
+        guard let id = (sender.representedObject as? NSNumber)?.int64Value, let f = MailService.shared.store.folder(id) else { return }
+        Self.confirmEmpty(f, in: view.window)
+    }
+
+    /// Empty Trash / Empty Spam with a confirmation (F-10).
+    static func confirmEmpty(_ f: Folder, in window: NSWindow?) {
+        guard f.role == .trash || f.role == .spam, let window else { return }
+        let n = MailService.shared.store.messageCount(folderID: f.id)
+        let alert = NSAlert()
+        alert.messageText = "Empty \(f.name)?"
+        alert.informativeText = "\(n > 0 ? "\(n) cached message\(n == 1 ? "" : "s") and everything else" : "Everything") in \(f.name) on the server will be deleted permanently. This can't be undone."
+        alert.addButton(withTitle: "Empty \(f.name)")
+        alert.addButton(withTitle: "Cancel")
+        alert.buttons.first?.hasDestructiveAction = true
+        alert.beginSheetModal(for: window) { r in
+            guard r == .alertFirstButtonReturn else { return }
+            Task {
+                do {
+                    try await MailService.shared.emptyFolder(f)
+                    (NSApp.delegate as? AppDelegate)?.mainWindow?.showToast("\(f.name) emptied")
+                } catch {
+                    let msg = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                    (NSApp.delegate as? AppDelegate)?.mainWindow?.showToast("Couldn't empty \(f.name): \(msg)")
+                }
+            }
+        }
+    }
+
+    @objc private func deleteSavedSearch(_ sender: NSMenuItem) {
+        guard let name = sender.representedObject as? String else { return }
+        SavedSearches.remove(name)
     }
 
     @objc private func removeAccount(_ sender: NSMenuItem) {
@@ -284,18 +458,23 @@ final class SidebarViewController: NSViewController, NSOutlineViewDataSource, NS
     }
 
     func outlineView(_ outlineView: NSOutlineView, isGroupItem item: Any) -> Bool {
-        if case .account = (item as? SidebarItem)?.kind { return true }
-        return false
+        switch (item as? SidebarItem)?.kind {
+        case .account, .group: return true
+        default: return false
+        }
     }
 
     func outlineView(_ outlineView: NSOutlineView, shouldSelectItem item: Any) -> Bool {
-        // Accounts are selectable rows too (context menu: Sync Now, Sign in again, Remove).
-        true
+        // Account and group headers aren't sources; their actions live in the context menu (B-37).
+        switch (item as? SidebarItem)?.kind {
+        case .account, .group: return false
+        default: return true
+        }
     }
 
     func outlineView(_ outlineView: NSOutlineView, viewFor tableColumn: NSTableColumn?, item: Any) -> NSView? {
         guard let item = item as? SidebarItem else { return nil }
-        if case .account = item.kind {
+        if item.accountID != nil || { if case .group = item.kind { return true }; return false }() {
             let id = NSUserInterfaceItemIdentifier("account")
             let cell = (outlineView.makeView(withIdentifier: id, owner: nil) as? AccountCell) ?? AccountCell(identifier: id)
             cell.configure(item)
@@ -311,8 +490,12 @@ final class SidebarViewController: NSViewController, NSOutlineViewDataSource, NS
         guard !suppressSelection, let item = outline.item(atRow: outline.selectedRow) as? SidebarItem else { return }
         switch item.kind {
         case .unified: onSelect?(.unified)
+        case .unifiedRole(let role): onSelect?(.unifiedRole(role))
+        case .flagged: onSelect?(.flagged)
         case .folder(let id): onSelect?(.folder(id))
-        case .account: break
+        case .saved(let name):
+            if let q = SavedSearches.all.first(where: { $0.name == name })?.query { onSavedSearch?(q) }
+        case .account, .group: break
         }
     }
 
@@ -320,19 +503,49 @@ final class SidebarViewController: NSViewController, NSOutlineViewDataSource, NS
 
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
-        guard let item = outline.item(atRow: outline.clickedRow) as? SidebarItem, let id = item.accountID else { return }
-        let sync = NSMenuItem(title: "Sync Now", action: #selector(syncAccount(_:)), keyEquivalent: "")
-        sync.target = self
-        sync.representedObject = id
-        menu.addItem(sync)
-        let signIn = NSMenuItem(title: "Sign in again…", action: #selector(signInAgain(_:)), keyEquivalent: "")
-        signIn.target = self
-        menu.addItem(signIn)
-        menu.addItem(.separator())
-        let remove = NSMenuItem(title: "Remove…", action: #selector(removeAccount(_:)), keyEquivalent: "")
-        remove.target = self
-        remove.representedObject = id
-        menu.addItem(remove)
+        guard let item = outline.item(atRow: outline.clickedRow) as? SidebarItem else { return }
+        func add(_ title: String, _ sel: Selector, _ obj: Any?) -> NSMenuItem {
+            let i = NSMenuItem(title: title, action: sel, keyEquivalent: "")
+            i.target = self
+            i.representedObject = obj
+            menu.addItem(i)
+            return i
+        }
+        switch item.kind {
+        case .account(let id):
+            _ = add("Sync Now", #selector(syncAccount(_:)), id)
+            _ = add("Edit Account / Sign in again…", #selector(signInAgain(_:)), id)
+            let notify = add("Notify About New Mail", #selector(toggleNotifications(_:)), id)
+            notify.state = Prefs.notifications(for: id) ? .on : .off
+            _ = add("New Folder…", #selector(newFolder(_:)), id)
+            // Mailbox usage (F-27), filled in when the server answers.
+            let quota = NSMenuItem(title: "Storage: checking…", action: nil, keyEquivalent: "")
+            quota.isEnabled = false
+            menu.addItem(quota)
+            if let e = MailService.shared.engine(id) {
+                Task {
+                    if let q = await e.quota() {
+                        quota.title = "Storage: \(MIME.formatSize(q.used * 1024)) of \(MIME.formatSize(q.limit * 1024))"
+                    } else {
+                        quota.title = "Storage: not reported by the server"
+                    }
+                }
+            }
+            menu.addItem(.separator())
+            _ = add("Remove…", #selector(removeAccount(_:)), id)
+        case .folder(let fid):
+            guard let f = MailService.shared.store.folder(fid) else { return }
+            if f.role == .trash || f.role == .spam { _ = add("Empty \(f.name)…", #selector(emptyFolder(_:)), NSNumber(value: fid)) }
+            _ = add("New Folder Inside…", #selector(newFolder(_:)), NSNumber(value: fid))
+            if f.role == .none {
+                _ = add("Rename…", #selector(renameFolder(_:)), NSNumber(value: fid))
+                _ = add("Delete Folder…", #selector(deleteFolder(_:)), NSNumber(value: fid))
+            }
+        case .saved(let name):
+            _ = add("Delete Saved Search", #selector(deleteSavedSearch(_:)), name)
+        default:
+            break
+        }
     }
 }
 
@@ -374,6 +587,9 @@ final class AccountCell: NSTableCellView {
 
     func configure(_ item: SidebarItem) {
         textField?.stringValue = item.title
+        if let id = item.accountID, let a = MailService.shared.account(id) {
+            toolTip = "\(a.email) — IMAP \(a.imapHost):\(a.imapPort) (\(a.imapSecurity.label)), SMTP \(a.smtpHost):\(a.smtpPort) (\(a.smtpSecurity.label))"
+        }
         warning.isHidden = !item.hasError
         ops.stringValue = item.pendingOps > 0 ? "✉\(item.pendingOps)" : ""
         ops.isHidden = item.pendingOps == 0
@@ -421,4 +637,34 @@ final class SidebarCell: NSTableCellView {
         textField?.stringValue = item.title
         badge.stringValue = item.unread > 0 ? "\(item.unread)" : ""
     }
+}
+
+extension Notification.Name {
+    static let mailSavedSearchesChanged = Notification.Name("MacMail.savedSearchesChanged")
+}
+
+/// Named searches shown in the sidebar (F-29), kept in the store's prefs table.
+@MainActor
+enum SavedSearches {
+    struct Entry: Codable, Equatable { var name: String; var query: String }
+
+    static var all: [Entry] {
+        guard let raw = MailService.shared.store.pref("savedSearches"), let data = raw.data(using: .utf8),
+              let list = try? JSONDecoder().decode([Entry].self, from: data) else { return [] }
+        return list
+    }
+
+    private static func save(_ list: [Entry]) {
+        let data = (try? JSONEncoder().encode(list)) ?? Data("[]".utf8)
+        MailService.shared.store.setPref("savedSearches", String(decoding: data, as: UTF8.self))
+        NotificationCenter.default.post(name: .mailSavedSearchesChanged, object: nil)
+    }
+
+    static func add(name: String, query: String) {
+        let clean = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !clean.isEmpty, !query.isEmpty else { return }
+        save(all.filter { $0.name != clean } + [Entry(name: clean, query: query)])
+    }
+
+    static func remove(_ name: String) { save(all.filter { $0.name != name }) }
 }

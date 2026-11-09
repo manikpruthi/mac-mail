@@ -156,6 +156,8 @@ final class SearchFilterBar: NSView, NSPopoverDelegate {
 
     // MARK: From / To / Subject popover
 
+    private var didConfigureWidths = false
+
     @objc private func showMore() {
         let vc = NSViewController()
         let root = NSView()
@@ -168,8 +170,10 @@ final class SearchFilterBar: NSView, NSPopoverDelegate {
             f.placeholderString = p
             f.target = self
             f.action = #selector(applyMore)
-            f.widthAnchor.constraint(equalToConstant: 220).isActive = true
+            // The fields outlive the popover: their width constraint is added once, not per opening (B-19).
+            if !didConfigureWidths { f.widthAnchor.constraint(equalToConstant: 220).isActive = true }
         }
+        didConfigureWidths = true
         let apply = NSButton(title: "Apply", target: self, action: #selector(applyMore))
         apply.bezelStyle = .rounded
         apply.keyEquivalent = "\r"

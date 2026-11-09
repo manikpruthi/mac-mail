@@ -20,6 +20,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             Self.applyTheme(Prefs.theme)
         }
         buildMenus()
+        installUndoSendKeys()
+    }
+
+    // MARK: Undo Send from the keyboard (F-09, B-04)
+
+    private var undoSendMonitor: Any?
+
+    /// While a send waits out its Undo delay, ⌘Z and Esc undo it — unless a text editor or field has focus,
+    /// where ⌘Z keeps its usual meaning and Esc its usual cancel.
+    private func installUndoSendKeys() {
+        undoSendMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+            let mods = event.modifierFlags.intersection([.command, .shift, .option, .control])
+            let isCmdZ = mods == [.command] && event.charactersIgnoringModifiers?.lowercased() == "z"
+            let isEsc = mods.isEmpty && event.keyCode == 53
+            guard isCmdZ || isEsc else { return event }
+            let handled = MainActor.assumeIsolated { () -> Bool in
+                guard MailService.shared.undoableSendID != nil else { return false }
+                if NSApp.keyWindow?.firstResponder is NSTextView { return false }
+                return MailService.shared.undoLatestSend()
+            }
+            return handled ? nil : event
+        }
+    }
+
+    @objc func undoSend(_ sender: Any?) {
+        if !MailService.shared.undoLatestSend() { NSSound.beep() }
+    }
+
+    /// Help ▸ Mac Mail Help (B-33): the user guide in the project README.
+    @objc func showHelp(_ sender: Any?) {
+        NSWorkspace.shared.open(URL(string: "https://github.com/manikpruthi/mac-mail#readme")!)
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -35,7 +66,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         w.start()
         Debug.log("window started")
         launched = true
-        ImageLoader.pruneCache()
+        // Composers that were open when the app crashed or was force-quit come back (F-06).
+        if !Debug.bench && ProcessInfo.processInfo.environment["MAC_MAIL_SNAPSHOT"] == nil {
+            ComposeWindowController.restoreAutosaved()
+        }
         if !pendingOpen.isEmpty {
             let urls = pendingOpen
             pendingOpen = []
@@ -154,9 +188,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     }
 
     private func handle(_ urls: [URL]) {
-        let files = urls.filter { $0.isFileURL }
-        Debug.log("open request: \(files.count) file(s) \(files.map { $0.lastPathComponent }) mailto=\(urls.count - files.count)")
+        let all = urls.filter { $0.isFileURL }
+        // Saved messages (.eml) open in the offline viewer; any other file starts a message with it attached.
+        let eml = all.filter { $0.pathExtension.lowercased() == "eml" }
+        let files = all.filter { $0.pathExtension.lowercased() != "eml" }
+        Debug.log("open request: \(files.count) file(s) \(files.map { $0.lastPathComponent }) eml=\(eml.count) mailto=\(urls.count - all.count)")
         for m in urls where m.scheme?.lowercased() == "mailto" { compose(mailto: m) }
+        for e in eml { EMLWindowController.show(e) }
         if !files.isEmpty { ComposeWindowController.open(.files(files)) }
         NSApp.activate(ignoringOtherApps: true)
     }
@@ -220,17 +258,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         if item.action == #selector(setThemeFromMenu(_:)) {
             item.state = (item.representedObject as? String) == Prefs.theme.rawValue ? .on : .off
         }
+        if item.action == #selector(setSortFromMenu(_:)) {
+            item.state = (item.representedObject as? String) == Prefs.sortOrder.rawValue ? .on : .off
+        }
+        if item.action == #selector(toggleCompactRows(_:)) { item.state = Prefs.compactRows ? .on : .off }
+        if item.action == #selector(undoSend(_:)) { return MailService.shared.undoableSendID != nil }
         return true
+    }
+
+    /// File ▸ Open… for saved .eml messages.
+    @objc func openDocument(_ sender: Any?) {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [EMLDocument.type]
+        panel.allowsMultipleSelection = true
+        if panel.runModal() == .OK { panel.urls.forEach { EMLWindowController.show($0) } }
+    }
+
+    @objc func setSortFromMenu(_ sender: NSMenuItem) {
+        guard let raw = sender.representedObject as? String, let order = Prefs.SortOrder(rawValue: raw) else { return }
+        Prefs.sortOrder = order
+        mainWindow?.list.applyViewOptions()
+    }
+
+    @objc func toggleCompactRows(_ sender: Any?) {
+        Prefs.compactRows.toggle()
+        mainWindow?.list.applyViewOptions()
     }
 
     // MARK: Settings
 
     @objc func showSettingsAction(_ sender: Any?) { showSettings(addAccount: false) }
 
-    func showSettings(addAccount: Bool) {
+    func showSettings(addAccount: Bool, editAccount: String? = nil) {
         if settings == nil { settings = SettingsWindowController() }
         settings?.show(tab: "accounts")
         if addAccount { settings?.addAccount() }
+        if let id = editAccount { settings?.editAccount(id) }
     }
 
     // MARK: Menus
@@ -272,15 +335,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         NSApp.servicesMenu = servicesMenu
         _ = submenu("File", [
             item("New Message", #selector(MainWindowController.newMessage(_:)), "n"),
+            item("Open Saved Message…", #selector(openDocument(_:)), "o"),
             item("Attach Files…", #selector(ComposeWindowController.attachFiles(_:)), "a", [.command, .shift]),
             .separator(),
+            item("Save As…", #selector(MainWindowController.saveMessageAs(_:)), "s"),
             item("Save Attachments…", #selector(MainWindowController.saveAttachments(_:)), "s", [.command, .shift]),
+            .separator(),
+            item("Print…", #selector(MainWindowController.printMessage(_:)), "p"),
             .separator(),
             item("Close Window", #selector(NSWindow.performClose(_:)), "w"),
         ])
         _ = submenu("Edit", [
             item("Undo", Selector(("undo:")), "z"),
             item("Redo", Selector(("redo:")), "z", [.command, .shift]),
+            item("Undo Send", #selector(undoSend(_:)), ""),
             .separator(),
             item("Cut", #selector(NSText.cut(_:)), "x"),
             item("Copy", #selector(NSText.copy(_:)), "c"),
@@ -292,6 +360,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             item("Find…", #selector(NSTextView.performFindPanelAction(_:)), "f"),
         ])
         if let find = main.items.last?.submenu?.items.last { find.tag = Int(NSFindPanelAction.showFindPanel.rawValue) }
+        for top in main.items {
+            for i in top.submenu?.items ?? [] where i.action == #selector(undoSend(_:)) || i.action == #selector(openDocument(_:)) {
+                i.target = self
+            }
+        }
         let appearance = NSMenuItem(title: "Appearance", action: nil, keyEquivalent: "")
         let appearanceMenu = NSMenu(title: "Appearance")
         for t in Prefs.Theme.allCases {
@@ -301,8 +374,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             appearanceMenu.addItem(i)
         }
         appearance.submenu = appearanceMenu
+        let sort = NSMenuItem(title: "Sort By", action: nil, keyEquivalent: "")
+        let sortMenu = NSMenu(title: "Sort By")
+        for o in Prefs.SortOrder.allCases {
+            let i = NSMenuItem(title: o.label, action: #selector(setSortFromMenu(_:)), keyEquivalent: "")
+            i.target = self
+            i.representedObject = o.rawValue
+            sortMenu.addItem(i)
+        }
+        sort.submenu = sortMenu
+        let compact = item("Compact Rows", #selector(toggleCompactRows(_:)), "")
+        compact.target = self
         _ = submenu("View", [
             item("Group by Conversation", #selector(MainWindowController.toggleConversations(_:)), "c", [.command, .option]),
+            sort, compact,
             .separator(),
             appearance,
             item("Show Message with Light Background", #selector(MainWindowController.toggleLightBackground(_:)), "l", [.command, .option]),
@@ -326,6 +411,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         goItems.append(.separator())
         goItems.append(item("Focus Next Pane", Selector(("focusNextPane:")), "\t", [.control]))
         _ = submenu("Go", goItems)
+        _ = submenu("Mailbox", [
+            item("Save Search…", #selector(MainWindowController.saveCurrentSearch(_:)), ""),
+            .separator(),
+            item("Empty Trash…", #selector(MainWindowController.emptyTrash(_:)), "\u{8}", [.command, .option, .shift]),
+            item("Empty Spam…", #selector(MainWindowController.emptySpam(_:)), ""),
+        ])
         _ = submenu("Message", [
             item("Reply", #selector(MainWindowController.reply(_:)), "r"),
             item("Reply All", #selector(MainWindowController.replyAll(_:)), "r", [.command, .shift]),
@@ -360,7 +451,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         ])
         NSApp.windowsMenu = window.submenu
         // Standard Help menu (BUG-36).
-        let help = submenu("Help", [item("Mac Mail Help", Selector(("showHelp:")), "?")])
+        let helpItem = item("Mac Mail Help", #selector(showHelp(_:)), "?")
+        helpItem.target = self
+        let help = submenu("Help", [helpItem])
         NSApp.helpMenu = help.submenu
         NSApp.mainMenu = main
     }
@@ -456,6 +549,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             // Message window opens at a usable size.
             w.list.selectAfterRemoval(previousIndex: 0)
             if let r = w.list.focusedRow { w.openRow(r) }
+        }
+        // Archive → Undo puts the message back (F-08); Save As → .eml opens in the offline viewer (F-17).
+        step(1.0) {
+            let store = MailService.shared.store
+            guard let inbox = store.folder(account: DemoData.account.id, role: .inbox),
+                  let row = store.rows(folderID: inbox.id).last else { log("FAIL demo inbox empty"); return }
+            let before = store.messageCount(folderID: inbox.id)
+            let result = MailService.shared.move([row], to: .archive)
+            let during = store.messageCount(folderID: inbox.id)
+            let undone = result?.undoID.map { MailService.shared.undo($0) } ?? false
+            let after = store.messageCount(folderID: inbox.id)
+            log((undone && during == before - 1 && after == before ? "PASS" : "FAIL") + " archive can be undone (\(before)→\(during)→\(after))")
+            Task { @MainActor in
+                guard let data = try? await MailService.shared.engine(row.accountID)?.rawMessage(messageID: row.id) else {
+                    log("FAIL raw message for Save As"); return
+                }
+                let url = FileManager.default.temporaryDirectory.appendingPathComponent("macmail-selftest.eml")
+                try? data.write(to: url)
+                EMLWindowController.show(url)
+                let viewer = NSApp.windows.first { $0.windowController is EMLWindowController }
+                log((viewer != nil && viewer?.title == row.subject ? "PASS" : "FAIL") + " saved .eml opens offline (\(viewer?.title ?? "nil"))")
+                viewer?.close()
+                try? FileManager.default.removeItem(at: url)
+            }
         }
         step(1.5) {
             let mw = NSApp.windows.first(where: { $0.windowController is MessageWindowController })

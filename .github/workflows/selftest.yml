@@ -2,12 +2,38 @@ name: selftest
 
 on:
   push:
+    branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
+  # Fast offline tests: protocol, MIME, cache, sanitiser, outbox (R-02).
   selftest:
-    runs-on: macos-latest
+    runs-on: macos-14
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - name: Run offline selftest
         run: tools/selftest.sh
+
+  # Every source file is compiled, UI included, so a broken file can't merge green (R-01).
+  typecheck:
+    runs-on: macos-14
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Typecheck all sources
+        run: |
+          swiftc -typecheck -swift-version 5 -module-name MacMail \
+            -sdk "$(xcrun --show-sdk-path)" -target arm64-apple-macos14.0 \
+            $(find Sources -name '*.swift' | sort)
+      - name: Lint Info.plist and entitlements
+        run: |
+          plutil -lint Resources/Info.plist Resources/MacMail.entitlements
+          test "$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' Resources/Info.plist)" = "14.0"

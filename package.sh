@@ -1,4 +1,9 @@
 #!/bin/bash
+# Release build → verified, versioned DMG in release/.
+#   ./package.sh
+# Environment:
+#   MAC_MAIL_SIGN_IDENTITY   Developer ID identity (otherwise ad-hoc)
+#   MAC_MAIL_NOTARY_PROFILE  notarytool keychain profile; when set, the DMG is notarised and stapled
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -10,18 +15,43 @@ APP="$BUILD_DIR/$APP_NAME.app"
 
 ./build.sh release
 
-rm -rf "$RELEASE_DIR"
+BUILD="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$APP/Contents/Info.plist")"
+DMG="$RELEASE_DIR/MacMail-$VERSION-$BUILD-universal.dmg"
 mkdir -p "$RELEASE_DIR"
+# Older releases are kept; only an artifact with this exact name is replaced (R-08).
+rm -f "$DMG" "$DMG.sha256"
+
+# Signature checks before packaging (R-09).
+codesign --verify --deep --strict --verbose=1 "$APP"
+if [ -n "${MAC_MAIL_SIGN_IDENTITY:-}" ]; then
+    spctl --assess --type execute --verbose "$APP" || echo "warning: Gatekeeper assessment failed (not notarised yet?)"
+else
+    echo "note: ad-hoc signed — Gatekeeper will ask on first launch (see README → Install)"
+fi
 
 STAGE="$(mktemp -d)"
-trap 'rm -rf "$STAGE"' EXIT
+MOUNT="$(mktemp -d)"
+trap 'hdiutil detach "$MOUNT" -quiet >/dev/null 2>&1 || true; rm -rf "$STAGE" "$MOUNT"' EXIT
 ditto "$APP" "$STAGE/$APP_NAME.app"
 ln -s /Applications "$STAGE/Applications"
+cp LICENSE "$STAGE/LICENSE.txt"
+cp README.md "$STAGE/README.md"
 
-hdiutil create -volname "$APP_NAME" -srcfolder "$STAGE" -ov -format UDZO \
-    "$RELEASE_DIR/MacMail-$VERSION.dmg" >/dev/null
+hdiutil create -volname "$APP_NAME" -srcfolder "$STAGE" -ov -format UDZO "$DMG" >/dev/null
 
+# Smoke test: the image mounts and the app inside is intact and signed.
+hdiutil attach "$DMG" -nobrowse -readonly -mountpoint "$MOUNT" -quiet
+codesign --verify --strict "$MOUNT/$APP_NAME.app"
+/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$MOUNT/$APP_NAME.app/Contents/Info.plist" >/dev/null
+hdiutil detach "$MOUNT" -quiet
+
+if [ -n "${MAC_MAIL_NOTARY_PROFILE:-}" ]; then
+    xcrun notarytool submit "$DMG" --keychain-profile "$MAC_MAIL_NOTARY_PROFILE" --wait
+    xcrun stapler staple "$DMG"
+fi
+
+(cd "$RELEASE_DIR" && shasum -a 256 "$(basename "$DMG")" > "$(basename "$DMG").sha256")
 touch "$RELEASE_DIR/.metadata_never_index"
 
 echo "Packaged:"
-ls -lh "$RELEASE_DIR"
+ls -lh "$DMG" "$DMG.sha256"

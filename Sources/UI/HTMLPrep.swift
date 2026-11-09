@@ -70,8 +70,10 @@ enum HTMLPrep {
         var out = PreparedHTML(html: "")
         var s = input
         if clip, s.utf8.count > Prefs.htmlClipBytes {
-            // Cut at a tag boundary near the limit; WebKit closes open tags itself.
-            let cut = s.utf8.index(s.utf8.startIndex, offsetBy: Prefs.htmlClipBytes)
+            // Cut at a tag boundary near the limit; WebKit closes open tags itself. The byte offset is first
+            // moved back to a character boundary so a multi-byte character is never split (B-27).
+            var cut = s.utf8.index(s.utf8.startIndex, offsetBy: Prefs.htmlClipBytes)
+            while cut > s.startIndex, String.Index(cut, within: s) == nil { cut = s.utf8.index(before: cut) }
             var head = String(s[..<cut])
             if let lt = head.lastIndex(of: "<") { head = String(head[..<lt]) }
             s = head
@@ -327,27 +329,61 @@ enum HTMLPrep {
     /// Body fragment safe to quote into an outgoing reply/forward: the same sanitising as the display
     /// path (active content, remote-setting meta/base/link tags, srcset and tracking pixels removed),
     /// but images keep their original URLs — the recipient's mail client loads them.
+    ///
+    /// Stricter than display (B-28), because this HTML leaves the app inside the user's own message: <style>
+    /// blocks (page-wide rules that would restyle the reply) and <link> are dropped, every on* handler is
+    /// removed, javascript:/vbscript:/data: links are neutralised, and only images with absolute https URLs
+    /// survive.
     static func quoteSanitized(_ html: String) -> String {
         var s = stripActive(html)
+        s = replace(styleBlock, in: s) { _, _ in "" }
         s = replace(voidActive, in: s) { _, _ in "" }
         s = replace(srcsetAttr, in: s) { _, _ in "" }
         s = replace(posterAttr, in: s) { _, _ in "" }
         s = replace(cssImport, in: s) { _, _ in "" }
-        s = replace(imgTag, in: s) { tag, _ in isTrackingPixel(tag) ? "" : tag }
+        s = replace(imgTag, in: s) { tag, _ in
+            if isTrackingPixel(tag) { return "" }
+            let src = MIME.decodeEntities(attrValue(tag, srcAttr) ?? attrValue(tag, hrefAttr) ?? "")
+                .trimmingCharacters(in: .whitespaces).lowercased()
+            return src.hasPrefix("https://") ? tag : ""
+        }
+        s = replace(openTag, in: s) { tag, _ in
+            var t = tag
+            t = onHandler.stringByReplacingMatches(in: t, range: NSRange(location: 0, length: (t as NSString).length), withTemplate: "")
+            t = replace(urlAttr, in: t) { attr, m in
+                var value = ""
+                for g in 2...4 where m.count > g && !m[g].isEmpty { value = m[g]; break }
+                let v = MIME.decodeEntities(value).filter { !$0.isWhitespace && !$0.isNewline }.lowercased()
+                if v.hasPrefix("javascript:") || v.hasPrefix("vbscript:") || v.hasPrefix("data:") {
+                    return " \(m.count > 1 ? m[1] : "href")=\"#\""
+                }
+                return attr
+            }
+            return t
+        }
         return s
     }
 
-    /// Body inner HTML, for quoting in replies.
+    private static let styleBlock = try! NSRegularExpression(pattern: "<style\\b[^>]*>[\\s\\S]*?</style\\s*>", options: [.caseInsensitive])
+    private static let openTag = try! NSRegularExpression(pattern: "<[a-zA-Z][^>]*>", options: [])
+    private static let onHandler = try! NSRegularExpression(
+        pattern: "(?:\\s|/)on[a-z]+\\s*=\\s*(?:\"[^\"]*\"|'[^']*'|[^\\s>]+)", options: [.caseInsensitive])
+    private static let urlAttr = try! NSRegularExpression(
+        pattern: "\\s(href|src|action|formaction|background|xlink:href)\\s*=\\s*(?:\"([^\"]*)\"|'([^']*)'|([^\\s>]+))",
+        options: [.caseInsensitive])
+    private static let bodyOpen = try! NSRegularExpression(pattern: "<body\\b[^>]*>", options: [.caseInsensitive])
+    private static let bodyClose = try! NSRegularExpression(pattern: "</body\\s*>", options: [.caseInsensitive])
+
+    /// Body inner HTML, for quoting in replies. Located with case-insensitive matches on the original
+    /// string, so case mappings that change length (e.g. "İ") can't shift the slice (B-26).
     static func bodyInner(_ html: String) -> String {
-        let lower = html.lowercased()
-        guard let bodyStart = lower.range(of: "<body") else { return html }
-        guard let gt = lower[bodyStart.upperBound...].firstIndex(of: ">") else { return html }
-        let startOffset = lower.distance(from: lower.startIndex, to: gt) + 1
-        let endOffset = lower.range(of: "</body>").map { lower.distance(from: lower.startIndex, to: $0.lowerBound) } ?? lower.count
-        guard endOffset > startOffset else { return html }
-        let si = html.index(html.startIndex, offsetBy: startOffset)
-        let ei = html.index(html.startIndex, offsetBy: endOffset)
-        return String(html[si..<ei])
+        let ns = html as NSString
+        guard let open = bodyOpen.firstMatch(in: html, range: NSRange(location: 0, length: ns.length)) else { return html }
+        let start = open.range.location + open.range.length
+        let close = bodyClose.firstMatch(in: html, range: NSRange(location: start, length: ns.length - start))
+        let end = close?.range.location ?? ns.length
+        guard end >= start else { return html }
+        return ns.substring(with: NSRange(location: start, length: end - start))
     }
 }
 

@@ -14,7 +14,8 @@ enum DBError: Error, LocalizedError {
     }
 }
 
-/// A thin SQLite wrapper with a prepared-statement cache. One instance, used from the main actor.
+/// A thin SQLite wrapper with a prepared-statement cache. The app's instance is used from the main actor;
+/// background maintenance (prune) opens its own short-lived connection on a utility queue.
 final class SQLiteDB {
     private var handle: OpaquePointer?
     private var cache: [String: Statement] = [:]
@@ -26,9 +27,10 @@ final class SQLiteDB {
         }
         // A 2 MB page cache keeps the database's resident memory small; WAL keeps writes cheap.
         try exec("""
-            PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON;
+            PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON; PRAGMA recursive_triggers=ON;
             PRAGMA busy_timeout=3000; PRAGMA cache_size=-2000; PRAGMA temp_store=MEMORY; PRAGMA mmap_size=0;
             """)
+        // recursive_triggers: ON DELETE CASCADE deletes must fire the FTS/contacts maintenance triggers (B-14).
     }
 
     deinit {
@@ -163,4 +165,21 @@ final class Statement {
         return String(cString: p)
     }
     func text(_ i: Int32) -> String { string(i) ?? "" }
+
+    var columnCount: Int32 { sqlite3_column_count(raw) }
+    func columnName(_ i: Int32) -> String { String(cString: sqlite3_column_name(raw, i)) }
+
+    /// The column as a bindable Swift value (Int64, Double, String, Data or nil), for snapshot/restore.
+    func value(_ i: Int32) -> Any? {
+        switch sqlite3_column_type(raw, i) {
+        case SQLITE_INTEGER: return sqlite3_column_int64(raw, i)
+        case SQLITE_FLOAT: return sqlite3_column_double(raw, i)
+        case SQLITE_TEXT: return string(i)
+        case SQLITE_BLOB:
+            let n = Int(sqlite3_column_bytes(raw, i))
+            guard n > 0, let p = sqlite3_column_blob(raw, i) else { return Data() }
+            return Data(bytes: p, count: n)
+        default: return nil
+        }
+    }
 }

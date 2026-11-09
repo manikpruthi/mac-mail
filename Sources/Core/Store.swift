@@ -5,9 +5,11 @@ import Foundation
 @MainActor
 final class Store {
     let db: SQLiteDB
+    /// The database file, so background maintenance can open its own connection.
+    nonisolated let path: String
 
-    init() throws {
-        let path = AppPaths.support.appendingPathComponent("mail.sqlite").path
+    init(path: String = AppPaths.support.appendingPathComponent("mail.sqlite").path) throws {
+        self.path = path
         db = try SQLiteDB(path: path)
         // The mail cache is the whole mailbox on disk; keep other local users out of it.
         let fm = FileManager.default
@@ -65,7 +67,77 @@ final class Store {
         if db.userVersion < 2 { try migrate_1_to_2() }
         if db.userVersion < 3 { try migrate_2_to_3() }
         if db.userVersion < 4 { try migrate_3_to_4() }
-        db.run("PRAGMA user_version=4")
+        if db.userVersion < 5 { try migrate_4_to_5() }
+        db.run("PRAGMA user_version=5")
+    }
+
+    /// v4 → v5: index maintenance that cascade deletes used to skip, header FTS that follows sender/recipient
+    /// changes, body_fts backfill, reference-based thread keys for non-Gmail mail, and a Message-ID index.
+    private func migrate_4_to_5() throws {
+        try db.exec("""
+            DROP TRIGGER IF EXISTS msg_au;
+            CREATE TRIGGER msg_au AFTER UPDATE OF subject, snippet, from_name, from_addr, to_list ON messages BEGIN
+                INSERT INTO fts(fts, rowid, subject, from_name, from_addr, to_list, snippet)
+                VALUES ('delete', old.id, old.subject, old.from_name, old.from_addr, old.to_list, old.snippet);
+                INSERT INTO fts(rowid, subject, from_name, from_addr, to_list, snippet)
+                VALUES (new.id, new.subject, new.from_name, new.from_addr, new.to_list, new.snippet);
+            END;
+            CREATE TRIGGER IF NOT EXISTS msg_body_fts_ad AFTER DELETE ON messages BEGIN
+                DELETE FROM body_fts WHERE rowid=old.id;
+            END;
+            CREATE INDEX IF NOT EXISTS msg_msgid ON messages(message_id);
+            """)
+        // Earlier cascade deletes left orphans behind (B-14): rebuild both indexes and the contact counts.
+        db.run("INSERT INTO fts(fts) VALUES('rebuild')")
+        db.run("DELETE FROM body_fts WHERE rowid NOT IN (SELECT id FROM messages)")
+        db.transaction {
+            db.run("DELETE FROM contacts")
+            db.run("""
+                INSERT INTO contacts(email, name, count) SELECT from_addr, MAX(from_name), COUNT(*) FROM messages
+                WHERE from_addr != '' GROUP BY from_addr
+                """)
+        }
+        backfillBodyIndex()
+        rethreadNonGmail()
+    }
+
+    /// Indexes cached bodies that predate body_fts (B-38). Only rows missing from the index are touched.
+    private func backfillBodyIndex() {
+        var pending: [(Int64, String?, String?)] = []
+        db.query("SELECT message_id, html, text FROM bodies WHERE message_id NOT IN (SELECT rowid FROM body_fts)") {
+            pending.append(($0.int64(0), $0.string(1), $0.string(2)))
+        }
+        guard !pending.isEmpty else { return }
+        db.transaction {
+            for (id, html, text) in pending {
+                let body = Self.indexText(html: html, text: text)
+                if !body.isEmpty { db.run("INSERT INTO body_fts(rowid, body) VALUES (?,?)", [id, body]) }
+            }
+        }
+        db.run("PRAGMA optimize")
+    }
+
+    /// Recomputes conversation keys for non-Gmail messages (gmsgid 0) with the References-based key (B-12).
+    private func rethreadNonGmail() {
+        var updates: [(Int64, Int64)] = []
+        db.query("SELECT id, message_id, in_reply_to, refs, subject, from_addr, to_list, cc_list FROM messages WHERE gmsgid=0") { s in
+            let people = [s.text(5)] + MIME.parseAddresses(s.text(6)).map { $0.email } + MIME.parseAddresses(s.text(7)).map { $0.email }
+            let key = MIME.threadKey(messageID: s.text(1), inReplyTo: s.text(2), references: s.text(3),
+                                     subject: s.text(4), participants: people)
+            updates.append((s.int64(0), key))
+        }
+        guard !updates.isEmpty else { return }
+        db.transaction {
+            for (id, key) in updates { db.run("UPDATE messages SET thrid=? WHERE id=?", [key, id]) }
+        }
+    }
+
+    /// Text that goes into body_fts for one message: the plain part, else text extracted from the HTML, capped.
+    nonisolated static func indexText(html: String?, text: String?) -> String {
+        var body = text ?? ""
+        if body.isEmpty, let html { body = MIME.plainText(fromHTML: html, limit: 65_536) }
+        if body.utf8.count > 65_536 { body = String(body.prefix(65_536)) }
+        return body
     }
 
     /// v1 → v2: pending ops bound to folder id + UIDVALIDITY, body full-text index, body-cache index, contacts table.
@@ -103,6 +175,7 @@ final class Store {
             INSERT INTO contacts(email, name, count) SELECT from_addr, from_name, COUNT(*) FROM messages GROUP BY from_addr
             ON CONFLICT(email) DO UPDATE SET count=count+excluded.count
             """)
+        backfillBodyIndex()
     }
 
     // v2 → v3: the Bcc line is remembered per message so editing a draft restores its Bcc recipients
@@ -187,6 +260,8 @@ final class Store {
             }
             for id in stale {
                 db.run("DELETE FROM pending_ops WHERE folder_id=?", [id])
+                // Explicit delete so the FTS/contacts triggers run for every message (B-14).
+                db.run("DELETE FROM messages WHERE folder_id=?", [id])
                 db.run("DELETE FROM folders WHERE id=?", [id])
             }
         }
@@ -224,8 +299,34 @@ final class Store {
     }
 
     func deleteAccount(_ account: String) {
-        db.run("DELETE FROM folders WHERE account=?", [account])
-        db.run("DELETE FROM pending_ops WHERE account=?", [account])
+        db.transaction {
+            // Messages first, explicitly, so the FTS and contacts triggers fire for each one (B-14).
+            db.run("DELETE FROM messages WHERE folder_id IN (SELECT id FROM folders WHERE account=?)", [account])
+            db.run("DELETE FROM folders WHERE account=?", [account])
+            db.run("DELETE FROM pending_ops WHERE account=?", [account])
+        }
+    }
+
+    /// Adds a folder created on the server (F-12 / F-14) so it can be used before the next LIST.
+    @discardableResult
+    func addFolder(account: String, path: String, name: String, role: FolderRole, delimiter: String) -> Folder? {
+        db.run("""
+            INSERT INTO folders(account, path, name, role, delim, selectable) VALUES (?,?,?,?,?,1)
+            ON CONFLICT(account, path) DO UPDATE SET name=excluded.name
+            """, [account, path, name, role.rawValue, delimiter])
+        return folder(account: account, path: path)
+    }
+
+    func renameFolder(_ id: Int64, path: String, name: String) {
+        db.run("UPDATE folders SET path=?, name=? WHERE id=?", [path, name, id])
+    }
+
+    func deleteFolder(_ id: Int64) {
+        db.transaction {
+            db.run("DELETE FROM pending_ops WHERE folder_id=?", [id])
+            db.run("DELETE FROM messages WHERE folder_id=?", [id])
+            db.run("DELETE FROM folders WHERE id=?", [id])
+        }
     }
 
     // MARK: Messages
@@ -238,7 +339,12 @@ final class Store {
                     INSERT INTO messages(folder_id, uid, gmsgid, thrid, date, size, flags, has_att, subject, from_name,
                         from_addr, to_list, cc_list, reply_to, message_id, in_reply_to, refs, list_unsub, structure)
                     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                    ON CONFLICT(folder_id, uid) DO UPDATE SET flags=excluded.flags
+                    ON CONFLICT(folder_id, uid) DO UPDATE SET flags=excluded.flags, gmsgid=excluded.gmsgid,
+                        thrid=excluded.thrid, date=excluded.date, size=excluded.size, has_att=excluded.has_att,
+                        subject=excluded.subject, from_name=excluded.from_name, from_addr=excluded.from_addr,
+                        to_list=excluded.to_list, cc_list=excluded.cc_list, reply_to=excluded.reply_to,
+                        message_id=excluded.message_id, in_reply_to=excluded.in_reply_to, refs=excluded.refs,
+                        list_unsub=excluded.list_unsub, structure=COALESCE(excluded.structure, structure)
                     """, [folderID, h.uid, h.gmailID, h.threadID, h.date, h.size, h.flags.rawValue, h.hasAttachments,
                           h.subject, h.from.name, h.from.email.lowercased(), h.toList, h.ccList, h.replyTo, h.messageID,
                           h.inReplyTo, h.references, h.listUnsubscribe, h.structureJSON])
@@ -246,13 +352,18 @@ final class Store {
         }
     }
 
-    func updateFlags(folderID: Int64, _ changes: [(UInt32, MessageFlags)]) {
-        guard !changes.isEmpty else { return }
+    /// Applies server flags; returns the UIDs whose flags actually changed (so a no-op sync redraws nothing).
+    @discardableResult
+    func updateFlags(folderID: Int64, _ changes: [(UInt32, MessageFlags)]) -> [UInt32] {
+        guard !changes.isEmpty else { return [] }
+        var changed: [UInt32] = []
         db.transaction {
             for (uid, f) in changes {
-                db.run("UPDATE messages SET flags=? WHERE folder_id=? AND uid=?", [f.rawValue, folderID, uid])
+                db.run("UPDATE messages SET flags=? WHERE folder_id=? AND uid=? AND flags!=?", [f.rawValue, folderID, uid, f.rawValue])
+                if db.changes > 0 { changed.append(uid) }
             }
         }
+        return changed
     }
 
     func setFlag(messageIDs: [Int64], flag: MessageFlags, on: Bool) {
@@ -311,18 +422,37 @@ final class Store {
                    folderRole: FolderRole(rawValue: s.text(14)) ?? .none)
     }
 
-    func rows(folderID: Int64) -> [MessageRow] {
+    /// Newest rows of a folder. `limit` is the list's fetch window (O-05): big caches load a page at a time.
+    func rows(folderID: Int64, limit: Int = Int(Int32.max)) -> [MessageRow] {
         var out: [MessageRow] = []
-        db.query("SELECT \(rowCols) FROM messages m JOIN folders f ON f.id=m.folder_id WHERE m.folder_id=? ORDER BY m.date DESC",
-                 [folderID]) { out.append(self.rowFrom($0)) }
+        db.query("SELECT \(rowCols) FROM messages m JOIN folders f ON f.id=m.folder_id WHERE m.folder_id=? ORDER BY m.date DESC LIMIT ?",
+                 [folderID, limit]) { out.append(self.rowFrom($0)) }
         return out
     }
 
-    func unifiedInboxRows() -> [MessageRow] {
+    func unifiedInboxRows(limit: Int = Int(Int32.max)) -> [MessageRow] {
+        unifiedRows(role: .inbox, limit: limit)
+    }
+
+    /// Every account's folder with this role, merged newest first (unified Sent, Drafts, Trash… — F-13).
+    func unifiedRows(role: FolderRole, limit: Int = Int(Int32.max)) -> [MessageRow] {
         var out: [MessageRow] = []
-        db.query("SELECT \(rowCols) FROM messages m JOIN folders f ON f.id=m.folder_id WHERE f.role='inbox' ORDER BY m.date DESC") {
-            out.append(self.rowFrom($0))
-        }
+        db.query("SELECT \(rowCols) FROM messages m JOIN folders f ON f.id=m.folder_id WHERE f.role=? ORDER BY m.date DESC LIMIT ?",
+                 [role.rawValue, limit]) { out.append(self.rowFrom($0)) }
+        return out
+    }
+
+    func unifiedCount(role: FolderRole) -> Int {
+        Int(db.scalarInt("SELECT COUNT(*) FROM messages m JOIN folders f ON f.id=m.folder_id WHERE f.role=?", [role.rawValue]) ?? 0)
+    }
+
+    /// Rows the user explicitly flagged, across every account (unified Flagged — F-13).
+    func flaggedRows(limit: Int = Int(Int32.max)) -> [MessageRow] {
+        var out: [MessageRow] = []
+        db.query("""
+            SELECT \(rowCols) FROM messages m JOIN folders f ON f.id=m.folder_id
+            WHERE (m.flags & 2) != 0 AND f.role NOT IN ('all','starred','important','trash','spam') ORDER BY m.date DESC LIMIT ?
+            """, [limit]) { out.append(self.rowFrom($0)) }
         return out
     }
 
@@ -365,13 +495,19 @@ final class Store {
 
     // MARK: Bodies
 
-    /// The cached row for a server UID, for opening a message from a notification tap.
-    func messageID(account: String, uid: UInt32) -> Int64? {
-        var out: Int64?
-        db.query("""
-            SELECT m.id FROM messages m JOIN folders f ON f.id=m.folder_id WHERE f.account=? AND m.uid=? LIMIT 1
-            """, [account, Int(uid)]) { out = $0.int64(0) }
-        return out
+    /// The cached row for a server UID in one folder, for opening a message from a notification tap.
+    /// UIDs are only unique per folder, so the folder is part of the key (B-05).
+    func messageID(folderID: Int64, uid: UInt32) -> Int64? {
+        db.scalarInt("SELECT id FROM messages WHERE folder_id=? AND uid=?", [folderID, uid])
+    }
+
+    /// The row carrying a given Message-ID header in a folder (with or without angle brackets), so a saved
+    /// draft is found by the id it was built with rather than by its subject (B-09).
+    func messageID(folderID: Int64, messageIDHeader: String) -> Int64? {
+        let bare = messageIDHeader.trimmingCharacters(in: CharacterSet(charactersIn: "<> \t"))
+        guard !bare.isEmpty else { return nil }
+        return db.scalarInt("SELECT id FROM messages WHERE folder_id=? AND (message_id=? OR message_id=?) ORDER BY uid DESC LIMIT 1",
+                            [folderID, "<\(bare)>", bare])
     }
 
     /// Remembers the Bcc header line for messages (drafts), whose MIME never carries it.
@@ -398,11 +534,19 @@ final class Store {
         db.run("UPDATE messages SET snippet=? WHERE id=?", [snip, id])
         // Body text goes into its own full-text index so search finds words deep inside a message.
         // Capped per message; replaced (never appended) so the index tracks the cache.
-        var body = text ?? ""
-        if body.isEmpty, let html { body = MIME.plainText(fromHTML: html, limit: 65_536) }
-        if body.utf8.count > 65_536 { body = String(body.prefix(65_536)) }
+        let body = Self.indexText(html: html, text: text)
         db.run("DELETE FROM body_fts WHERE rowid=?", [id])
         if !body.isEmpty { db.run("INSERT INTO body_fts(rowid, body) VALUES (?,?)", [id, body]) }
+    }
+
+    /// Saves a body whose snippet and index text were already computed off the main actor (O-03).
+    func saveBody(_ id: Int64, html: String?, text: String?, snippet: String, indexText: String) {
+        db.transaction {
+            db.run("INSERT OR REPLACE INTO bodies(message_id, html, text, fetched) VALUES (?,?,?,?)", [id, html, text, Date()])
+            db.run("UPDATE messages SET snippet=? WHERE id=?", [snippet, id])
+            db.run("DELETE FROM body_fts WHERE rowid=?", [id])
+            if !indexText.isEmpty { db.run("INSERT INTO body_fts(rowid, body) VALUES (?,?)", [id, indexText]) }
+        }
     }
 
     /// Newest messages in a folder whose body has not been cached yet (for background prefetch).
@@ -423,22 +567,128 @@ final class Store {
             """)
     }
 
-    /// Keeps the cache bounded: drops messages outside the offline window (keeping the newest 200 per folder) and old bodies.
-    func prune(offlineDays: Int) {
-        let cutoff = Date().addingTimeInterval(-Double(offlineDays + 7) * 86400).timeIntervalSince1970
-        db.run("""
-            DELETE FROM messages WHERE date < ? AND id NOT IN (
-                SELECT id FROM (SELECT id, ROW_NUMBER() OVER (PARTITION BY folder_id ORDER BY date DESC) rn FROM messages) WHERE rn <= 200)
-            """, [cutoff])
-        db.run("DELETE FROM bodies WHERE message_id NOT IN (SELECT message_id FROM (SELECT message_id, SUM(length(COALESCE(html,'')) + length(COALESCE(text,''))) OVER (ORDER BY fetched DESC) AS total FROM bodies) WHERE total <= 536870912)")
+    /// The prune cutoff: exactly the offline window from Settings, no hidden grace period (B-36).
+    nonisolated static func pruneCutoff(offlineDays: Int, now: Date = Date()) -> Date {
+        now.addingTimeInterval(-Double(max(1, offlineDays)) * 86400)
+    }
+
+    /// Body cache cap: the newest 512 MB of message text is kept.
+    nonisolated static let bodyCacheBytes = 536_870_912
+
+    /// Keeps the cache bounded: drops messages outside the offline window (keeping the newest 200 per folder)
+    /// and the oldest bodies past the cap. Runs on its own connection in batches of separate transactions, so
+    /// it never holds the main thread or a long write lock (O-09). Returns how many messages were removed.
+    @discardableResult
+    nonisolated static func prune(path: String, offlineDays: Int, now: Date = Date()) -> Int {
+        guard let db = try? SQLiteDB(path: path) else { return 0 }
+        let cutoff = pruneCutoff(offlineDays: offlineDays, now: now).timeIntervalSince1970
+        var doomed: [Int64] = []
+        db.query("""
+            SELECT id FROM (SELECT id, date, ROW_NUMBER() OVER (PARTITION BY folder_id ORDER BY date DESC) rn FROM messages)
+            WHERE rn > 200 AND date < ?
+            """, [cutoff]) { doomed.append($0.int64(0)) }
+        for chunk in doomed.chunked(500) {
+            db.transaction {
+                for id in chunk { db.run("DELETE FROM messages WHERE id=?", [id]) }
+            }
+        }
+        var oldBodies: [Int64] = []
+        db.query("""
+            SELECT message_id FROM (SELECT message_id, SUM(length(COALESCE(html,'')) + length(COALESCE(text,'')))
+                OVER (ORDER BY fetched DESC) AS total FROM bodies) WHERE total > ?
+            """, [bodyCacheBytes]) { oldBodies.append($0.int64(0)) }
+        for chunk in oldBodies.chunked(500) {
+            db.transaction {
+                for id in chunk { db.run("DELETE FROM bodies WHERE message_id=?", [id]) }
+            }
+        }
         db.run("PRAGMA optimize")
+        return doomed.count
+    }
+
+    /// Same as the background prune, on the app's own connection (tests and the demo).
+    func prune(offlineDays: Int) {
+        _ = Self.prune(path: path, offlineDays: offlineDays)
+    }
+
+    // MARK: Snapshots (undo for move / archive / delete — F-08)
+
+    /// Full copies of message rows (and their cached bodies) taken before an optimistic local delete,
+    /// so Undo can put them back exactly as they were.
+    struct Snapshot {
+        fileprivate var messages: [(columns: [String], values: [Any?])] = []
+        fileprivate var bodies: [(columns: [String], values: [Any?])] = []
+        var isEmpty: Bool { messages.isEmpty }
+    }
+
+    func snapshot(ids: [Int64]) -> Snapshot {
+        var snap = Snapshot()
+        guard !ids.isEmpty else { return snap }
+        let list = ids.map(String.init).joined(separator: ",")
+        func grab(_ sql: String, into out: inout [(columns: [String], values: [Any?])]) {
+            var rows: [(columns: [String], values: [Any?])] = []
+            db.query(sql) { s in
+                let n = s.columnCount
+                rows.append(((0..<n).map { s.columnName($0) }, (0..<n).map { s.value($0) }))
+            }
+            out = rows
+        }
+        grab("SELECT * FROM messages WHERE id IN (\(list))", into: &snap.messages)
+        grab("SELECT * FROM bodies WHERE message_id IN (\(list))", into: &snap.bodies)
+        return snap
+    }
+
+    /// Re-inserts snapshotted rows (same ids, so the FTS/contacts triggers and body index come back too).
+    func restore(_ snap: Snapshot) {
+        db.transaction {
+            for r in snap.messages {
+                let cols = r.columns.joined(separator: ",")
+                let marks = Array(repeating: "?", count: r.columns.count).joined(separator: ",")
+                db.run("INSERT OR IGNORE INTO messages(\(cols)) VALUES (\(marks))", r.values)
+            }
+            for r in snap.bodies {
+                let cols = r.columns.joined(separator: ",")
+                let marks = Array(repeating: "?", count: r.columns.count).joined(separator: ",")
+                db.run("INSERT OR IGNORE INTO bodies(\(cols)) VALUES (\(marks))", r.values)
+                if let idIdx = r.columns.firstIndex(of: "message_id"), let id = r.values[idIdx] as? Int64 {
+                    let html = r.columns.firstIndex(of: "html").flatMap { r.values[$0] as? String }
+                    let text = r.columns.firstIndex(of: "text").flatMap { r.values[$0] as? String }
+                    let body = Self.indexText(html: html, text: text)
+                    db.run("DELETE FROM body_fts WHERE rowid=?", [id])
+                    if !body.isEmpty { db.run("INSERT INTO body_fts(rowid, body) VALUES (?,?)", [id, body]) }
+                }
+            }
+        }
+    }
+
+    // MARK: Diagnostics (F-26)
+
+    /// Bytes used by the database and its WAL.
+    var databaseBytes: Int64 {
+        ["", "-wal", "-shm"].reduce(Int64(0)) { sum, suffix in
+            let size = (try? FileManager.default.attributesOfItem(atPath: path + suffix)[.size] as? NSNumber)?.int64Value ?? 0
+            return sum + size
+        }
+    }
+
+    var cachedMessageCount: Int { Int(db.scalarInt("SELECT COUNT(*) FROM messages") ?? 0) }
+    var cachedBodyCount: Int { Int(db.scalarInt("SELECT COUNT(*) FROM bodies") ?? 0) }
+
+    /// Drops every cached body (they are re-fetched on demand); headers and queued actions stay.
+    func clearBodyCache() {
+        db.transaction {
+            db.run("DELETE FROM bodies")
+            db.run("DELETE FROM body_fts")
+            db.run("UPDATE messages SET snippet=''")
+        }
+        db.run("VACUUM")
     }
 
     // MARK: Search and contacts
 
     /// Local search over the offline cache: words via the full-text indexes (headers + body, prefix match),
     /// operators and filters via SQL.
-    func search(_ q: SearchQuery, folderID: Int64? = nil, limit: Int = 400) -> [MessageRow] {
+    func search(_ q: SearchQuery, folderID: Int64? = nil, limit: Int = 2000) -> [MessageRow] {
         guard q.hasLocalCriteria else { return [] }
         var sql = "SELECT \(rowCols) FROM messages m JOIN folders f ON f.id=m.folder_id"
         var conds: [String] = []
@@ -456,6 +706,10 @@ final class Store {
         for v in q.to {
             conds.append("(m.to_list LIKE ? ESCAPE '\\' OR m.cc_list LIKE ? ESCAPE '\\')")
             args += [likePattern(v), likePattern(v)]
+        }
+        for v in q.cc {
+            conds.append("m.cc_list LIKE ? ESCAPE '\\'")
+            args.append(likePattern(v))
         }
         for v in q.subject {
             conds.append("m.subject LIKE ? ESCAPE '\\'")
@@ -532,9 +786,34 @@ final class Store {
     }
 
     func unifiedUnreadCount() -> Int {
+        unifiedUnreadCount(role: .inbox)
+    }
+
+    func unifiedUnreadCount(role: FolderRole) -> Int {
         var ids: [Int64] = []
-        db.query("SELECT id FROM folders WHERE role='inbox'") { ids.append($0.int64(0)) }
-        return ids.reduce(0) { $0 + unreadCount(folderID: $1) }
+        db.query("SELECT id FROM folders WHERE role=?", [role.rawValue]) { ids.append($0.int64(0)) }
+        let all = unreadCounts()
+        return ids.reduce(0) { $0 + (all[$1] ?? 0) }
+    }
+
+    /// Unread counts for every folder in one aggregate query (O-06), same rule as unreadCount(folderID:).
+    func unreadCounts() -> [Int64: Int] {
+        var out: [Int64: Int] = [:]
+        db.query("""
+            SELECT f.id, f.server_unread, f.unread_base, COALESCE(u.n, 0) FROM folders f
+            LEFT JOIN (SELECT folder_id, COUNT(*) n FROM messages WHERE (flags & 1)=0 GROUP BY folder_id) u ON u.folder_id=f.id
+            """) { s in
+            let server = s.int(1), base = s.int(2), local = s.int(3)
+            out[s.int64(0)] = server < 0 ? local : max(local, server + local - base)
+        }
+        return out
+    }
+
+    /// Queued actions per account in one query (O-06).
+    func opCounts() -> [String: Int] {
+        var out: [String: Int] = [:]
+        db.query("SELECT account, COUNT(*) FROM pending_ops GROUP BY account") { out[$0.text(0)] = $0.int(1) }
+        return out
     }
 
     // MARK: Pending operations

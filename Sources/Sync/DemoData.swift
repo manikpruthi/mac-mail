@@ -75,6 +75,18 @@ enum DemoData {
         store.updateFolderState(inbox.id, uidValidity: 1, uidNext: 21, modseq: 1)
     }
 
+    /// The demo has no server: Save As builds an equivalent RFC 822 message from the cached row.
+    static func rawMessage(_ d: MessageDetail, body: StoredBody?) -> Data {
+        var to = MIME.parseAddresses(d.toList)
+        if to.isEmpty { to = [account.fromHeader] }
+        let m = OutgoingMessage(from: d.from.email.contains("@") ? d.from : account.fromHeader, to: to,
+                                cc: MIME.parseAddresses(d.ccList), bcc: [], subject: d.subject,
+                                textBody: body?.text ?? MIME.plainText(fromHTML: body?.html ?? "", limit: 100_000),
+                                htmlBody: body?.html ?? MIME.escapeHTML(body?.text ?? ""), inReplyTo: nil, references: nil,
+                                attachments: [])
+        return (try? MessageBuilder.build(m, date: d.date)) ?? Data()
+    }
+
     static let budgetHTML = """
     <p>Hi Manik,</p>
     <p>Updated the budget with the offsite costs — the venue photo and the forecast sheet are attached.

@@ -1,4 +1,5 @@
 import AppKit
+import Quartz
 import UniformTypeIdentifiers
 import WebKit
 
@@ -90,6 +91,12 @@ final class PreviewViewController: NSViewController, WKNavigationDelegate, WKUID
         attachmentBar.isHidden = true
         attachmentBar.onSave = { [weak self] part in self?.save(part) }
         attachmentBar.onSaveAll = { [weak self] in self?.saveAll() }
+        attachmentBar.onQuickLook = { [weak self] part in self?.quickLook(part) }
+        attachmentBar.provideFile = { [weak self] part, url in
+            guard let self, let d = self.current else { throw NetError.server("No message is open.") }
+            guard let engine = MailService.shared.engine(d.accountID) else { throw NetError.server("Account unavailable") }
+            try await engine.download(messageID: d.id, part: part, to: url)
+        }
 
         stack.orientation = .vertical
         stack.spacing = 0
@@ -241,8 +248,9 @@ final class PreviewViewController: NSViewController, WKNavigationDelegate, WKUID
             markReadAllowed = true
             markReadIfNeeded(messageID)
         }
-        // Already shown, or a body fetch for it is still in flight — but a failed fetch may be retried.
-        if current?.id == messageID, currentBody != nil || fetchingID == messageID { return }
+        // Already shown, or a body fetch for it is still in flight — but a failed fetch may be retried, and a
+        // web view released while idle must be rebuilt rather than leaving a blank pane (B-29).
+        if current?.id == messageID, webView != nil, !tornDown, currentBody != nil || fetchingID == messageID { return }
         markReadAllowed = markRead
         tornDown = false
         spinner.stopAnimation(nil)
@@ -277,7 +285,7 @@ final class PreviewViewController: NSViewController, WKNavigationDelegate, WKUID
             Task {
                 defer { if fetchingID == id { fetchingID = nil } }
                 do {
-                    guard let engine = MailService.shared.engine(d.accountID) else { return }
+                    guard let engine = MailService.shared.engine(d.accountID) else { throw NetError.server("Account unavailable") }
                     let body = try await engine.loadBody(messageID: id)
                     guard current?.id == id, !tornDown else { return }
                     spinner.stopAnimation(nil)
@@ -300,12 +308,19 @@ final class PreviewViewController: NSViewController, WKNavigationDelegate, WKUID
         return f
     }()
 
-    private func render(_ d: MessageDetail, _ body: StoredBody, forceImages: Bool = false) {
+    private func render(_ d: MessageDetail, _ body: StoredBody, forceImages: Bool = false, attempt: Int = 0) {
         // Fail closed: nothing goes on screen until the remote-load block list is attached (CSP meta is the backstop).
+        // The wait is capped at ~2 s; after that the CSP meta alone guards the render (B-30).
         if Self.ruleList == nil, !Self.ruleListFailed {
+            guard attempt < 100 else {
+                Debug.log("content rule list unavailable after 2 s; rendering with CSP only")
+                Self.ruleListFailed = true
+                render(d, body, forceImages: forceImages)
+                return
+            }
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.02) { [weak self] in
                 guard let self, self.current?.id == d.id, !self.tornDown else { return }
-                self.render(d, body, forceImages: forceImages)
+                self.render(d, body, forceImages: forceImages, attempt: attempt + 1)
             }
             return
         }
@@ -330,7 +345,8 @@ final class PreviewViewController: NSViewController, WKNavigationDelegate, WKUID
         updateLightButton()
         let senderPref = store.pref("img:" + d.from.email.lowercased())
         let isSpam = d.folderRole == .spam
-        let autoLoad = forceImages || senderPref == "always" || (!isSpam && !Prefs.askBeforeImages && senderPref != "ask")
+        // Spam never loads images on its own, whatever the sender preference says (B-31).
+        let autoLoad = forceImages || (!isSpam && (senderPref == "always" || (!Prefs.askBeforeImages && senderPref != "ask")))
         let page = ImagePage(generation: generation, messageID: d.id, accountID: d.accountID, prepared: prepared,
                              autoLoad: autoLoad, ignoreLimits: forceImages || senderPref == "always")
         page.dark = isDark && !forceLight
@@ -461,13 +477,13 @@ final class PreviewViewController: NSViewController, WKNavigationDelegate, WKUID
             guard resp == .OK, let url = panel.url else { return }
             self?.attachmentBar.setBusy(true, text: "Saving \(part.suggestedFilename)…")
             Task { @MainActor in
+                // Busy always clears, including when the account is gone (B-06).
+                defer { self?.attachmentBar.setBusy(false) }
                 do {
-                    guard let engine = MailService.shared.engine(d.accountID) else { return }
+                    guard let engine = MailService.shared.engine(d.accountID) else { throw NetError.server("Account unavailable") }
                     try await engine.download(messageID: d.id, part: part, to: url)
-                    self?.attachmentBar.setBusy(false)
                     self?.showToast?("Saved \(url.lastPathComponent)")
                 } catch {
-                    self?.attachmentBar.setBusy(false)
                     try? FileManager.default.removeItem(at: url)
                     self?.presentError(error)
                 }
@@ -487,19 +503,20 @@ final class PreviewViewController: NSViewController, WKNavigationDelegate, WKUID
             self?.attachmentBar.setBusy(true, text: "Saving \(parts.count) attachments…")
             Task { @MainActor in
                 let dir = AppPaths.tempDir("attachments")
-                defer { try? FileManager.default.removeItem(at: dir) }
+                defer {
+                    try? FileManager.default.removeItem(at: dir)
+                    self?.attachmentBar.setBusy(false)
+                }
                 do {
-                    guard let engine = MailService.shared.engine(d.accountID) else { return }
+                    guard let engine = MailService.shared.engine(d.accountID) else { throw NetError.server("Account unavailable") }
                     var used = Set<String>()
                     for p in parts {
                         let name = Self.uniqueName(p.suggestedFilename, used: &used)
                         try await engine.download(messageID: d.id, part: p, to: dir.appendingPathComponent(name))
                     }
                     try await AttachmentZip.zip(directory: dir, to: dest)
-                    self?.attachmentBar.setBusy(false)
                     self?.showToast?("Saved \(dest.lastPathComponent)")
                 } catch {
-                    self?.attachmentBar.setBusy(false)
                     self?.presentError(error)
                 }
             }
@@ -616,6 +633,8 @@ final class PreviewViewController: NSViewController, WKNavigationDelegate, WKUID
         webView = nil
         pendingNavigation = nil
         lastRenderedDark = nil
+        // The prepared HTML and image bookkeeping are rebuilt from currentBody on restore (O-17).
+        loader.page = nil
         Debug.log("web view released")
     }
 
@@ -687,6 +706,50 @@ final class PreviewViewController: NSViewController, WKNavigationDelegate, WKUID
         let key = Self.lightKey(d.from.email)
         Prefs.d.set(!Prefs.d.bool(forKey: key), forKey: key)
         render(d, b)
+    }
+
+    // MARK: Print (F-17)
+
+    func printMessage() {
+        guard let d = current, let web = webView, let window = view.window else { NSSound.beep(); return }
+        let info = NSPrintInfo.shared.copy() as! NSPrintInfo
+        info.topMargin = 36; info.bottomMargin = 36; info.leftMargin = 36; info.rightMargin = 36
+        info.horizontalPagination = .fit
+        info.verticalPagination = .automatic
+        info.jobDisposition = .spool
+        let op = web.printOperation(with: info)
+        op.jobTitle = d.subject.isEmpty ? "Message" : d.subject
+        op.showsPrintPanel = true
+        op.showsProgressPanel = true
+        // WKWebView's print view has no size until laid out.
+        op.view?.frame = web.bounds
+        op.runModal(for: window, delegate: nil, didRun: nil, contextInfo: nil)
+    }
+
+    // MARK: Quick Look (F-15)
+
+    private var quickLookURL: URL?
+    private var quickLookDir: URL?
+
+    private func quickLook(_ part: BodyPart) {
+        guard let d = current else { return }
+        attachmentBar.setBusy(true, text: "Opening \(part.suggestedFilename)…")
+        let dir = AppPaths.tempDir("quicklook")
+        let url = dir.appendingPathComponent(part.suggestedFilename)
+        Task { @MainActor in
+            defer { attachmentBar.setBusy(false) }
+            do {
+                guard let engine = MailService.shared.engine(d.accountID) else { throw NetError.server("Account unavailable") }
+                try await engine.download(messageID: d.id, part: part, to: url)
+                if let old = quickLookDir { try? FileManager.default.removeItem(at: old) }
+                quickLookDir = dir
+                quickLookURL = url
+                QuickLookController.shared.show(url)
+            } catch {
+                try? FileManager.default.removeItem(at: dir)
+                presentError(error)
+            }
+        }
     }
 
     func saveAllAttachments() {

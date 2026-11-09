@@ -80,13 +80,20 @@ final class MessageWindowController: NSWindowController, NSWindowDelegate, NSToo
     @objc func zoomOutReading(_ sender: Any?) { preview.zoomOut() }
     @objc func resetReadingZoom(_ sender: Any?) { preview.resetZoom() }
 
-    private var row: MessageRow? { MailService.shared.store.rows(ids: [messageID]).first }
+    /// Cached row (B-23 / O-14): menu validation used to run a SQL query per menu item. Refreshed on
+    /// data changes, so validation reads memory only.
+    private lazy var cachedRow: MessageRow? = MailService.shared.store.rows(ids: [messageID]).first
+    private var row: MessageRow? { cachedRow }
 
     /// Closes the window if the message left its folder (archived, deleted, moved here or elsewhere).
     @objc private func dataChanged(_ note: Notification) {
-        // A flag change can't remove the message; only row changes can.
-        if case .flags = note.mailDataChange { return }
-        if MailService.shared.store.detail(messageID) == nil { window?.close() }
+        if case .flags(let ids) = note.mailDataChange {
+            // A flag change can't remove the message; just refresh the cached flags.
+            if ids.contains(messageID) { cachedRow = MailService.shared.store.rows(ids: [messageID]).first }
+            return
+        }
+        cachedRow = MailService.shared.store.rows(ids: [messageID]).first
+        if cachedRow == nil { window?.close() }
     }
 
     func windowWillClose(_ notification: Notification) {
@@ -160,8 +167,13 @@ final class MessageWindowController: NSWindowController, NSWindowDelegate, NSToo
 
     private func move(_ target: MailService.MoveTarget) {
         guard let r = row else { return }
-        if let label = MailService.shared.move([r], to: target) {
-            (NSApp.delegate as? AppDelegate)?.mainWindow?.showToast(label)
+        if let result = MailService.shared.move([r], to: target) {
+            let main = (NSApp.delegate as? AppDelegate)?.mainWindow
+            if let id = result.undoID {
+                main?.showToast(result.label, action: ("Undo", { MailService.shared.undo(id) }), duration: MailService.undoWindow)
+            } else {
+                main?.showToast(result.label)
+            }
             window?.close()
         } else {
             NSSound.beep()
@@ -169,6 +181,11 @@ final class MessageWindowController: NSWindowController, NSWindowDelegate, NSToo
     }
 
     @objc func saveAttachments(_ sender: Any?) { preview.saveAllAttachments() }
+    @objc func saveMessageAs(_ sender: Any?) {
+        guard let r = row else { return }
+        MessageActions.saveAs(r, in: window) { [weak self] s in self?.toast.show(s) }
+    }
+    @objc func printMessage(_ sender: Any?) { preview.printMessage() }
     @objc func toggleLightBackground(_ sender: Any?) { preview.toggleLight() }
 
     func validateMenuItem(_ item: NSMenuItem) -> Bool { row != nil }

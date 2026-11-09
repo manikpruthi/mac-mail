@@ -1,4 +1,12 @@
 #!/bin/bash
+# Builds Mac Mail as a universal (arm64 + x86_64) app.
+#   ./build.sh            debug build
+#   ./build.sh release    optimised build (used by package.sh)
+# Environment:
+#   MAC_MAIL_BUILD_DIR      output folder (default ~/Library/Caches/MacMailBuild)
+#   MAC_MAIL_ARCHS          "arm64" for faster local iteration (release requires both)
+#   MAC_MAIL_SKIP_SELFTEST  skip the offline selftest
+#   MAC_MAIL_SIGN_IDENTITY  a "Developer ID Application: …" identity; ad-hoc signing otherwise
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -7,14 +15,19 @@ BUNDLE_NAME="Mac Mail"
 BUILD_DIR="${MAC_MAIL_BUILD_DIR:-$HOME/Library/Caches/MacMailBuild}"
 APP="$BUILD_DIR/$BUNDLE_NAME.app"
 MODE="${1:-debug}"
-# Both architectures by default; MAC_MAIL_ARCHS=arm64 speeds up local iteration.
 read -r -a ARCHS <<< "${MAC_MAIL_ARCHS:-arm64 x86_64}"
 
 SDK="$(xcrun --show-sdk-path)"
-MIN_MACOS="14.0"
+# One source of truth for the deployment target (R-10).
+MIN_MACOS="$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' Resources/Info.plist)"
 
 if [ "$MODE" = "release" ] || [ "$MODE" = "--release" ]; then
+    MODE="release"
     OPTIMIZATION=(-O -whole-module-optimization)
+    if [ "${#ARCHS[@]}" -ne 2 ]; then
+        echo "error: a release build must contain arm64 and x86_64 (unset MAC_MAIL_ARCHS)" >&2
+        exit 1
+    fi
 else
     OPTIMIZATION=(-Onone -g)
 fi
@@ -27,14 +40,18 @@ fi
 SOURCES=()
 while IFS= read -r file; do SOURCES+=("$file"); done < <(find Sources -name '*.swift' | sort)
 
-rm -rf "$APP"
-mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+# Build into a staging bundle; the installed/previous app is replaced only after everything succeeded (R-05).
+mkdir -p "$BUILD_DIR"
+STAGE="$(mktemp -d "$BUILD_DIR/stage.XXXXXX")"
+trap 'rm -rf "$STAGE"' EXIT
+STAGED_APP="$STAGE/$BUNDLE_NAME.app"
+mkdir -p "$STAGED_APP/Contents/MacOS" "$STAGED_APP/Contents/Resources"
 
-# Compile each architecture in parallel; a release must contain both.
+# Compile each architecture in parallel.
 PIDS=()
 BINARIES=()
 for ARCH in "${ARCHS[@]}"; do
-    OUT="$BUILD_DIR/$APP_NAME-$ARCH"
+    OUT="$STAGE/$APP_NAME-$ARCH"
     BINARIES+=("$OUT")
     echo "Compiling ${#SOURCES[@]} Swift files for $ARCH-apple-macos$MIN_MACOS ($MODE)…"
     swiftc -swift-version 5 -sdk "$SDK" -target "$ARCH-apple-macos$MIN_MACOS" "${OPTIMIZATION[@]}" \
@@ -48,22 +65,39 @@ for PID in "${PIDS[@]}"; do
     wait "$PID" || FAILED=1
 done
 if [ "$FAILED" -ne 0 ]; then
-    echo "error: compilation failed for at least one architecture" >&2
+    echo "error: compilation failed; the previous build at $APP was left untouched" >&2
     exit 1
 fi
 
-lipo -create "${BINARIES[@]}" -output "$APP/Contents/MacOS/$APP_NAME"
-rm -rf "${BINARIES[@]}" "$BUILD_DIR"/*.dSYM
+lipo -create "${BINARIES[@]}" -output "$STAGED_APP/Contents/MacOS/$APP_NAME"
+rm -rf "${BINARIES[@]}" "$STAGE"/*.dSYM
 
-cp Resources/Info.plist "$APP/Contents/Info.plist"
-[ -f Resources/AppIcon.icns ] && cp Resources/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
-printf 'APPL????' > "$APP/Contents/PkgInfo"
+# Every requested slice must be present (R-06).
+SLICES="$(lipo -archs "$STAGED_APP/Contents/MacOS/$APP_NAME")"
+for ARCH in "${ARCHS[@]}"; do
+    case " $SLICES " in
+        *" $ARCH "*) ;;
+        *) echo "error: binary is missing the $ARCH slice (has: $SLICES)" >&2; exit 1 ;;
+    esac
+done
 
-# Pin the signature requirement to the bundle id so Keychain and notification grants survive rebuilds.
-# Hardened runtime is enabled without App Sandbox (sandboxing would move the cache and Keychain items).
-BUNDLE_ID="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' Resources/Info.plist)"
-codesign --force --options runtime --sign - --requirements "=designated => identifier \"$BUNDLE_ID\"" "$APP"
+cp Resources/Info.plist "$STAGED_APP/Contents/Info.plist"
+# Build number = commit count, so every build is distinguishable (R-08). The source plist is not modified.
+BUILD_NUMBER="$(git rev-list --count HEAD 2>/dev/null || echo 1)"
+if ! git diff --quiet HEAD 2>/dev/null; then BUILD_NUMBER="$((BUILD_NUMBER + 1))"; fi
+/usr/libexec/PlistBuddy -c "Set :CFBundleVersion $BUILD_NUMBER" "$STAGED_APP/Contents/Info.plist"
+[ -f Resources/AppIcon.icns ] && cp Resources/AppIcon.icns "$STAGED_APP/Contents/Resources/AppIcon.icns"
+printf 'APPL????' > "$STAGED_APP/Contents/PkgInfo"
 
+# Hardened runtime, no App Sandbox (sandboxing would move the cache and Keychain items).
+# Ad-hoc builds keep the default designated requirement (the code hash), so a Keychain grant belongs to
+# exactly this binary; a Developer ID identity gets the usual team-based requirement (R-07).
+IDENTITY="${MAC_MAIL_SIGN_IDENTITY:--}"
+codesign --force --options runtime --timestamp=none --entitlements Resources/MacMail.entitlements \
+    --sign "$IDENTITY" "$STAGED_APP"
+codesign --verify --strict "$STAGED_APP"
+
+rm -rf "$APP"
+mv "$STAGED_APP" "$APP"
 touch "$BUILD_DIR/.metadata_never_index"
-echo "Built $APP"
-lipo -info "$APP/Contents/MacOS/$APP_NAME"
+echo "Built $APP (build $BUILD_NUMBER, $SLICES)"

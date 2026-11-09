@@ -6,6 +6,8 @@ struct SearchQuery: Equatable {
     var words: [String] = []
     var from: [String] = []
     var to: [String] = []
+    /// cc: is its own criterion (B-13): Gmail and IMAP both search the Cc header separately from To.
+    var cc: [String] = []
     var subject: [String] = []
     var hasAttachment = false
     var unread = false
@@ -16,13 +18,14 @@ struct SearchQuery: Equatable {
     var serverOnly: [String] = []
 
     var isEmpty: Bool {
-        words.isEmpty && from.isEmpty && to.isEmpty && subject.isEmpty && !hasAttachment && !unread && !flagged
+        words.isEmpty && from.isEmpty && to.isEmpty && cc.isEmpty && subject.isEmpty && !hasAttachment && !unread && !flagged
             && withinDays == nil && serverOnly.isEmpty
     }
 
     /// Whether the local cache can answer it (server-only operators need Gmail).
     var hasLocalCriteria: Bool {
-        !(words.isEmpty && from.isEmpty && to.isEmpty && subject.isEmpty && !hasAttachment && !unread && !flagged && withinDays == nil)
+        !(words.isEmpty && from.isEmpty && to.isEmpty && cc.isEmpty && subject.isEmpty && !hasAttachment && !unread && !flagged
+          && withinDays == nil)
     }
 
     // MARK: Parsing
@@ -60,7 +63,8 @@ struct SearchQuery: Equatable {
             guard !value.isEmpty else { continue } // bare "Re:" carries nothing to search for
             switch key {
             case "from": q.from.append(value)
-            case "to", "cc": q.to.append(value)
+            case "to": q.to.append(value)
+            case "cc": q.cc.append(value)
             case "bcc": q.serverOnly.append("bcc:\(quoteIfNeeded(value))")
             case "subject": q.subject.append(value)
             case "has" where value.lowercased().hasPrefix("attachment"): q.hasAttachment = true
@@ -126,6 +130,7 @@ struct SearchQuery: Equatable {
         var parts: [String] = words.map(Self.quoteIfNeeded)
         parts += from.map { "from:\(Self.quoteIfNeeded($0))" }
         parts += to.map { "to:\(Self.quoteIfNeeded($0))" }
+        parts += cc.map { "cc:\(Self.quoteIfNeeded($0))" }
         parts += subject.map { "subject:\(Self.quoteIfNeeded($0))" }
         if hasAttachment { parts.append("has:attachment") }
         if unread { parts.append("is:unread") }
@@ -140,7 +145,7 @@ struct SearchQuery: Equatable {
     /// (or its results post-filtered) rather than silently widened to "ALL".
     var isIMAPRepresentable: Bool {
         guard serverOnly.isEmpty && !hasAttachment else { return false }
-        let all = words + from + to + subject
+        let all = words + from + to + cc + subject
         return all.allSatisfy { $0.unicodeScalars.allSatisfy(\.isASCII) }
     }
 
@@ -151,6 +156,7 @@ struct SearchQuery: Equatable {
         parts += words.compactMap { q($0).map { "TEXT \($0)" } }
         parts += from.compactMap { q($0).map { "FROM \($0)" } }
         parts += to.compactMap { q($0).map { "TO \($0)" } }
+        parts += cc.compactMap { q($0).map { "CC \($0)" } }
         parts += subject.compactMap { q($0).map { "SUBJECT \($0)" } }
         if unread { parts.append("UNSEEN") }
         if flagged { parts.append("FLAGGED") }

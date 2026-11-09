@@ -25,6 +25,8 @@ final class ImagePage {
     var dark = false
 
     private var cidParts: [String: BodyPart?] = [:]
+    /// Inline images of a message opened from a .eml file come from the file, not a server.
+    var localCID: ((String) -> (Data, String)?)?
 
     /// cid → part, resolved once per message (the detail row and BODYSTRUCTURE JSON are not re-fetched per image).
     func part(forCID cid: String) -> BodyPart? {
@@ -147,6 +149,10 @@ final class ImageLoader: NSObject, WKURLSchemeHandler {
     // MARK: Inline (cid:) images
 
     private func loadCID(id: Int, page: ImagePage) async -> (Data, String) {
+        if let local = page.localCID {
+            guard let cid = page.prepared.cids[id], let hit = local(cid) else { return (Self.transparentGIF, "image/gif") }
+            return await Self.processed(hit.0, fallbackMime: hit.1)
+        }
         guard let cid = page.prepared.cids[id],
               let part = page.part(forCID: cid),
               let engine = MailService.shared.engine(page.accountID),
@@ -169,7 +175,7 @@ final class ImageLoader: NSObject, WKURLSchemeHandler {
             Debug.log("image rejected \(original)")
             return (Self.transparentGIF, "image/gif")
         }
-        if let cached = Self.cached(url) { return cached }
+        if let cached = await ImageDiskCache.shared.load(url) { return cached }
 
         let perImage = Prefs.imageMaxBytes
         let perMessage = Prefs.imageMessageMaxBytes
@@ -242,7 +248,7 @@ final class ImageLoader: NSObject, WKURLSchemeHandler {
                 page.bytesLoaded += data.count
                 let mime = type.hasPrefix("image/") ? type : "image/jpeg"
                 let result = await Self.processed(data, fallbackMime: mime)
-                Self.store(url, result)
+                Task.detached(priority: .utility) { await ImageDiskCache.shared.save(url, result) }
                 return result
             }
         } catch {
@@ -352,29 +358,7 @@ final class ImageLoader: NSObject, WKURLSchemeHandler {
         }.value
     }
 
-    // MARK: Disk cache (processed images, LRU-pruned to 200 MB)
-
-    nonisolated private static func cacheURL(_ url: URL) -> URL {
-        let digest = SHA256.hash(data: Data(url.absoluteString.utf8)).map { String(format: "%02x", $0) }.joined()
-        return AppPaths.imageCache.appendingPathComponent(String(digest.prefix(40)))
-    }
-
-    nonisolated private static func cached(_ url: URL) -> (Data, String)? {
-        let file = cacheURL(url)
-        guard let data = try? Data(contentsOf: file), data.count > 1,
-              let mimeLen = data.first, data.count > Int(mimeLen) + 1 else { return nil }
-        let mime = String(decoding: data[1...Int(mimeLen)], as: UTF8.self)
-        try? FileManager.default.setAttributes([.modificationDate: Date()], ofItemAtPath: file.path)
-        return (data.subdata(in: (Int(mimeLen) + 1)..<data.count), mime)
-    }
-
-    nonisolated private static func store(_ url: URL, _ value: (Data, String)) {
-        let mime = Data(value.1.utf8.prefix(255))
-        var out = Data([UInt8(mime.count)])
-        out.append(mime)
-        out.append(value.0)
-        try? out.write(to: cacheURL(url), options: .atomic)
-    }
+    // MARK: Disk cache (processed images, LRU-pruned to 200 MB) — see ImageDiskCache
 
     nonisolated static func pruneCache() {
         DispatchQueue.global(qos: .utility).async {
@@ -414,5 +398,48 @@ final class ImageLoader: NSObject, WKURLSchemeHandler {
         </svg>
         """
         return Data(svg.utf8)
+    }
+}
+
+
+/// Processed-image cache: disk reads, writes and LRU touches run on this actor, never the main thread
+/// (O-02). There is deliberately no in-memory layer: WebKit already holds what's on screen, and RAM must
+/// not grow past the measured baseline. Every 200 stores it prunes itself, so the 200 MB cap holds during
+/// long sessions too (O-08).
+actor ImageDiskCache {
+    static let shared = ImageDiskCache()
+    private var storesSincePrune = 0
+
+    private static func key(_ url: URL) -> String {
+        String(SHA256.hash(data: Data(url.absoluteString.utf8)).map { String(format: "%02x", $0) }.joined().prefix(40))
+    }
+
+    func load(_ url: URL) -> (Data, String)? {
+        let file = AppPaths.imageCache.appendingPathComponent(Self.key(url))
+        guard let data = try? Data(contentsOf: file), data.count > 1,
+              let mimeLen = data.first, data.count > Int(mimeLen) + 1 else { return nil }
+        let mime = String(decoding: data[1...Int(mimeLen)], as: UTF8.self)
+        try? FileManager.default.setAttributes([.modificationDate: Date()], ofItemAtPath: file.path)
+        return (data.subdata(in: (Int(mimeLen) + 1)..<data.count), mime)
+    }
+
+    func save(_ url: URL, _ value: (Data, String)) {
+        let mime = Data(value.1.utf8.prefix(255))
+        var out = Data([UInt8(mime.count)])
+        out.append(mime)
+        out.append(value.0)
+        try? out.write(to: AppPaths.imageCache.appendingPathComponent(Self.key(url)), options: .atomic)
+        storesSincePrune += 1
+        if storesSincePrune >= 200 {
+            storesSincePrune = 0
+            ImageLoader.pruneCache()
+        }
+    }
+
+    func clear() {
+        let fm = FileManager.default
+        for f in (try? fm.contentsOfDirectory(at: AppPaths.imageCache, includingPropertiesForKeys: nil)) ?? [] {
+            try? fm.removeItem(at: f)
+        }
     }
 }

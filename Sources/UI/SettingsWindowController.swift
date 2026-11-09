@@ -2,13 +2,20 @@ import AppKit
 
 /// Settings: Accounts (add / remove / signature) and General (offline window, images, reading, sending).
 @MainActor
-final class SettingsWindowController: NSWindowController, NSTableViewDataSource, NSTableViewDelegate {
+final class SettingsWindowController: NSWindowController, NSTableViewDataSource, NSTableViewDelegate, NSTextViewDelegate,
+                                       NSTextFieldDelegate {
     private let tabs = NSTabView()
     private let table = NSTableView()
     private let signature = NSTextView()
     private let nameField = NSTextField()
     private let removeButton = NSButton(title: "Remove", target: nil, action: nil)
     private let defaultButton = NSButton(title: "Make Default", target: nil, action: nil)
+    private let editButton = NSButton(title: "Edit Account…", target: nil, action: nil)
+    private let notifyBox = NSButton(checkboxWithTitle: "Notify about new mail in this account", target: nil, action: nil)
+    private let saveButton = NSButton(title: "Save", target: nil, action: nil)
+    /// Name/signature edits not yet saved, and which account they belong to (B-10).
+    private var detailsDirty = false
+    private var loadedAccountID: String?
 
     init() {
         let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 620, height: 470), styleMask: [.titled, .closable],
@@ -22,8 +29,12 @@ final class SettingsWindowController: NSWindowController, NSTableViewDataSource,
         let general = NSTabViewItem(identifier: "general")
         general.label = "General"
         general.view = generalView()
+        let storage = NSTabViewItem(identifier: "storage")
+        storage.label = "Storage"
+        storage.view = storageView()
         tabs.addTabViewItem(accounts)
         tabs.addTabViewItem(general)
+        tabs.addTabViewItem(storage)
         tabs.translatesAutoresizingMaskIntoConstraints = false
         w.contentView?.addSubview(tabs)
         NSLayoutConstraint.activate([
@@ -64,14 +75,21 @@ final class SettingsWindowController: NSWindowController, NSTableViewDataSource,
         defaultButton.bezelStyle = .rounded
         defaultButton.target = self
         defaultButton.action = #selector(makeDefault)
+        editButton.bezelStyle = .rounded
+        editButton.target = self
+        editButton.action = #selector(editSelectedAccount)
+        notifyBox.target = self
+        notifyBox.action = #selector(notifyToggled)
 
         let nameLabel = NSTextField(labelWithString: "Your name:")
         nameField.placeholderString = "Shown as the sender"
         nameField.target = self
         nameField.action = #selector(saveDetails)
+        nameField.delegate = self
         let sigLabel = NSTextField(labelWithString: "Signature:")
         signature.font = .systemFont(ofSize: 13)
         signature.isRichText = false
+        signature.delegate = self
         signature.textContainerInset = NSSize(width: 4, height: 4)
         let sigScroll = NSScrollView()
         sigScroll.documentView = signature
@@ -80,10 +98,12 @@ final class SettingsWindowController: NSWindowController, NSTableViewDataSource,
         signature.isVerticallyResizable = true
         signature.autoresizingMask = [.width]
         signature.textContainer?.widthTracksTextView = true
-        let save = NSButton(title: "Save", target: self, action: #selector(saveDetails))
+        let save = saveButton
+        save.target = self
+        save.action = #selector(saveDetails)
         save.bezelStyle = .rounded
 
-        for x in [scroll, add, removeButton, defaultButton, nameLabel, nameField, sigLabel, sigScroll, save] as [NSView] {
+        for x in [scroll, add, removeButton, defaultButton, editButton, nameLabel, nameField, sigLabel, sigScroll, save, notifyBox] as [NSView] {
             x.translatesAutoresizingMaskIntoConstraints = false
             v.addSubview(x)
         }
@@ -98,6 +118,8 @@ final class SettingsWindowController: NSWindowController, NSTableViewDataSource,
             removeButton.leadingAnchor.constraint(equalTo: add.trailingAnchor, constant: 8),
             defaultButton.centerYAnchor.constraint(equalTo: add.centerYAnchor),
             defaultButton.leadingAnchor.constraint(equalTo: removeButton.trailingAnchor, constant: 8),
+            editButton.centerYAnchor.constraint(equalTo: add.centerYAnchor),
+            editButton.trailingAnchor.constraint(equalTo: scroll.trailingAnchor),
             nameLabel.topAnchor.constraint(equalTo: add.bottomAnchor, constant: 18),
             nameLabel.leadingAnchor.constraint(equalTo: scroll.leadingAnchor),
             nameField.centerYAnchor.constraint(equalTo: nameLabel.centerYAnchor),
@@ -111,6 +133,8 @@ final class SettingsWindowController: NSWindowController, NSTableViewDataSource,
             sigScroll.heightAnchor.constraint(equalToConstant: 90),
             save.topAnchor.constraint(equalTo: sigScroll.bottomAnchor, constant: 8),
             save.trailingAnchor.constraint(equalTo: scroll.trailingAnchor),
+            notifyBox.centerYAnchor.constraint(equalTo: save.centerYAnchor),
+            notifyBox.leadingAnchor.constraint(equalTo: sigScroll.leadingAnchor),
         ])
         reloadAccounts()
         return v
@@ -129,19 +153,60 @@ final class SettingsWindowController: NSWindowController, NSTableViewDataSource,
 
     private func loadDetails() {
         let a = selectedAccount
+        loadedAccountID = a?.id
         nameField.stringValue = a?.displayName ?? ""
         signature.string = a?.signature ?? ""
         nameField.isEnabled = a != nil
         signature.isEditable = a != nil
         removeButton.isEnabled = a != nil
+        editButton.isEnabled = a != nil && a?.provider != .demo
+        notifyBox.isEnabled = a != nil
+        notifyBox.state = a.map { Prefs.notifications(for: $0.id) } ?? false ? .on : .off
         defaultButton.isEnabled = a != nil && MailService.shared.accounts.count > 1
+        detailsDirty = false
+        saveButton.isEnabled = false
+    }
+
+    func textDidChange(_ notification: Notification) { markDetailsDirty() }
+    func controlTextDidChange(_ obj: Notification) { markDetailsDirty() }
+
+    private func markDetailsDirty() {
+        detailsDirty = true
+        saveButton.isEnabled = true
     }
 
     @objc private func saveDetails() {
-        guard var a = selectedAccount else { return }
+        commitDetails(for: loadedAccountID)
+    }
+
+    /// Writes the name/signature edits to the account they were made for.
+    private func commitDetails(for id: String?) {
+        guard detailsDirty, let id, var a = MailService.shared.account(id) else { return }
         a.displayName = nameField.stringValue
         a.signature = signature.string
+        detailsDirty = false
+        saveButton.isEnabled = false
         MailService.shared.updateAccount(a)
+    }
+
+    @objc private func notifyToggled() {
+        guard let a = selectedAccount else { return }
+        Prefs.setNotifications(notifyBox.state == .on, for: a.id)
+    }
+
+    @objc private func editSelectedAccount() {
+        guard let a = selectedAccount else { return }
+        editAccount(a.id)
+    }
+
+    /// Account editor / Sign in again (F-04): servers, ports, logins, security and the password.
+    func editAccount(_ id: String) {
+        guard let w = window, let a = MailService.shared.account(id), a.provider != .demo else { return }
+        let sheet = AddAccountSheet(editing: a)
+        w.beginSheet(sheet.window!) { _ in
+            sheet.cancelProbe()
+            _ = sheet
+        }
     }
 
     @objc func addAccount() {
@@ -188,7 +253,118 @@ final class SettingsWindowController: NSWindowController, NSTableViewDataSource,
         return stack
     }
 
-    func tableViewSelectionDidChange(_ notification: Notification) { loadDetails() }
+    /// Switching accounts commits pending name/signature edits to the account they were typed for (B-10).
+    func tableViewSelectionDidChange(_ notification: Notification) {
+        commitDetails(for: loadedAccountID)
+        loadDetails()
+    }
+
+    // MARK: Storage tab (F-26)
+
+    private let storageInfo = NSTextField(wrappingLabelWithString: "")
+
+    private func storageView() -> NSView {
+        let v = NSView()
+        storageInfo.font = .monospacedDigitSystemFont(ofSize: 12, weight: .regular)
+        storageInfo.isSelectable = true
+        let refresh = NSButton(title: "Refresh", target: self, action: #selector(refreshStorage))
+        let clearBodies = NSButton(title: "Clear Message Text Cache…", target: self, action: #selector(clearBodies))
+        let clearImages = NSButton(title: "Clear Image Cache", target: self, action: #selector(clearImages))
+        let pruneNow = NSButton(title: "Prune Now", target: self, action: #selector(pruneNow))
+        let exportLog = NSButton(title: "Export Diagnostics Log…", target: self, action: #selector(exportLog))
+        for b in [refresh, clearBodies, clearImages, pruneNow, exportLog] { b.bezelStyle = .rounded }
+        let note = NSTextField(wrappingLabelWithString: "Cleared message text is downloaded again when you open a message. Nothing is deleted from the server. The diagnostics log holds connection and sync errors only — never message content or passwords.")
+        note.font = .systemFont(ofSize: 11)
+        note.textColor = .secondaryLabelColor
+        let buttons = NSStackView(views: [refresh, pruneNow, clearBodies, clearImages])
+        buttons.orientation = .horizontal
+        buttons.spacing = 8
+        for x in [storageInfo, buttons, exportLog, note] as [NSView] {
+            x.translatesAutoresizingMaskIntoConstraints = false
+            v.addSubview(x)
+        }
+        NSLayoutConstraint.activate([
+            storageInfo.topAnchor.constraint(equalTo: v.topAnchor, constant: 18),
+            storageInfo.leadingAnchor.constraint(equalTo: v.leadingAnchor, constant: 20),
+            storageInfo.trailingAnchor.constraint(equalTo: v.trailingAnchor, constant: -20),
+            buttons.topAnchor.constraint(equalTo: storageInfo.bottomAnchor, constant: 16),
+            buttons.leadingAnchor.constraint(equalTo: storageInfo.leadingAnchor),
+            exportLog.topAnchor.constraint(equalTo: buttons.bottomAnchor, constant: 10),
+            exportLog.leadingAnchor.constraint(equalTo: storageInfo.leadingAnchor),
+            note.topAnchor.constraint(equalTo: exportLog.bottomAnchor, constant: 14),
+            note.leadingAnchor.constraint(equalTo: storageInfo.leadingAnchor),
+            note.trailingAnchor.constraint(equalTo: storageInfo.trailingAnchor),
+        ])
+        refreshStorage()
+        return v
+    }
+
+    @objc private func refreshStorage() {
+        let service = MailService.shared
+        let store = service.store
+        let fmt = ByteCountFormatter()
+        let db = fmt.string(fromByteCount: store.databaseBytes)
+        let messages = store.cachedMessageCount
+        let bodies = store.cachedBodyCount
+        let prune = service.lastPrune.map { DateFormatter.localizedString(from: $0, dateStyle: .short, timeStyle: .short) } ?? "not yet this session"
+        var lines = [
+            "Mail cache:      \(db)  (\(messages) messages, \(bodies) with text)",
+            "Image cache:     calculating…",
+            "Outbox:          \(service.outbox.items.count) waiting",
+            "Queued actions:  \(store.opCounts().values.reduce(0, +))",
+            "Offline window:  \(Prefs.offlineDays) days (newest 200 per folder always kept)",
+            "Last prune:      \(prune)",
+        ]
+        for e in service.engines.values where e.lastError != nil {
+            lines.append("Last error:      \(e.account.email): \(e.lastError ?? "")")
+        }
+        storageInfo.stringValue = lines.joined(separator: "\n")
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let images = ByteCountFormatter().string(fromByteCount: AppPaths.directorySize(AppPaths.imageCache))
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.storageInfo.stringValue = self.storageInfo.stringValue
+                    .replacingOccurrences(of: "Image cache:     calculating…", with: "Image cache:     \(images) (limit 200 MB)")
+            }
+        }
+    }
+
+    @objc private func clearBodies() {
+        guard let w = window else { return }
+        let a = NSAlert()
+        a.messageText = "Clear the cached message text?"
+        a.informativeText = "Messages stay in the list; their text is downloaded again when opened. Offline reading needs a fresh download."
+        a.addButton(withTitle: "Clear")
+        a.addButton(withTitle: "Cancel")
+        a.beginSheetModal(for: w) { [weak self] r in
+            guard r == .alertFirstButtonReturn else { return }
+            MailService.shared.store.clearBodyCache()
+            NotificationCenter.default.postMailDataChanged(.all)
+            self?.refreshStorage()
+        }
+    }
+
+    @objc private func clearImages() {
+        Task {
+            await ImageDiskCache.shared.clear()
+            refreshStorage()
+        }
+    }
+
+    @objc private func pruneNow() {
+        MailService.shared.pruneNow()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in self?.refreshStorage() }
+    }
+
+    @objc private func exportLog() {
+        guard let w = window else { return }
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = "Mac Mail diagnostics.log"
+        panel.beginSheetModal(for: w) { r in
+            guard r == .OK, let url = panel.url else { return }
+            try? DiagnosticsLog.export(to: url)
+        }
+    }
 
     // MARK: General tab
 
@@ -304,9 +480,8 @@ final class SettingsWindowController: NSWindowController, NSTableViewDataSource,
 
     @objc private func daysChanged(_ s: NSPopUpButton) {
         Prefs.offlineDays = s.selectedTag()
-        // Apply the new offline window right away instead of waiting for the next launch.
-        MailService.shared.store.prune(offlineDays: Prefs.offlineDays)
-        NotificationCenter.default.postMailDataChanged(.all)
+        // Apply the new offline window right away (on a background connection) instead of at the next launch.
+        MailService.shared.pruneNow()
     }
     @objc private func groupChanged(_ s: NSButton) { Prefs.groupByConversationDefault = s.state == .on }
     @objc private func markReadChanged(_ s: NSButton) { Prefs.markReadOnOpen = s.state == .on }
@@ -353,22 +528,49 @@ final class AddAccountSheet: NSWindowController {
     private let imapPort = NSTextField()
     private let smtpHost = NSTextField()
     private let smtpPort = NSTextField()
+    private let username = NSTextField()
+    private let smtpUsername = NSTextField()
+    private let imapSecurity = NSPopUpButton()
+    private let smtpSecurity = NSPopUpButton()
+    /// Set when editing an existing account (F-04) rather than adding one.
+    private let editing: Account?
     private let error = NSTextField(wrappingLabelWithString: "")
     private let spinner = NSProgressIndicator()
     private let signIn = NSButton(title: "Sign In", target: nil, action: nil)
     private var serverRows: [NSGridRow] = []
 
-    init() {
-        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 480, height: 380), styleMask: [.titled], backing: .buffered, defer: false)
+    init(editing: Account? = nil) {
+        self.editing = editing
+        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 520, height: 460), styleMask: [.titled], backing: .buffered, defer: false)
         super.init(window: w)
         build()
+        if let a = editing { fill(a) }
+    }
+
+    private func fill(_ a: Account) {
+        provider.selectItem(at: a.provider == .gmail ? 0 : 1)
+        provider.isEnabled = false
+        name.stringValue = a.displayName
+        email.stringValue = a.email
+        email.isEditable = false
+        username.stringValue = a.username == a.email ? "" : a.username
+        smtpUsername.stringValue = a.smtpUsername
+        imapHost.stringValue = a.imapHost
+        imapPort.stringValue = "\(a.imapPort)"
+        smtpHost.stringValue = a.smtpHost
+        smtpPort.stringValue = "\(a.smtpPort)"
+        imapSecurity.selectItem(at: ConnectionSecurity.allCases.firstIndex(of: a.imapSecurity) ?? 0)
+        smtpSecurity.selectItem(at: ConnectionSecurity.allCases.firstIndex(of: a.smtpSecurity) ?? 0)
+        password.placeholderString = "Leave empty to keep the saved password"
+        signIn.title = "Save"
+        providerChanged()
     }
 
     required init?(coder: NSCoder) { fatalError() }
 
     private func build() {
         guard let content = window?.contentView else { return }
-        let title = NSTextField(labelWithString: "Add a mail account")
+        let title = NSTextField(labelWithString: editing == nil ? "Add a mail account" : "Edit \(editing?.email ?? "account")")
         title.font = .systemFont(ofSize: 15, weight: .semibold)
         provider.addItems(withTitles: ["Gmail", "Other (IMAP over SSL)"])
         provider.target = self
@@ -380,6 +582,14 @@ final class AddAccountSheet: NSWindowController {
         imapPort.stringValue = "993"
         smtpHost.placeholderString = "smtp.example.com"
         smtpPort.stringValue = "465"
+        username.placeholderString = "Same as email"
+        smtpUsername.placeholderString = "Same as IMAP login"
+        for p in [imapSecurity, smtpSecurity] {
+            p.addItems(withTitles: ConnectionSecurity.allCases.map { $0.label })
+            p.target = self
+        }
+        imapSecurity.action = #selector(imapSecurityChanged)
+        smtpSecurity.action = #selector(smtpSecurityChanged)
         let help = NSButton(title: "How do I get an App Password?", target: self, action: #selector(openHelp))
         help.bezelStyle = .inline
         help.isBordered = false
@@ -397,15 +607,18 @@ final class AddAccountSheet: NSWindowController {
             [l("Email:"), email],
             [l("App Password:"), password],
             [NSGridCell.emptyContentView, help],
+            [l("Login name:"), username],
             [l("IMAP server:"), imapHost],
-            [l("IMAP port:"), imapPort],
+            [l("IMAP port / security:"), Self.pair(imapPort, imapSecurity)],
             [l("SMTP server:"), smtpHost],
-            [l("SMTP port:"), smtpPort],
+            [l("SMTP port / security:"), Self.pair(smtpPort, smtpSecurity)],
+            [l("SMTP login:"), smtpUsername],
         ])
         grid.rowSpacing = 8
         grid.column(at: 0).xPlacement = .trailing
-        for f in [name, email, password, imapHost, smtpHost] { f.widthAnchor.constraint(equalToConstant: 280).isActive = true }
-        serverRows = (5...8).map { grid.row(at: $0) }
+        for f in [name, email, password, imapHost, smtpHost, username, smtpUsername] { f.widthAnchor.constraint(equalToConstant: 280).isActive = true }
+        for f in [imapPort, smtpPort] { f.widthAnchor.constraint(equalToConstant: 70).isActive = true }
+        serverRows = (5...10).map { grid.row(at: $0) }
 
         let cancel = NSButton(title: "Cancel", target: self, action: #selector(cancel))
         cancel.bezelStyle = .rounded
@@ -414,7 +627,7 @@ final class AddAccountSheet: NSWindowController {
         signIn.keyEquivalent = "\r"
         signIn.target = self
         signIn.action = #selector(submit)
-        let note = NSTextField(wrappingLabelWithString: "The App Password is stored only in your Mac's Keychain.")
+        let note = NSTextField(wrappingLabelWithString: "The password is stored only in your Mac's Keychain. Mac Mail signs in to both incoming (IMAP) and outgoing (SMTP) mail before saving, and never sends a password without TLS.")
         note.font = .systemFont(ofSize: 11)
         note.textColor = .secondaryLabelColor
 
@@ -445,6 +658,24 @@ final class AddAccountSheet: NSWindowController {
         providerChanged()
     }
 
+    private static func pair(_ a: NSView, _ b: NSView) -> NSView {
+        let s = NSStackView(views: [a, b])
+        s.orientation = .horizontal
+        s.spacing = 8
+        return s
+    }
+
+    /// Picking a security mode suggests its usual port.
+    @objc private func imapSecurityChanged() {
+        let sec = ConnectionSecurity.allCases[max(0, imapSecurity.indexOfSelectedItem)]
+        if ["993", "143", ""].contains(imapPort.stringValue) { imapPort.stringValue = sec == .tls ? "993" : "143" }
+    }
+
+    @objc private func smtpSecurityChanged() {
+        let sec = ConnectionSecurity.allCases[max(0, smtpSecurity.indexOfSelectedItem)]
+        if ["465", "587", ""].contains(smtpPort.stringValue) { smtpPort.stringValue = sec == .tls ? "465" : "587" }
+    }
+
     @objc private func providerChanged() {
         let other = provider.indexOfSelectedItem == 1
         for r in serverRows { r.isHidden = !other }
@@ -466,17 +697,18 @@ final class AddAccountSheet: NSWindowController {
         let mail = email.stringValue.trimmingCharacters(in: .whitespaces)
         // App Passwords are shown with spaces; Google accepts them without.
         let pass = password.stringValue.replacingOccurrences(of: " ", with: "")
-        guard mail.contains("@"), !pass.isEmpty else {
+        guard mail.contains("@"), !pass.isEmpty || editing != nil else {
             error.stringValue = "Enter your email address and App Password."
             return
         }
-        if MailService.shared.accounts.contains(where: { $0.email.lowercased() == mail.lowercased() }) {
+        if editing == nil, MailService.shared.accounts.contains(where: { $0.email.lowercased() == mail.lowercased() }) {
             error.stringValue = "\(mail) is already added."
             return
         }
         var account: Account
         if provider.indexOfSelectedItem == 0 {
             account = Account.gmail(email: mail, name: name.stringValue)
+            if let e = editing { account.id = e.id; account.signature = e.signature }
         } else {
             guard !imapHost.stringValue.isEmpty, !smtpHost.stringValue.isEmpty else {
                 error.stringValue = "Enter the IMAP and SMTP servers."
@@ -495,9 +727,15 @@ final class AddAccountSheet: NSWindowController {
                 error.stringValue = "The SMTP port must be a number between 1 and 65535."
                 return
             }
-            account = Account(id: UUID().uuidString, email: mail, displayName: name.stringValue, provider: .imap, username: mail,
-                              imapHost: imapHost.stringValue, imapPort: pIn,
-                              smtpHost: smtpHost.stringValue, smtpPort: pOut, signature: "")
+            let login = username.stringValue.trimmingCharacters(in: .whitespaces)
+            account = Account(id: editing?.id ?? UUID().uuidString, email: mail, displayName: name.stringValue, provider: .imap,
+                              username: login.isEmpty ? mail : login,
+                              imapHost: imapHost.stringValue.trimmingCharacters(in: .whitespaces), imapPort: pIn,
+                              smtpHost: smtpHost.stringValue.trimmingCharacters(in: .whitespaces), smtpPort: pOut,
+                              signature: editing?.signature ?? "",
+                              imapSecurity: ConnectionSecurity.allCases[max(0, imapSecurity.indexOfSelectedItem)],
+                              smtpSecurity: ConnectionSecurity.allCases[max(0, smtpSecurity.indexOfSelectedItem)],
+                              smtpUsername: smtpUsername.stringValue.trimmingCharacters(in: .whitespaces))
         }
         if account.displayName.isEmpty { account.displayName = String(mail.split(separator: "@").first ?? "") }
         error.stringValue = ""
@@ -505,9 +743,14 @@ final class AddAccountSheet: NSWindowController {
         signIn.isEnabled = false
         probeTask = Task { [weak self] in
             do {
-                try await MailService.shared.addAccount(account, password: pass)
-                // The sheet may have been cancelled while the probe was running: undo the add.
-                guard !Task.isCancelled else { MailService.shared.removeAccount(account.id); return }
+                if self?.editing != nil {
+                    try await MailService.shared.updateCredentials(account, password: pass)
+                    guard !Task.isCancelled else { return }
+                } else {
+                    try await MailService.shared.addAccount(account, password: pass)
+                    // The sheet may have been cancelled while the probe was running: undo the add.
+                    guard !Task.isCancelled else { MailService.shared.removeAccount(account.id); return }
+                }
                 self?.spinner.stopAnimation(nil)
                 if let w = self?.window { w.sheetParent?.endSheet(w) }
                 (NSApp.delegate as? AppDelegate)?.mainWindow?.window?.makeKeyAndOrderFront(nil)

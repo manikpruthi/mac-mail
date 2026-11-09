@@ -362,6 +362,32 @@ enum MIME {
     // MARK: Misc
 
     /// Stable 63-bit FNV-1a hash, used as a thread id for servers without Gmail's X-GM-THRID.
+    /// Conversation key for servers without X-GM-THRID (B-12). Replies point back at the thread's first
+    /// message through References (oldest first) or In-Reply-To, so the root Message-ID identifies the
+    /// conversation; a message with no ids falls back to subject plus the people involved, never subject alone.
+    static func threadKey(messageID: String, inReplyTo: String, references: String, subject: String,
+                          participants: [String]) -> Int64 {
+        func ids(_ raw: String) -> [String] {
+            var out: [String] = []
+            var rest = Substring(raw)
+            while let lt = rest.firstIndex(of: "<"), let gt = rest[lt...].firstIndex(of: ">") {
+                let inner = rest[rest.index(after: lt)..<gt].trimmingCharacters(in: .whitespaces)
+                if !inner.isEmpty { out.append(inner.lowercased()) }
+                rest = rest[rest.index(after: gt)...]
+            }
+            if out.isEmpty {
+                let bare = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !bare.isEmpty, !bare.contains(" ") { out.append(bare.lowercased()) }
+            }
+            return out
+        }
+        if let root = ids(references).first ?? ids(inReplyTo).first ?? ids(messageID).first {
+            return stableHash("mid:" + root)
+        }
+        let people = Set(participants.map { $0.lowercased() }.filter { !$0.isEmpty }).sorted().joined(separator: ",")
+        return stableHash("subj:" + normalizedSubject(subject).lowercased() + "|" + people)
+    }
+
     static func stableHash(_ s: String) -> Int64 {
         var h: UInt64 = 0xcbf29ce484222325
         for b in s.utf8 {
