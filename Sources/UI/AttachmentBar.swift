@@ -219,8 +219,13 @@ final class AttachmentChip: NSButton, NSDraggingSource {
         // inside the chip is a click. The wait is capped, and a mouse-up outside the chip is not a click,
         // so a missed mouse-up can never wedge the event loop or swallow the next click (C-23).
         guard let window else { super.mouseDown(with: event); return }
+        let trackingWindow = window
         let deadline = Date().addingTimeInterval(10)
-        while let next = window.nextEvent(matching: [.leftMouseUp, .leftMouseDragged], until: deadline, inMode: .eventTracking, dequeue: true) {
+        while let next = trackingWindow.nextEvent(matching: [.leftMouseUp, .leftMouseDragged], until: deadline, inMode: .eventTracking, dequeue: true) {
+            // A click in another window, a sheet, or the window closing/being replaced ends the wait at
+            // once, leaving those events to the normal event loop instead of swallowing them here.
+            if next.window !== trackingWindow || self.window !== trackingWindow
+                || trackingWindow.attachedSheet != nil || !trackingWindow.isVisible { break }
             if next.type == .leftMouseUp {
                 mouseDownPoint = nil
                 if isEnabled, bounds.contains(convert(next.locationInWindow, from: nil)) { performClick(nil) }

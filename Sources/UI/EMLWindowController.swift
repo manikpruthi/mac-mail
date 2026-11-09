@@ -12,21 +12,14 @@ final class EMLWindowController: NSWindowController, NSWindowDelegate, WKNavigat
     static func show(_ url: URL) {
         let key = url.standardizedFileURL
         if let existing = open[key] { existing.window?.makeKeyAndOrderFront(nil); return }
-        do {
-            let data = try Data(contentsOf: url, options: .mappedIfSafe)
-            let doc = try EMLDocument.parse(data)
-            let c = EMLWindowController(doc: doc, url: url)
-            open[key] = c
-            c.showWindow(nil)
-            c.window?.makeKeyAndOrderFront(nil)
-        } catch {
-            let a = NSAlert(error: error)
-            a.messageText = "Couldn't open “\(url.lastPathComponent)”"
-            a.runModal()
-        }
+        let c = EMLWindowController(url: url)
+        open[key] = c
+        c.showWindow(nil)
+        c.window?.makeKeyAndOrderFront(nil)
+        c.load()
     }
 
-    private let doc: EMLDocument
+    private var doc: EMLDocument?
     private let url: URL
     private let loader = ImageLoader()
     private var web: WKWebView?
@@ -37,23 +30,26 @@ final class EMLWindowController: NSWindowController, NSWindowDelegate, WKNavigat
     private var renderAttempt = 0
     private var ruleListAttached = false
     private var closed = false
+    /// Decoded once with the file, so Reply doesn't decode the message again.
+    private var bodies: (html: String?, text: String?) = (html: nil, text: nil)
+    private var lastRenderedDark: Bool?
     /// Required zero height while the banner is hidden, so no space is reserved for it.
     private var bannerCollapse: NSLayoutConstraint?
 
-    private init(doc: EMLDocument, url: URL) {
-        self.doc = doc
+    private init(url: URL) {
         self.url = url
         let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 860, height: 760),
                          styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
         w.minSize = NSSize(width: 520, height: 420)
         w.isReleasedWhenClosed = false
         w.tabbingMode = .disallowed
-        w.title = doc.subject.isEmpty ? url.deletingPathExtension().lastPathComponent : doc.subject
+        w.title = url.deletingPathExtension().lastPathComponent
         w.representedURL = url
         super.init(window: w)
+        let content = EMLContentView(frame: .zero)
+        w.contentView = content
+        content.onAppearanceChange = { [weak self] in self?.appearanceChanged() }
         w.delegate = self
-        build()
-        render()
         if let last = Self.open.values.compactMap({ $0.window }).last {
             w.setFrameTopLeftPoint(NSPoint(x: last.frame.minX + 24, y: last.frame.maxY - 24))
         } else {
@@ -63,8 +59,33 @@ final class EMLWindowController: NSWindowController, NSWindowDelegate, WKNavigat
 
     required init?(coder: NSCoder) { fatalError() }
 
+    /// Reads, parses and decodes on a background thread; the window is already on screen and is filled in after.
+    private func load() {
+        let url = self.url
+        Task { @MainActor [weak self] in
+            do {
+                let (doc, bodies) = try await Task.detached(priority: .userInitiated) {
+                    let doc = try EMLDocument.parse(Data(contentsOf: url, options: .mappedIfSafe))
+                    return (doc, doc.bodies())
+                }.value
+                guard let self, !self.closed else { return }
+                self.doc = doc
+                self.bodies = bodies
+                self.window?.title = doc.subject.isEmpty ? url.deletingPathExtension().lastPathComponent : doc.subject
+                self.build()
+                self.render()
+            } catch {
+                guard let self, !self.closed else { return }
+                self.close()
+                let a = NSAlert(error: error)
+                a.messageText = "Couldn't open “\(url.lastPathComponent)”"
+                a.runModal()
+            }
+        }
+    }
+
     private func build() {
-        guard let content = window?.contentView else { return }
+        guard let content = window?.contentView, let doc else { return }
         let subject = NSTextField(wrappingLabelWithString: doc.subject.isEmpty ? "(no subject)" : doc.subject)
         subject.font = .systemFont(ofSize: 18, weight: .semibold)
         subject.isSelectable = true
@@ -167,7 +188,8 @@ final class EMLWindowController: NSWindowController, NSWindowDelegate, WKNavigat
     }
 
     private func render() {
-        guard let web else { return }
+        guard let web, let doc else { return }
+        lastRenderedDark = isDark
         // Fail closed like the reading pane: nothing renders until the remote-load block list is attached.
         // The wait is capped at ~2 s; after that the CSP meta alone guards the render (C-24).
         if PreviewViewController.ruleList == nil, !PreviewViewController.ruleListFailed {
@@ -192,23 +214,35 @@ final class EMLWindowController: NSWindowController, NSWindowDelegate, WKNavigat
             ruleListAttached = true
         }
         generation += 1
-        let (html, text) = doc.bodies()
-        let prepared = HTMLPrep.prepare(html: html, text: text, clip: false, page: generation)
-        // Remote images stay blocked until asked for: a file from someone else is untrusted.
-        let page = ImagePage(generation: generation, messageID: 0, accountID: "", prepared: prepared,
-                             autoLoad: loadImages, ignoreLimits: false)
-        let doc = self.doc
-        page.localCID = { cid in
-            guard let part = doc.structure.part(withContentID: cid), let data = doc.data(for: part) else { return nil }
-            return (data, part.mimeType)
+        let gen = generation
+        let bodies = self.bodies
+        // Rewriting large HTML takes real time; prepare it off the main thread like the reading pane does.
+        Task { @MainActor [weak self] in
+            let prepared = await HTMLPrep.prepareOffMain(html: bodies.html, text: bodies.text, clip: false, page: gen)
+            guard let self, gen == self.generation, !self.closed, let web = self.web else { return }
+            // Remote images stay blocked until asked for: a file from someone else is untrusted.
+            let page = ImagePage(generation: gen, messageID: 0, accountID: "", prepared: prepared,
+                                 autoLoad: self.loadImages, ignoreLimits: false)
+            page.localCID = { cid in
+                guard let part = doc.structure.part(withContentID: cid), let data = doc.data(for: part) else { return nil }
+                return (data, part.mimeType)
+            }
+            page.dark = self.isDark
+            self.loader.page = page
+            if prepared.hasRemoteImages && !self.loadImages {
+                self.showBanner(text: "Images from the internet aren't loaded in saved messages.",
+                                actions: [("Load images", { [weak self] in self?.loadImages = true; self?.hideBanner(); self?.render() })])
+            }
+            web.loadHTMLString(prepared.html, baseURL: URL(string: "lm://message/0/"))
         }
-        page.dark = window?.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
-        loader.page = page
-        if prepared.hasRemoteImages && !loadImages {
-            showBanner(text: "Images from the internet aren't loaded in saved messages.",
-                       actions: [("Load images", { [weak self] in self?.loadImages = true; self?.hideBanner(); self?.render() })])
-        }
-        web.loadHTMLString(prepared.html, baseURL: URL(string: "lm://message/0/"))
+    }
+
+    private var isDark: Bool { window?.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua }
+
+    /// The page's image placeholders are baked per appearance, so a theme switch re-renders it.
+    private func appearanceChanged() {
+        guard doc != nil, !closed, lastRenderedDark != isDark else { return }
+        render()
     }
 
     private func showBanner(text: String, actions: [(String, () -> Void)]) {
@@ -225,8 +259,8 @@ final class EMLWindowController: NSWindowController, NSWindowDelegate, WKNavigat
     // MARK: Actions
 
     @objc private func replyTapped() {
-        guard !MailService.shared.accounts.isEmpty else { return }
-        let (html, text) = doc.bodies()
+        guard !MailService.shared.accounts.isEmpty, let doc else { return }
+        let (html, text) = bodies
         let d = MessageDetail(id: 0, folderID: 0, accountID: MailService.shared.defaultAccount?.id ?? "", uid: 0,
                               date: doc.date ?? Date(), flags: [], subject: doc.subject, from: doc.from, toList: doc.to,
                               ccList: doc.cc, replyTo: doc.headers["reply-to"] ?? "", messageIDHeader: doc.headers["message-id"] ?? "",
@@ -238,7 +272,7 @@ final class EMLWindowController: NSWindowController, NSWindowDelegate, WKNavigat
     @objc func printMessage(_ sender: Any?) {
         guard let web, let window else { return }
         let op = web.printOperation(with: NSPrintInfo.shared)
-        op.jobTitle = doc.subject
+        op.jobTitle = doc?.subject ?? ""
         op.view?.frame = web.bounds
         op.runModal(for: window, delegate: nil, didRun: nil, contextInfo: nil)
     }
@@ -273,17 +307,30 @@ final class EMLWindowController: NSWindowController, NSWindowDelegate, WKNavigat
         panel.beginSheetModal(for: window) { [weak self] resp in
             guard resp == .OK, let dir = panel.url, let doc = self?.doc else { return }
             Task { @MainActor in
-                var used = Set<String>()
+                // Names already in the folder count as used, so a collision saves as "name 2" instead of failing.
+                let existing = (try? FileManager.default.contentsOfDirectory(atPath: dir.path)) ?? []
+                var used = Set(existing.map { $0.lowercased() })
                 let named = doc.structure.attachments().map {
                     (part: $0, name: PreviewViewController.uniqueName($0.suggestedFilename, used: &used))
                 }
-                // Write every attachment off the main thread.
-                await Task.detached(priority: .userInitiated) {
+                // Write every attachment off the main thread and report what couldn't be written in one alert.
+                let skipped = await Task.detached(priority: .userInitiated) {
+                    var skipped: [String] = []
                     for (p, name) in named {
-                        guard let data = doc.data(for: p) else { continue }
-                        try? data.write(to: dir.appendingPathComponent(name), options: .withoutOverwriting)
+                        guard let data = doc.data(for: p) else { skipped.append(name); continue }
+                        do {
+                            try data.write(to: dir.appendingPathComponent(name), options: .withoutOverwriting)
+                        } catch {
+                            skipped.append(name)
+                        }
                     }
+                    return skipped
                 }.value
+                guard !skipped.isEmpty, let self, !self.closed, let window = self.window else { return }
+                let a = NSAlert()
+                a.messageText = "Some attachments weren't saved"
+                a.informativeText = skipped.joined(separator: "\n")
+                a.beginSheetModal(for: window, completionHandler: nil)
             }
         }
     }
@@ -291,7 +338,7 @@ final class EMLWindowController: NSWindowController, NSWindowDelegate, WKNavigat
     private var quickLookDir: URL?
 
     private func quickLook(_ part: BodyPart) {
-        let doc = doc
+        guard let doc else { return }
         let dir = AppPaths.tempDir("quicklook")
         let file = dir.appendingPathComponent(part.suggestedFilename)
         Task { @MainActor in
@@ -347,5 +394,15 @@ final class EMLWindowController: NSWindowController, NSWindowDelegate, WKNavigat
         if let d = quickLookDir { try? FileManager.default.removeItem(at: d) }
         quickLookDir = nil
         Self.open[url.standardizedFileURL] = nil
+    }
+}
+
+/// Calls back when the window's effective appearance changes (a dark-mode switch), so the page can re-render.
+private final class EMLContentView: NSView {
+    var onAppearanceChange: (() -> Void)?
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        onAppearanceChange?()
     }
 }
