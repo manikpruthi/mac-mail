@@ -13,6 +13,9 @@ struct BodyPart: Codable, Equatable {
     var disposition: String?
     var dispositionParams: [String: String] = [:]
     var children: [BodyPart] = []
+    /// Set when parsing hit the depth/part cap (.eml): the part was not fully parsed and its raw body is
+    /// unavailable, so it must never be offered as a savable attachment.
+    var truncated: Bool = false
 
     var mimeType: String { "\(type)/\(subtype)" }
     var isMultipart: Bool { type == "multipart" }
@@ -108,10 +111,12 @@ struct BodyPart: Codable, Equatable {
         return (html, text)
     }
 
-    /// Parts shown as attachment chips. Inline images referenced by Content-ID are not listed.
+    /// Parts shown as attachment chips. Inline images referenced by Content-ID are not listed,
+    /// and parts whose parsing was cut off by the depth/part caps are never savable.
     func attachments() -> [BodyPart] {
         let display = displayParts()
         return leaves.filter { p in
+            if p.truncated { return false }
             if p.partID == display.html?.partID || p.partID == display.text?.partID { return false }
             if p.isAttachmentDisposition { return true }
             if p.type == "image", p.contentID != nil, p.disposition != "attachment" { return false }

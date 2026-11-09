@@ -34,6 +34,9 @@ final class EMLWindowController: NSWindowController, NSWindowDelegate, WKNavigat
     private let attachmentBar = AttachmentBar()
     private var loadImages = false
     private var generation = 0
+    private var renderAttempt = 0
+    /// Required zero height while the banner is hidden, so no space is reserved for it.
+    private var bannerCollapse: NSLayoutConstraint?
 
     private init(doc: EMLDocument, url: URL) {
         self.doc = doc
@@ -90,9 +93,12 @@ final class EMLWindowController: NSWindowController, NSWindowDelegate, WKNavigat
         sep.boxType = .separator
 
         banner.isHidden = true
+        let bannerCollapse = banner.heightAnchor.constraint(equalToConstant: 0)
+        bannerCollapse.isActive = true
+        self.bannerCollapse = bannerCollapse
         let parts = doc.structure.attachments()
         attachmentBar.set(parts)
-        attachmentBar.isHidden = parts.isEmpty
+        attachmentBar.setCollapsed(parts.isEmpty)
         attachmentBar.onSave = { [weak self] p in self?.save(p) }
         attachmentBar.onSaveAll = { [weak self] in self?.saveAll() }
         attachmentBar.onQuickLook = { [weak self] p in self?.quickLook(p) }
@@ -122,8 +128,6 @@ final class EMLWindowController: NSWindowController, NSWindowDelegate, WKNavigat
         subject.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         from.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         to.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        let attachHeight = attachmentBar.heightAnchor.constraint(equalToConstant: 0)
-        attachHeight.isActive = parts.isEmpty
         NSLayoutConstraint.activate([
             subject.topAnchor.constraint(equalTo: content.topAnchor, constant: 16),
             subject.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 20),
@@ -159,6 +163,23 @@ final class EMLWindowController: NSWindowController, NSWindowDelegate, WKNavigat
 
     private func render() {
         guard let web else { return }
+        // Fail closed like the reading pane: nothing renders until the remote-load block list is attached.
+        // The wait is capped at ~2 s; after that the CSP meta alone guards the render (C-24).
+        if PreviewViewController.ruleList == nil, !PreviewViewController.ruleListFailed {
+            guard renderAttempt < 100 else {
+                Debug.log("content rule list unavailable after 2 s; rendering with CSP only")
+                PreviewViewController.ruleListFailed = true
+                renderAttempt = 0
+                return render()
+            }
+            renderAttempt += 1
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.02) { [weak self] in
+                guard let self, self.web != nil else { return }
+                self.render()
+            }
+            return
+        }
+        renderAttempt = 0
         generation += 1
         let (html, text) = doc.bodies()
         let prepared = HTMLPrep.prepare(html: html, text: text, clip: false, page: generation)
@@ -173,10 +194,21 @@ final class EMLWindowController: NSWindowController, NSWindowDelegate, WKNavigat
         page.dark = window?.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
         loader.page = page
         if prepared.hasRemoteImages && !loadImages {
-            banner.show(text: "Images from the internet aren't loaded in saved messages.",
-                        actions: [("Load images", { [weak self] in self?.loadImages = true; self?.banner.isHidden = true; self?.render() })])
+            showBanner(text: "Images from the internet aren't loaded in saved messages.",
+                       actions: [("Load images", { [weak self] in self?.loadImages = true; self?.hideBanner(); self?.render() })])
         }
         web.loadHTMLString(prepared.html, baseURL: URL(string: "lm://message/0/"))
+    }
+
+    private func showBanner(text: String, actions: [(String, () -> Void)]) {
+        bannerCollapse?.isActive = false
+        banner.isHidden = false
+        banner.show(text: text, actions: actions)
+    }
+
+    private func hideBanner() {
+        banner.isHidden = true
+        bannerCollapse?.isActive = true
     }
 
     // MARK: Actions
@@ -201,12 +233,22 @@ final class EMLWindowController: NSWindowController, NSWindowDelegate, WKNavigat
     }
 
     private func save(_ part: BodyPart) {
-        guard let window, let data = doc.data(for: part) else { return }
+        guard let window else { return }
         let panel = NSSavePanel()
         panel.nameFieldStringValue = part.suggestedFilename
-        panel.beginSheetModal(for: window) { resp in
-            guard resp == .OK, let dest = panel.url else { return }
-            do { try data.write(to: dest, options: .atomic) } catch { NSAlert(error: error).beginSheetModal(for: window, completionHandler: nil) }
+        panel.beginSheetModal(for: window) { [weak self] resp in
+            guard resp == .OK, let dest = panel.url, let doc = self?.doc else { return }
+            Task { @MainActor in
+                do {
+                    // Decode (base64 can be tens of MB) and write off the main thread.
+                    try await Task.detached(priority: .userInitiated) {
+                        guard let data = doc.data(for: part) else { throw NetError.server("The attachment is empty.") }
+                        try data.write(to: dest, options: .atomic)
+                    }.value
+                } catch {
+                    NSAlert(error: error).beginSheetModal(for: window, completionHandler: nil)
+                }
+            }
         }
     }
 
@@ -217,13 +259,20 @@ final class EMLWindowController: NSWindowController, NSWindowDelegate, WKNavigat
         panel.canChooseFiles = false
         panel.canCreateDirectories = true
         panel.prompt = "Save Attachments Here"
-        panel.beginSheetModal(for: window) { [doc] resp in
-            guard resp == .OK, let dir = panel.url else { return }
-            var used = Set<String>()
-            for p in doc.structure.attachments() {
-                guard let data = doc.data(for: p) else { continue }
-                let name = PreviewViewController.uniqueName(p.suggestedFilename, used: &used)
-                try? data.write(to: dir.appendingPathComponent(name), options: .withoutOverwriting)
+        panel.beginSheetModal(for: window) { [weak self] resp in
+            guard resp == .OK, let dir = panel.url, let doc = self?.doc else { return }
+            Task { @MainActor in
+                var used = Set<String>()
+                let named = doc.structure.attachments().map {
+                    (part: $0, name: PreviewViewController.uniqueName($0.suggestedFilename, used: &used))
+                }
+                // Write every attachment off the main thread.
+                await Task.detached(priority: .userInitiated) {
+                    for (p, name) in named {
+                        guard let data = doc.data(for: p) else { continue }
+                        try? data.write(to: dir.appendingPathComponent(name), options: .withoutOverwriting)
+                    }
+                }.value
             }
         }
     }
@@ -231,16 +280,23 @@ final class EMLWindowController: NSWindowController, NSWindowDelegate, WKNavigat
     private var quickLookDir: URL?
 
     private func quickLook(_ part: BodyPart) {
-        guard let data = doc.data(for: part) else { return }
-        if let old = quickLookDir { try? FileManager.default.removeItem(at: old) }
+        let doc = doc
         let dir = AppPaths.tempDir("quicklook")
-        quickLookDir = dir
         let file = dir.appendingPathComponent(part.suggestedFilename)
-        do {
-            try data.write(to: file)
-            QuickLookController.shared.show(file)
-        } catch {
-            NSSound.beep()
+        Task { @MainActor in
+            do {
+                // Decode and write off the main thread.
+                try await Task.detached(priority: .userInitiated) {
+                    guard let data = doc.data(for: part) else { throw NetError.server("The attachment is empty.") }
+                    try data.write(to: file, options: .atomic)
+                }.value
+                if let old = quickLookDir { try? FileManager.default.removeItem(at: old) }
+                quickLookDir = dir
+                QuickLookController.shared.show(file)
+            } catch {
+                try? FileManager.default.removeItem(at: dir)
+                NSSound.beep()
+            }
         }
     }
 
@@ -266,9 +322,16 @@ final class EMLWindowController: NSWindowController, NSWindowDelegate, WKNavigat
     func windowWillClose(_ notification: Notification) {
         loader.cancelAll()
         loader.page = nil
-        web?.removeFromSuperview()
+        if let web {
+            web.stopLoading()
+            web.navigationDelegate = nil
+            web.removeFromSuperview()
+        }
         web = nil
+        // Close Quick Look before deleting its temp file, so it never previews a deleted attachment.
+        if quickLookDir != nil { QuickLookController.shared.close() }
         if let d = quickLookDir { try? FileManager.default.removeItem(at: d) }
+        quickLookDir = nil
         Self.open[url.standardizedFileURL] = nil
     }
 }
