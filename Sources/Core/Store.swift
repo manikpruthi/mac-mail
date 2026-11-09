@@ -137,14 +137,18 @@ final class Store {
     }
 
     /// Indexes cached bodies that predate body_fts (B-38). Only rows missing from the index are touched.
+    /// Bodies are read one at a time inside the transaction: holding every unindexed body's text in memory
+    /// at once could spike to the whole body cache (RAM constraint).
     private func backfillBodyIndex() {
-        var pending: [(Int64, String?, String?)] = []
-        db.query("SELECT message_id, html, text FROM bodies WHERE message_id NOT IN (SELECT rowid FROM body_fts)") {
-            pending.append(($0.int64(0), $0.string(1), $0.string(2)))
+        var pending: [Int64] = []
+        db.query("SELECT message_id FROM bodies WHERE message_id NOT IN (SELECT rowid FROM body_fts)") {
+            pending.append($0.int64(0))
         }
         guard !pending.isEmpty else { return }
         db.transaction {
-            for (id, html, text) in pending {
+            for id in pending {
+                var html: String?, text: String?
+                db.query("SELECT html, text FROM bodies WHERE message_id=?", [id]) { html = $0.string(0); text = $0.string(1) }
                 let body = Self.indexText(html: html, text: text)
                 if !body.isEmpty { db.run("INSERT INTO body_fts(rowid, body) VALUES (?,?)", [id, body]) }
             }
@@ -761,22 +765,6 @@ final class Store {
 
     var cachedMessageCount: Int { Int(db.scalarInt("SELECT COUNT(*) FROM messages") ?? 0) }
     var cachedBodyCount: Int { Int(db.scalarInt("SELECT COUNT(*) FROM bodies") ?? 0) }
-
-    /// Drops every cached body (they are re-fetched on demand); headers and queued actions stay.
-    func clearBodyCache() {
-        db.transaction {
-            db.run("DELETE FROM bodies")
-            db.run("DELETE FROM body_fts")
-            db.run("UPDATE messages SET snippet=''")
-        }
-        // Compacting a multi-gigabyte cache is real I/O; the rows are already gone, so compact on its own
-        // connection instead of freezing the window (O-09 pattern).
-        let path = self.path
-        DispatchQueue.global(qos: .utility).async {
-            guard let db = try? SQLiteDB(path: path) else { return }
-            try? db.exec("VACUUM")
-        }
-    }
 
     // MARK: Search and contacts
 
