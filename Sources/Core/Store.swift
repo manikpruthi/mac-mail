@@ -68,7 +68,42 @@ final class Store {
         if db.userVersion < 3 { try migrate_2_to_3() }
         if db.userVersion < 4 { try migrate_3_to_4() }
         if db.userVersion < 5 { try migrate_4_to_5() }
+        try upgradeHeaderIndex()
         db.run("PRAGMA user_version=5")
+    }
+
+    /// The header index gains Cc (W-02), so `from:`/`to:`/`cc:`/`subject:` filters are answered by the index
+    /// instead of a leading-wildcard LIKE that reads every cached message. Guarded by the table's own shape
+    /// rather than user_version, so it runs exactly once per database and is idempotent if interrupted.
+    private func upgradeHeaderIndex() throws {
+        guard !db.columnExists(table: "fts", column: "cc_list") else { return }
+        try db.transactionChecked {
+            // One transaction: dropping the index without rebuilding it would break search until relaunch.
+            try db.exec("""
+                DROP TRIGGER IF EXISTS msg_ai;
+                DROP TRIGGER IF EXISTS msg_ad;
+                DROP TRIGGER IF EXISTS msg_au;
+                DROP TABLE IF EXISTS fts;
+                CREATE VIRTUAL TABLE fts USING fts5(
+                    subject, from_name, from_addr, to_list, cc_list, snippet, content='messages',
+                    content_rowid='id', tokenize='unicode61 remove_diacritics 2');
+                CREATE TRIGGER msg_ai AFTER INSERT ON messages BEGIN
+                    INSERT INTO fts(rowid, subject, from_name, from_addr, to_list, cc_list, snippet)
+                    VALUES (new.id, new.subject, new.from_name, new.from_addr, new.to_list, new.cc_list, new.snippet);
+                END;
+                CREATE TRIGGER msg_ad AFTER DELETE ON messages BEGIN
+                    INSERT INTO fts(fts, rowid, subject, from_name, from_addr, to_list, cc_list, snippet)
+                    VALUES ('delete', old.id, old.subject, old.from_name, old.from_addr, old.to_list, old.cc_list, old.snippet);
+                END;
+                CREATE TRIGGER msg_au AFTER UPDATE OF subject, snippet, from_name, from_addr, to_list, cc_list ON messages BEGIN
+                    INSERT INTO fts(fts, rowid, subject, from_name, from_addr, to_list, cc_list, snippet)
+                    VALUES ('delete', old.id, old.subject, old.from_name, old.from_addr, old.to_list, old.cc_list, old.snippet);
+                    INSERT INTO fts(rowid, subject, from_name, from_addr, to_list, cc_list, snippet)
+                    VALUES (new.id, new.subject, new.from_name, new.from_addr, new.to_list, new.cc_list, new.snippet);
+                END;
+                INSERT INTO fts(fts) VALUES('rebuild');
+                """)
+        }
     }
 
     /// v4 → v5: index maintenance that cascade deletes used to skip, header FTS that follows sender/recipient
@@ -170,11 +205,10 @@ final class Store {
                 DELETE FROM contacts WHERE email=old.from_addr AND count<=0;
             END;
             """)
-        // Seed contacts from what's already cached (triggers didn't exist before this migration).
-        db.run("""
-            INSERT INTO contacts(email, name, count) SELECT from_addr, from_name, COUNT(*) FROM messages GROUP BY from_addr
-            ON CONFLICT(email) DO UPDATE SET count=count+excluded.count
-            """)
+        // Seed contacts from what's already cached (triggers didn't exist before this migration). Recomputed,
+        // never added: a migration that has to re-run must not inflate the counts.
+        db.run("DELETE FROM contacts")
+        db.run("INSERT INTO contacts(email, name, count) SELECT from_addr, MAX(from_name), COUNT(*) FROM messages GROUP BY from_addr")
         backfillBodyIndex()
     }
 
@@ -291,11 +325,23 @@ final class Store {
                [uidValidity, uidValidity, uidNext, modseq, id])
     }
 
+    /// Throwing form: sync must not treat the folder as caught up when the state write failed (C-10).
+    func updateFolderStateChecked(_ id: Int64, uidValidity: UInt32, uidNext: UInt32, modseq: UInt64) throws {
+        try db.runChecked("UPDATE folders SET uidvalidity=CASE WHEN ?!=0 THEN ? ELSE uidvalidity END, uidnext=?, modseq=? WHERE id=?",
+                          [uidValidity, uidValidity, uidNext, modseq, id])
+    }
+
     func resetFolder(_ id: Int64) {
+        var account = "", path = ""
+        db.query("SELECT account, path FROM folders WHERE id=?", [id]) { account = $0.text(0); path = $0.text(1) }
         // Stale UIDs must never be applied to a recreated folder: drop its queued actions too.
-        db.run("DELETE FROM pending_ops WHERE folder_id=?", [id])
-        db.run("DELETE FROM messages WHERE folder_id=?", [id])
-        db.run("UPDATE folders SET uidvalidity=0, uidnext=0, modseq=0 WHERE id=?", [id])
+        db.transaction {
+            db.run("DELETE FROM pending_ops WHERE folder_id=?", [id])
+            // Ops queued by builds before v2 have no folder id; they still name the folder by path.
+            db.run("DELETE FROM pending_ops WHERE folder_id=0 AND account=? AND folder_path=?", [account, path])
+            db.run("DELETE FROM messages WHERE folder_id=?", [id])
+            db.run("UPDATE folders SET uidvalidity=0, uidnext=0, modseq=0 WHERE id=?", [id])
+        }
     }
 
     func deleteAccount(_ account: String) {
@@ -317,8 +363,34 @@ final class Store {
         return folder(account: account, path: path)
     }
 
+    /// Renames a folder and repoints everything that stored its path (C-28): queued actions for the folder,
+    /// queued moves whose destination it is, and child folders under the old prefix — a child was renamed
+    /// with its parent on the server, so its cache and queued actions must follow, not be pruned as stale.
     func renameFolder(_ id: Int64, path: String, name: String) {
-        db.run("UPDATE folders SET path=?, name=? WHERE id=?", [path, name, id])
+        db.transaction {
+            var oldPath = "", account = "", delim = "/"
+            db.query("SELECT path, account, delim FROM folders WHERE id=?", [id]) {
+                oldPath = $0.text(0); account = $0.text(1); delim = $0.text(2)
+            }
+            db.run("UPDATE folders SET path=?, name=? WHERE id=?", [path, name, id])
+            db.run("UPDATE pending_ops SET folder_path=? WHERE folder_id=?", [path, id])
+            guard !oldPath.isEmpty, oldPath != path else { return }
+            // Ops queued by builds before v2 carry no folder id; they still name the folder by path.
+            db.run("UPDATE pending_ops SET folder_path=? WHERE folder_id=0 AND account=? AND folder_path=?",
+                   [path, account, oldPath])
+            db.run("UPDATE pending_ops SET arg=? WHERE kind='move' AND account=? AND arg=?", [path, account, oldPath])
+            guard !delim.isEmpty else { return }
+            var children: [(id: Int64, path: String)] = []
+            db.query("SELECT id, path FROM folders WHERE account=? AND path LIKE ? ESCAPE '\\' AND id!=?",
+                     [account, likePrefix(oldPath + delim), id]) { children.append(($0.int64(0), $0.text(1))) }
+            for child in children {
+                let newChild = path + String(child.path.dropFirst(oldPath.count))
+                db.run("UPDATE folders SET path=? WHERE id=?", [newChild, child.id])
+                db.run("UPDATE pending_ops SET folder_path=? WHERE folder_id=?", [newChild, child.id])
+                db.run("UPDATE pending_ops SET arg=? WHERE kind='move' AND account=? AND arg=?",
+                       [newChild, account, child.path])
+            }
+        }
     }
 
     func deleteFolder(_ id: Int64) {
@@ -332,10 +404,17 @@ final class Store {
     // MARK: Messages
 
     func insert(folderID: Int64, _ headers: [ParsedHeader]) {
+        do { try insertChecked(folderID: folderID, headers) }
+        catch { /* logged by SQLiteDB; sync uses the throwing form so it never advances past a gap */ }
+    }
+
+    /// Throwing form: a failed header write must stop sync from moving UIDNEXT past the missing rows (C-10).
+    /// The whole batch is one transaction, so a failure leaves none of it behind for the next sync to skip.
+    func insertChecked(folderID: Int64, _ headers: [ParsedHeader]) throws {
         guard !headers.isEmpty else { return }
-        db.transaction {
+        try db.transactionChecked {
             for h in headers {
-                db.run("""
+                try db.runChecked("""
                     INSERT INTO messages(folder_id, uid, gmsgid, thrid, date, size, flags, has_att, subject, from_name,
                         from_addr, to_list, cc_list, reply_to, message_id, in_reply_to, refs, list_unsub, structure)
                     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
@@ -355,11 +434,19 @@ final class Store {
     /// Applies server flags; returns the UIDs whose flags actually changed (so a no-op sync redraws nothing).
     @discardableResult
     func updateFlags(folderID: Int64, _ changes: [(UInt32, MessageFlags)]) -> [UInt32] {
+        (try? updateFlagsChecked(folderID: folderID, changes)) ?? []
+    }
+
+    /// Throwing form: a failed flag write must keep MODSEQ where it was so the changes are fetched again (C-10).
+    func updateFlagsChecked(folderID: Int64, _ changes: [(UInt32, MessageFlags)]) throws -> [UInt32] {
         guard !changes.isEmpty else { return [] }
         var changed: [UInt32] = []
-        db.transaction {
+        try db.transactionChecked {
             for (uid, f) in changes {
-                db.run("UPDATE messages SET flags=? WHERE folder_id=? AND uid=? AND flags!=?", [f.rawValue, folderID, uid, f.rawValue])
+                // Only count a change the write really made: after a failed statement sqlite3_changes()
+                // still reports the previous one.
+                try db.runChecked("UPDATE messages SET flags=? WHERE folder_id=? AND uid=? AND flags!=?",
+                                  [f.rawValue, folderID, uid, f.rawValue])
                 if db.changes > 0 { changed.append(uid) }
             }
         }
@@ -529,14 +616,10 @@ final class Store {
     }
 
     func saveBody(_ id: Int64, html: String?, text: String?) {
-        db.run("INSERT OR REPLACE INTO bodies(message_id, html, text, fetched) VALUES (?,?,?,?)", [id, html, text, Date()])
-        let snip = MIME.snippet(html: html, text: text)
-        db.run("UPDATE messages SET snippet=? WHERE id=?", [snip, id])
-        // Body text goes into its own full-text index so search finds words deep inside a message.
-        // Capped per message; replaced (never appended) so the index tracks the cache.
-        let body = Self.indexText(html: html, text: text)
-        db.run("DELETE FROM body_fts WHERE rowid=?", [id])
-        if !body.isEmpty { db.run("INSERT INTO body_fts(rowid, body) VALUES (?,?)", [id, body]) }
+        // One transaction through the prepared variant: a body row without its snippet/index would be
+        // half-cached and never repaired.
+        saveBody(id, html: html, text: text, snippet: MIME.snippet(html: html, text: text),
+                 indexText: Self.indexText(html: html, text: text))
     }
 
     /// Saves a body whose snippet and index text were already computed off the main actor (O-03).
@@ -599,7 +682,12 @@ final class Store {
             """, [bodyCacheBytes]) { oldBodies.append($0.int64(0)) }
         for chunk in oldBodies.chunked(500) {
             db.transaction {
-                for id in chunk { db.run("DELETE FROM bodies WHERE message_id=?", [id]) }
+                for id in chunk {
+                    db.run("DELETE FROM bodies WHERE message_id=?", [id])
+                    // A pruned body must leave the full-text index too, or search keeps matching text
+                    // that is no longer cached.
+                    db.run("DELETE FROM body_fts WHERE rowid=?", [id])
+                }
             }
         }
         db.run("PRAGMA optimize")
@@ -681,40 +769,41 @@ final class Store {
             db.run("DELETE FROM body_fts")
             db.run("UPDATE messages SET snippet=''")
         }
-        db.run("VACUUM")
+        // Compacting a multi-gigabyte cache is real I/O; the rows are already gone, so compact on its own
+        // connection instead of freezing the window (O-09 pattern).
+        let path = self.path
+        DispatchQueue.global(qos: .utility).async {
+            guard let db = try? SQLiteDB(path: path) else { return }
+            try? db.exec("VACUUM")
+        }
     }
 
     // MARK: Search and contacts
 
     /// Local search over the offline cache: words via the full-text indexes (headers + body, prefix match),
-    /// operators and filters via SQL.
+    /// operators and filters via SQL. Header filters (from/to/cc/subject) run through the header index too,
+    /// so they never scan every cached message (W-02).
     func search(_ q: SearchQuery, folderID: Int64? = nil, limit: Int = 2000) -> [MessageRow] {
         guard q.hasLocalCriteria else { return [] }
         var sql = "SELECT \(rowCols) FROM messages m JOIN folders f ON f.id=m.folder_id"
         var conds: [String] = []
         var args: [Any?] = []
-        let words = q.words.map { "\"" + $0.replacingOccurrences(of: "\"", with: "") + "\"*" }
+        // A word with no letters or digits tokenizes to nothing, and FTS5 rejects a phrase with no tokens —
+        // which would make the whole MATCH fail and hide every other term's results.
+        let words = q.words
+            .filter { $0.unicodeScalars.contains { CharacterSet.alphanumerics.contains($0) } }
+            .map { "\"" + $0.replacingOccurrences(of: "\"", with: "") + "\"*" }
         if !words.isEmpty {
             let match = words.joined(separator: " ")
             conds.append("(m.id IN (SELECT rowid FROM fts WHERE fts MATCH ?) OR m.id IN (SELECT rowid FROM body_fts WHERE body_fts MATCH ?))")
             args += [match, match]
+        } else if !q.words.isEmpty {
+            conds.append("0") // Only unsearchable words: nothing can match them.
         }
-        for v in q.from {
-            conds.append("(m.from_name LIKE ? ESCAPE '\\' OR m.from_addr LIKE ? ESCAPE '\\')")
-            args += [likePattern(v), likePattern(v)]
-        }
-        for v in q.to {
-            conds.append("(m.to_list LIKE ? ESCAPE '\\' OR m.cc_list LIKE ? ESCAPE '\\')")
-            args += [likePattern(v), likePattern(v)]
-        }
-        for v in q.cc {
-            conds.append("m.cc_list LIKE ? ESCAPE '\\'")
-            args.append(likePattern(v))
-        }
-        for v in q.subject {
-            conds.append("m.subject LIKE ? ESCAPE '\\'")
-            args.append(likePattern(v))
-        }
+        for v in q.from { addHeaderFilter(v, "{from_name from_addr}", &conds, &args) }
+        for v in q.to { addHeaderFilter(v, "{to_list cc_list}", &conds, &args) }
+        for v in q.cc { addHeaderFilter(v, "{cc_list}", &conds, &args) }
+        for v in q.subject { addHeaderFilter(v, "{subject}", &conds, &args) }
         if q.hasAttachment { conds.append("m.has_att = 1") }
         if q.unread { conds.append("(m.flags & 1) = 0") }
         if q.flagged { conds.append("(m.flags & 2) != 0") }
@@ -734,12 +823,21 @@ final class Store {
         return out
     }
 
-    /// LIKE pattern with user wildcards escaped, so "%" and "_" in a query match literally.
-    private func likePattern(_ value: String) -> String {
-        var v = value.replacingOccurrences(of: "\\", with: "\\\\")
+    /// One header filter as an index lookup. A value's words are quoted and prefix-matched, so "ann" finds
+    /// "Ann" and "ann@x.com"; a value with nothing to look for matches nothing (it can never match a word).
+    private func addHeaderFilter(_ value: String, _ columns: String, _ conds: inout [String], _ args: inout [Any?]) {
+        let tokens = value.split(whereSeparator: { !$0.isLetter && !$0.isNumber })
+        guard !tokens.isEmpty else { conds.append("0"); return }
+        conds.append("m.id IN (SELECT rowid FROM fts WHERE fts MATCH ?)")
+        args.append(columns + " : (" + tokens.map { "\"\($0)\"*" }.joined(separator: " AND ") + ")")
+    }
+
+    /// LIKE pattern for "starts with", wildcards escaped (used to find the children of a renamed folder).
+    private func likePrefix(_ prefix: String) -> String {
+        var v = prefix.replacingOccurrences(of: "\\", with: "\\\\")
         v = v.replacingOccurrences(of: "%", with: "\\%")
         v = v.replacingOccurrences(of: "_", with: "\\_")
-        return "%\(v)%"
+        return v + "%"
     }
 
     func contacts(matching prefix: String, limit: Int = 8) -> [EmailAddress] {
@@ -828,8 +926,11 @@ final class Store {
         var uidvalidity: UInt32
     }
 
+    /// Queues a server action. Returns false when it could not be written, so the caller can say so instead of
+    /// letting the action silently disappear (C-10).
+    @discardableResult
     func addOp(account: String, kind: String, folderPath: String, uids: [UInt32], arg: String = "",
-               folderID: Int64 = 0, uidvalidity: UInt32 = 0) {
+               folderID: Int64 = 0, uidvalidity: UInt32 = 0) -> Bool {
         db.run("INSERT INTO pending_ops(account, kind, folder_path, uids, arg, created, folder_id, uidvalidity) VALUES (?,?,?,?,?,?,?,?)",
                [account, kind, folderPath, uids.map(String.init).joined(separator: ","), arg, Date(), folderID, uidvalidity])
     }
