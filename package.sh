@@ -3,9 +3,19 @@
 #   ./package.sh
 # Environment:
 #   MAC_MAIL_SIGN_IDENTITY   Developer ID identity (otherwise ad-hoc)
-#   MAC_MAIL_NOTARY_PROFILE  notarytool keychain profile; when set, the DMG is notarised and stapled
+#   MAC_MAIL_NOTARY_PROFILE  notarytool keychain profile; when set, the DMG is notarised, stapled and verified
 set -euo pipefail
 cd "$(dirname "$0")"
+
+# Notarisation needs a Developer ID signature: fail before the long build when the pair is incomplete.
+if [ -n "${MAC_MAIL_NOTARY_PROFILE:-}" ]; then
+    case "${MAC_MAIL_SIGN_IDENTITY:-}" in
+        ""|-)
+            echo "error: MAC_MAIL_NOTARY_PROFILE is set but MAC_MAIL_SIGN_IDENTITY is not a Developer ID identity" >&2
+            exit 1
+            ;;
+    esac
+fi
 
 VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' Resources/Info.plist)"
 APP_NAME="Mac Mail"
@@ -46,8 +56,23 @@ codesign --verify --strict "$MOUNT/$APP_NAME.app"
 hdiutil detach "$MOUNT" -quiet
 
 if [ -n "${MAC_MAIL_NOTARY_PROFILE:-}" ]; then
+    # Notarisation only accepts a Developer ID Application signature (the pair was checked before the build).
+    SIGNATURE="$(codesign --display --verbose=4 "$APP" 2>&1 || true)"
+    case "$SIGNATURE" in
+        *"Authority=Developer ID Application"*) ;;
+        *) echo "error: MAC_MAIL_NOTARY_PROFILE needs a Developer ID Application signature" >&2; exit 1 ;;
+    esac
+    echo "Notarising $(basename "$DMG")…"
     xcrun notarytool submit "$DMG" --keychain-profile "$MAC_MAIL_NOTARY_PROFILE" --wait
     xcrun stapler staple "$DMG"
+    # The ticket belongs to the image: validate it, then let Gatekeeper assess the app on the mounted image.
+    xcrun stapler validate "$DMG"
+    hdiutil attach "$DMG" -nobrowse -readonly -mountpoint "$MOUNT" -quiet
+    codesign --verify --strict "$MOUNT/$APP_NAME.app"
+    spctl --assess --type execute --verbose=2 "$MOUNT/$APP_NAME.app"
+    hdiutil detach "$MOUNT" -quiet
+else
+    echo "note: not notarised — set MAC_MAIL_NOTARY_PROFILE (with a Developer ID identity) to notarise and staple"
 fi
 
 (cd "$RELEASE_DIR" && shasum -a 256 "$(basename "$DMG")" > "$(basename "$DMG").sha256")
