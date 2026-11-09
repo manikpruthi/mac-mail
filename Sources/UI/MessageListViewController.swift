@@ -30,6 +30,9 @@ final class MessageListViewController: NSViewController, NSOutlineViewDataSource
     private(set) var source: MailSource = .unified
     private(set) var grouped = false
     private var searchRows: [MessageRow] = []
+    /// Message ids the last finished server search contributed; re-merged on live refreshes so
+    /// a cache-only refresh doesn't drop server hits (F-16).
+    private var serverHitIDs: [Int64] = []
     private var serverSearching = false
     private var serverSearchError: String?
     private let filterBar = SearchFilterBar()
@@ -155,7 +158,7 @@ final class MessageListViewController: NSViewController, NSOutlineViewDataSource
         allCaughtUp = false
         fetchLimit = Self.pageSize
         setFilterBarVisible(false)
-        if case .search = source {} else { searchRows = [] }
+        if case .search = source {} else { searchRows = []; serverHitIDs = [] }
         grouped = Prefs.groupByConversation(folderKey: folderKey)
         groupToggle.state = grouped ? .on : .off
         // A "Load older" still in flight belongs to the folder being left (W-17).
@@ -208,11 +211,14 @@ final class MessageListViewController: NSViewController, NSOutlineViewDataSource
         }
     }
 
-    /// Re-runs the local search for the live results. Search rows come from here, not from reload(),
-    /// because a finished server search replaces them with its merged result.
+    /// Re-runs the local search for the live results and re-merges the server hits. Search rows come
+    /// from here, not from reload(), because a finished server search replaces them with its merged result.
     private func refreshSearchRows() {
         guard case .search = source else { return }
-        searchRows = Self.dedupe(MailService.shared.store.search(currentQuery, folderID: scopeFolderID))
+        var merged = MailService.shared.store.search(currentQuery, folderID: scopeFolderID)
+            + MailService.shared.store.rows(ids: serverHitIDs)
+        merged.sort { $0.date > $1.date }
+        searchRows = Array(Self.dedupe(merged).prefix(2000))
     }
 
     /// Whether the current view's membership depends on read/flag state (All Flagged, is:unread, is:starred).
@@ -633,6 +639,7 @@ final class MessageListViewController: NSViewController, NSOutlineViewDataSource
         fetchLimit = Self.pageSize
         // Any query change invalidates an in-flight server search for the older query.
         searchToken += 1
+        serverHitIDs = []
         searchRows = Self.dedupe(MailService.shared.store.search(currentQuery, folderID: scopeFolderID))
         grouped = Prefs.groupByConversation(folderKey: "search")
         groupToggle.state = grouped ? .on : .off
@@ -650,6 +657,7 @@ final class MessageListViewController: NSViewController, NSOutlineViewDataSource
         // A filter change invalidates an in-flight server search for the old filters (B-18).
         searchToken += 1
         serverSearching = false
+        serverHitIDs = []
         fetchLimit = Self.pageSize
         searchRows = Self.dedupe(MailService.shared.store.search(currentQuery, folderID: scopeFolderID))
         let hadSelection = !outline.selectedRowIndexes.isEmpty
@@ -689,6 +697,7 @@ final class MessageListViewController: NSViewController, NSOutlineViewDataSource
             guard token == searchToken, case .search = source else { return }
             serverSearching = false
             serverSearchError = errors.first
+            serverHitIDs = ids
             // Local results are fetched with a wide window and capped only after merging, so older local
             // matches aren't dropped in favour of server hits (O-20).
             var merged = store.search(q, folderID: scopeID, limit: 2000) + store.rows(ids: ids)
