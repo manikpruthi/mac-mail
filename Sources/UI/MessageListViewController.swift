@@ -701,7 +701,10 @@ final class MessageListViewController: NSViewController, NSOutlineViewDataSource
             serverHitIDs = ids
             // Local results are fetched with a wide window and capped only after merging, so older local
             // matches aren't dropped in favour of server hits (O-20).
-            var merged = store.search(q, folderID: scopeID, limit: 2000) + store.rows(ids: ids)
+            // Server hits come back by id, so they pass the same live read/flag filter as a re-merge:
+            // a read message must not show under is:unread.
+            var merged = store.search(q, folderID: scopeID, limit: 2000)
+                + store.rows(ids: ids).filter { flagsMatchSource($0.flags) }
             merged.sort { $0.date > $1.date }
             searchRows = Array(Self.dedupe(merged).prefix(2000))
             reload(keepSelection: true)

@@ -364,7 +364,9 @@ final class MailService {
     func emptyFolder(_ folder: Folder) async throws {
         guard let e = engines[folder.accountID] else { throw NetError.server("Account not found") }
         if e.isDemo {
-            store.deleteMessages(folderID: folder.id, uids: store.localUIDs(folderID: folder.id))
+            guard store.deleteMessages(folderID: folder.id, uids: store.localUIDs(folderID: folder.id)) else {
+                throw NetError.server("The mail cache couldn't be updated.")
+            }
             NotificationCenter.default.postMailDataChanged(.folder(folder.id))
         } else {
             try await e.emptyFolder(folder)
@@ -469,9 +471,15 @@ final class MailService {
     }
 
     private func afterSent(engine: AccountEngine, safetyDraft: MessageRow?, replyTo: MessageRow?, draftToDelete: MessageRow?) {
-        if let d = safetyDraft { store.deleteMessages(ids: [d.id]); engine.queue(.expunge, rows: [d]) }
+        // The server copies are expunged either way. A draft row the cache couldn't drop is recorded,
+        // and goes when the next Drafts sync sees it missing on the server.
+        var cacheOK = true
+        if let d = safetyDraft { engine.queue(.expunge, rows: [d]); cacheOK = store.deleteMessages(ids: [d.id]) && cacheOK }
         if let r = replyTo { setFlag([r], flag: .answered, on: true) }
-        if let d = draftToDelete { engine.queue(.expunge, rows: [d]); store.deleteMessages(ids: [d.id]) }
+        if let d = draftToDelete { engine.queue(.expunge, rows: [d]); cacheOK = store.deleteMessages(ids: [d.id]) && cacheOK }
+        if !cacheOK {
+            DiagnosticsLog.record("\(engine.account.email): the sent message's draft couldn't be removed from the mail cache; it will go on the next Drafts sync.")
+        }
     }
 
     /// Connection-level failures (no route, timeout, closed) mean "try later"; refusals and auth errors don't.

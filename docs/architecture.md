@@ -39,7 +39,8 @@ over TLS; capabilities are asked for again.
    Moves/deletes first wait out an 8 s Undo window (`MailService.undoables`, restored from `Store.Snapshot`).
    Empty Trash/Spam flags every message and uses `UID EXPUNGE` where the server has UIDPLUS; without it a
    bare `EXPUNGE` runs only when the server's `\Deleted` set is exactly the UIDs just flagged (the ones
-   present when the command started); on a mismatch the flags it added are taken back.
+   present when the command started). ALL is snapshotted before DELETED, only messages not already
+   `\Deleted` are flagged, and any failure (STORE chunk, search, mismatch, EXPUNGE) takes back exactly those flags.
 3. **Sending** — `MailService.queueSend`: *waiting* (undoable) → *uploading* → done. A safety draft is
    appended while uploading; connection failures move the finished MIME into the `Outbox` folder on disk.
    Each record (`item.json` plus `message.eml`) is written into a `.tmp` staging folder, renamed into place
@@ -61,7 +62,9 @@ are ordered in memory and paged. `Store+Maintenance` reads the Storage figures a
 search cache on their own connections, off the main thread. Pruning runs on its own connection too.
 `SQLiteDB.transaction` reports whether the batch committed; folder-list saves, renames, flag changes and
 local deletes stop (and say so) instead of carrying on as if a skipped write had landed. A cached folder is
-pruned only after two consecutive LIST replies omit it.
+pruned only after two consecutive LIST replies omit it, and a miss is recorded only after the folder-list save
+committed. `AccountEngine.client` checks a connection epoch after every suspension, so a reset or shutdown
+never hands out a connection opened with the old settings.
 
 ## Rendering
 

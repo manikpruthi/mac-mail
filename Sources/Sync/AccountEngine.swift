@@ -70,6 +70,7 @@ final class AccountEngine {
         passwordTask = nil
         idleTask?.cancel()
         idleTask = nil
+        connectionEpoch += 1
         for t in connecting.values { t.cancel() }
         connecting.removeAll()
         let all = clients.values
@@ -88,15 +89,27 @@ final class AccountEngine {
 
     // MARK: Connections
 
+    /// Bumped whenever the connections are dropped (reset or shutdown). client() re-checks it after every
+    /// suspension, so no caller can be handed a connection opened with the old settings.
+    private var connectionEpoch = 0
+
     func client(_ lane: Lane) async throws -> IMAPClient {
+        let epoch = connectionEpoch
         if let c = clients[lane] {
-            if await c.isConnected { return c }
+            let alive = await c.isConnected
+            guard epoch == connectionEpoch else { throw CancellationError() }
+            if alive { return c }
             // The old connection died (sleep/wake, server restart): close it before opening a new one,
             // instead of leaving its socket to the garbage collector.
-            clients[lane] = nil
+            if clients[lane] === c { clients[lane] = nil }
             Task { await c.disconnect() }
         }
-        if let pending = connecting[lane] { return try await pending.value }
+        if let pending = connecting[lane] {
+            // A caller that joined an in-flight connect is checked too; the creator closes the connection.
+            let c = try await pending.value
+            guard epoch == connectionEpoch else { throw CancellationError() }
+            return c
+        }
         // Publish the connecting task before anything can suspend, so a second caller shares this
         // connection instead of opening a second one.
         let a = account
@@ -113,13 +126,19 @@ final class AccountEngine {
             let c = try await task.value
             // The engine was shut down or its connections were reset while this one was opening: it
             // belongs to the old settings, so close it instead of keeping it.
-            guard connecting[lane] == task else {
+            guard epoch == connectionEpoch, connecting[lane] == task else {
                 Task { await c.disconnect() }
                 throw CancellationError()
             }
             Debug.log("\(lane) connection ready: \(Debug.ms(since: t0))")
             clients[lane] = c
-            isGmail = await c.isGmail
+            let gmail = await c.isGmail
+            // A reset can land during that hop too; it already dropped `c` from `clients`.
+            guard epoch == connectionEpoch else {
+                Task { await c.disconnect() }
+                throw CancellationError()
+            }
+            isGmail = gmail
             // Only now is it safe to clear: anyone who arrived while we were waiting already holds the task.
             connecting[lane] = nil
             return c
@@ -169,6 +188,7 @@ final class AccountEngine {
         idleTask = nil
         searchTask?.cancel()
         searchTask = nil
+        connectionEpoch += 1
         for t in connecting.values { t.cancel() }
         connecting.removeAll()
         let all = clients.values
@@ -404,18 +424,23 @@ final class AccountEngine {
                     // Only the cached UIDs are asked about, 1,000 per command, so the reply is bounded by
                     // the cache, not the mailbox: `UID min:*` on a big Inbox returned one >1 MB line, which
                     // dropped the connection on every sync and left queued actions stuck.
+                    var gone: [UInt32] = []
                     do {
                         let local = store.localUIDs(folderID: folderID).sorted()
                         var present = Set<UInt32>()
                         for chunk in local.chunked(1000) {
                             present.formUnion(try await c.uidSearch("UID \(imapUIDSet(chunk))"))
                         }
-                        let gone = local.filter { !present.contains($0) }
-                        if !gone.isEmpty {
-                            store.deleteMessages(folderID: folderID, uids: gone)
-                            rowsChanged = true
-                        }
+                        gone = local.filter { !present.contains($0) }
                     } catch { report(error) }
+                    if !gone.isEmpty {
+                        // A failed cache delete stops the sync here: the folder state must not advance
+                        // past rows that are still cached, and the failure is reported, not hidden.
+                        guard store.deleteMessages(folderID: folderID, uids: gone) else {
+                            throw NetError.server("Messages removed on the server couldn't be removed from the mail cache.")
+                        }
+                        rowsChanged = true
+                    }
                 }
                 // MODSEQ only advances when the flag stage succeeded, so missed flag changes re-fetch.
                 try store.updateFolderStateChecked(folderID, uidValidity: info.uidValidity,
@@ -722,9 +747,10 @@ final class AccountEngine {
             let c = try await client(.sync)
             try await c.deleteMailbox(folder.path)
         }
-        store.deleteFolder(folder.id)
+        let removed = store.deleteFolder(folder.id)
         NotificationCenter.default.post(name: .mailFoldersChanged, object: self)
         NotificationCenter.default.postMailDataChanged(.all)
+        if !removed { throw NetError.server("The folder was deleted on the server, but the mail cache couldn't be updated.") }
     }
 
     func setSubscribed(_ folder: Folder, _ on: Bool) async throws {
@@ -742,7 +768,9 @@ final class AccountEngine {
             try self.verifySelection(try await c.ensureSelected(folder.path, readOnly: false), folder: folder)
             try await c.expungeAll()
         }
-        store.deleteMessages(folderID: folder.id, uids: store.localUIDs(folderID: folder.id))
+        guard store.deleteMessages(folderID: folder.id, uids: store.localUIDs(folderID: folder.id)) else {
+            throw NetError.server("The folder was emptied on the server, but the mail cache couldn't be updated.")
+        }
         store.setServerUnread(folderID: folder.id, 0)
         NotificationCenter.default.postMailDataChanged(.folder(folder.id))
     }

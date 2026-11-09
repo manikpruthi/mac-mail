@@ -285,7 +285,8 @@ final class Store {
     /// live mail and queued actions. Returns false when nothing was saved.
     @discardableResult
     func upsertFolders(account: String, _ listed: [ListedFolder], isGmail: Bool) -> Bool {
-        db.transaction {
+        var nowMissing: Set<String>?
+        let saved = db.transaction {
             var keep = Set<String>()
             for f in listed {
                 keep.insert(f.path)
@@ -302,7 +303,7 @@ final class Store {
                 if !keep.contains($0.text(1)) { stale.append(($0.int64(0), $0.text(1))) }
             }
             let missedBefore = missingFolders[account] ?? []
-            missingFolders[account] = Set(stale.map { $0.path })
+            nowMissing = Set(stale.map { $0.path })
             for (id, path) in stale where missedBefore.contains(path) {
                 db.run("DELETE FROM pending_ops WHERE folder_id=?", [id])
                 // Explicit delete so the FTS/contacts triggers run for every message (B-14).
@@ -310,6 +311,10 @@ final class Store {
                 db.run("DELETE FROM folders WHERE id=?", [id])
             }
         }
+        // A miss only counts once the list was really saved: a rolled-back save must not bring a
+        // folder one step closer to being pruned.
+        if saved, let nowMissing { missingFolders[account] = nowMissing }
+        return saved
     }
 
     static func displayName(_ f: ListedFolder, isGmail: Bool) -> String {
@@ -409,7 +414,9 @@ final class Store {
         }
     }
 
-    func deleteFolder(_ id: Int64) {
+    /// Returns false when the cache couldn't be changed (nothing was removed).
+    @discardableResult
+    func deleteFolder(_ id: Int64) -> Bool {
         db.transaction {
             db.run("DELETE FROM pending_ops WHERE folder_id=?", [id])
             db.run("DELETE FROM messages WHERE folder_id=?", [id])
@@ -482,9 +489,11 @@ final class Store {
         }
     }
 
-    func deleteMessages(folderID: Int64, uids: [UInt32]) {
-        guard !uids.isEmpty else { return }
-        db.transaction {
+    /// Returns false when the cache couldn't be changed (nothing was removed).
+    @discardableResult
+    func deleteMessages(folderID: Int64, uids: [UInt32]) -> Bool {
+        guard !uids.isEmpty else { return true }
+        return db.transaction {
             for u in uids { db.run("DELETE FROM messages WHERE folder_id=? AND uid=?", [folderID, u]) }
         }
     }

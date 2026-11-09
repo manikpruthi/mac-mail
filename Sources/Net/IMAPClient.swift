@@ -351,22 +351,39 @@ actor IMAPClient {
         } else {
             // Without UIDPLUS a bare EXPUNGE would also purge messages another client flagged \Deleted;
             // expunge only when the pending deletions are exactly the ones we just made.
-            let before = Set(try await uidSearch("DELETED"))
+            // ALL is snapshotted first: a message that arrives after it is in neither set, and one that
+            // another client deleted before the DELETED snapshot is in `before`, so it is never taken
+            // for a flag this command added.
             let ours = try await uidSearch("ALL")
             guard !ours.isEmpty else { return }
-            // Only the snapshot is flagged, never 1:*, so mail that arrives meanwhile is left alone.
-            for chunk in ours.chunked(1000) { try await run("UID STORE \(imapUIDSet(chunk)) +FLAGS.SILENT (\\Deleted)") }
-            let deleted = Set(try await uidSearch("DELETED"))
-            guard deleted == Set(ours) else {
-                // A message arrived already deleted by another client. Take back only the flags this
-                // command added (theirs stay), so a later EXPUNGE from any client can't purge the folder
-                // after the user was told it failed.
-                let mine = ours.filter { !before.contains($0) }
-                for chunk in mine.chunked(1000) { _ = try? await run("UID STORE \(imapUIDSet(chunk)) -FLAGS.SILENT (\\Deleted)") }
-                // Not expunged: reporting success here would tell the user the folder is empty when it isn't.
-                throw NetError.server("The folder changed while it was being emptied. Try again.")
+            let before = Set(try await uidSearch("DELETED"))
+            // Only the snapshot is flagged, never 1:*, so mail that arrives meanwhile is left alone;
+            // messages another client already flagged are not flagged again.
+            let mine = ours.filter { !before.contains($0) }
+            var marked: [UInt32] = []
+            do {
+                for chunk in mine.chunked(1000) {
+                    // Recorded before the command: a STORE that fails may still have been applied.
+                    marked += chunk
+                    try await run("UID STORE \(imapUIDSet(chunk)) +FLAGS.SILENT (\\Deleted)")
+                }
+                let deleted = Set(try await uidSearch("DELETED"))
+                // A message arrived already deleted by another client. Not expunged: reporting success
+                // here would tell the user the folder is empty when it isn't.
+                guard deleted == Set(ours) else {
+                    throw NetError.server("The folder changed while it was being emptied. Try again.")
+                }
+                try await run("EXPUNGE", timeout: 300)
+            } catch {
+                // Any failure (a chunk STORE, the DELETED search, the EXPUNGE or the mismatch above):
+                // take back only the flags this command added (theirs stay), so a later EXPUNGE from any
+                // client can't purge the folder after the user was told it failed. Best effort: on a dead
+                // connection there is nothing left to send.
+                for chunk in marked.chunked(1000) {
+                    _ = try? await run("UID STORE \(imapUIDSet(chunk)) -FLAGS.SILENT (\\Deleted)")
+                }
+                throw error
             }
-            try await run("EXPUNGE", timeout: 300)
         }
     }
 

@@ -626,6 +626,11 @@ MainActor.assumeIsolated {
     store.upsertFolders(account: "f", Array(full.prefix(3)), isGmail: false)
     check("two LISTs in a row prune the folder", store.folder(account: "f", path: "C") == nil
           && store.folder(account: "f", path: "B") != nil)
+    // H-03: the folder-scoped deletes report their result.
+    if let b = store.folder(account: "f", path: "B") {
+        check("deleting no UIDs succeeds", store.deleteMessages(folderID: b.id, uids: []))
+        check("deleteFolder reports success", store.deleteFolder(b.id) && store.folder(account: "f", path: "B") == nil)
+    } else { check("folder B exists", false) }
 }
 
 // F-22: repairEmptyBodies must drop the matching body_fts rows, not just the bodies.
