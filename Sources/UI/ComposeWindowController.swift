@@ -821,6 +821,7 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
         refreshAttachments()
         Debug.log("compose attachments: \(attachments.map { $0.filename })")
         dirty = true
+        scheduleAutosave()
     }
 
     /// Folders are zipped (with the system's ditto) and attached as one .zip.
