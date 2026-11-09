@@ -27,15 +27,16 @@ final class MessageWindowController: NSWindowController, NSWindowDelegate, NSToo
 
     private init(messageID: Int64) {
         self.messageID = messageID
-        let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 860, height: 760),
-                         styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
-                         backing: .buffered, defer: false)
+        let w = MessageKeyWindow(contentRect: NSRect(x: 0, y: 0, width: 860, height: 760),
+                                 styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
+                                 backing: .buffered, defer: false)
         w.minSize = NSSize(width: 520, height: 420)
         w.tabbingMode = .disallowed
         w.isReleasedWhenClosed = false
         w.toolbarStyle = .unified
         super.init(window: w)
         w.delegate = self
+        w.keyHandler = { [weak self] e in self?.handleKey(e) ?? false }
         w.contentViewController = preview
         w.setContentSize(NSSize(width: 860, height: 760))
         let toolbar = NSToolbar(identifier: "MacMailMessageWindow")
@@ -83,17 +84,33 @@ final class MessageWindowController: NSWindowController, NSWindowDelegate, NSToo
     @objc func replyAll(_ sender: Any?) { respond(.replyAll) }
     @objc func forward(_ sender: Any?) { respond(.forward) }
 
-    private enum Response { case reply, replyAll, forward }
+    private func respond(_ kind: MessageActions.Response) {
+        guard let r = row else { return }
+        MessageActions.respond(kind, row: r) { [weak self] s in self?.toast.show(s) }
+    }
 
-    private func respond(_ kind: Response) {
-        let store = MailService.shared.store
-        guard let d = store.detail(messageID) else { return }
-        let body = store.body(messageID)
-        switch kind {
-        case .reply: ComposeWindowController.open(.reply(d, body, all: false))
-        case .replyAll: ComposeWindowController.open(.reply(d, body, all: true))
-        case .forward: ComposeWindowController.open(.forward(d, body))
+    /// Plain keys work here too, like the main list: E archives, Delete deletes (BUG: menu-only before).
+    private func handleKey(_ e: NSEvent) -> Bool {
+        guard e.modifierFlags.intersection([.command, .control, .option]).isEmpty else { return false }
+        switch e.keyCode {
+        case 51, 117: // delete, forward delete
+            deleteMessages(nil)
+            return true
+        default: break
         }
+        switch e.charactersIgnoringModifiers {
+        case "e":
+            archiveMessages(nil)
+            return true
+        default: return false
+        }
+    }
+
+    /// ⌘⌥F from a message window re-targets the main window's search field.
+    @objc func focusSearch(_ sender: Any?) {
+        guard let main = (NSApp.delegate as? AppDelegate)?.mainWindow else { return }
+        main.window?.makeKeyAndOrderFront(nil)
+        main.focusSearch(sender)
     }
 
     @objc func toggleRead(_ sender: Any?) {
@@ -115,15 +132,9 @@ final class MessageWindowController: NSWindowController, NSWindowDelegate, NSToo
 
     @objc func deleteMessages(_ sender: Any?) {
         guard let r = row else { return }
-        if r.folderRole == .trash || r.folderRole == .spam, let w = window {
-            let alert = NSAlert()
-            alert.messageText = "Delete this message permanently?"
-            alert.informativeText = "Messages deleted from Trash or Spam can't be recovered."
-            alert.addButton(withTitle: "Delete")
-            alert.addButton(withTitle: "Cancel")
-            alert.buttons.first?.hasDestructiveAction = true
-            alert.beginSheetModal(for: w) { [weak self] resp in
-                if resp == .alertFirstButtonReturn { self?.move(.trash) }
+        if r.folderRole == .trash || r.folderRole == .spam {
+            MessageActions.confirmPermanentDelete([r], in: window) { [weak self] in
+                self?.move(.trash)
             }
             return
         }
@@ -190,5 +201,14 @@ final class MessageWindowController: NSWindowController, NSWindowDelegate, NSToo
         case TB.flag: return button("Flag", "flag", #selector(toggleFlag(_:)))
         default: return nil
         }
+    }
+}
+
+/// Catches the plain keys the reading view doesn't handle (E, Delete) so they act on this message.
+final class MessageKeyWindow: NSWindow {
+    var keyHandler: ((NSEvent) -> Bool)?
+    override func keyDown(with event: NSEvent) {
+        if keyHandler?(event) == true { return }
+        super.keyDown(with: event)
     }
 }

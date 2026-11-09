@@ -147,7 +147,11 @@ final class SettingsWindowController: NSWindowController, NSTableViewDataSource,
     @objc func addAccount() {
         guard let w = window else { return }
         let sheet = AddAccountSheet()
-        w.beginSheet(sheet.window!) { _ in _ = sheet }
+        w.beginSheet(sheet.window!) { _ in
+            // Ending the sheet (Cancel, Esc or success) stops an in-flight credential probe.
+            sheet.cancelProbe()
+            _ = sheet
+        }
     }
 
     @objc private func removeAccount() {
@@ -295,7 +299,12 @@ final class SettingsWindowController: NSWindowController, NSTableViewDataSource,
         themePopup?.selectItem(at: Prefs.Theme.allCases.firstIndex(of: Prefs.theme) ?? 0)
     }
 
-    @objc private func daysChanged(_ s: NSPopUpButton) { Prefs.offlineDays = s.selectedTag() }
+    @objc private func daysChanged(_ s: NSPopUpButton) {
+        Prefs.offlineDays = s.selectedTag()
+        // Apply the new offline window right away instead of waiting for the next launch.
+        MailService.shared.store.prune(offlineDays: Prefs.offlineDays)
+        NotificationCenter.default.post(name: .mailDataChanged, object: nil)
+    }
     @objc private func groupChanged(_ s: NSButton) { Prefs.groupByConversationDefault = s.state == .on }
     @objc private func markReadChanged(_ s: NSButton) { Prefs.markReadOnOpen = s.state == .on }
     @objc private func askChanged(_ s: NSButton) { Prefs.askBeforeImages = s.state == .on }
@@ -437,6 +446,7 @@ final class AddAccountSheet: NSWindowController {
     }
 
     @objc private func cancel() {
+        probeTask?.cancel()
         guard let w = window else { return }
         w.sheetParent?.endSheet(w)
     }
@@ -461,29 +471,51 @@ final class AddAccountSheet: NSWindowController {
                 error.stringValue = "Enter the IMAP and SMTP servers."
                 return
             }
+            // Invalid ports would silently fall back to 993/465 before; now they stop the submit.
+            func port(_ text: String, _ name: String) -> UInt16? {
+                guard let n = Int(text.trimmingCharacters(in: .whitespaces)), (1...65535).contains(n) else { return nil }
+                return UInt16(n)
+            }
+            guard let pIn = port(imapPort.stringValue, "IMAP") else {
+                error.stringValue = "The IMAP port must be a number between 1 and 65535."
+                return
+            }
+            guard let pOut = port(smtpPort.stringValue, "SMTP") else {
+                error.stringValue = "The SMTP port must be a number between 1 and 65535."
+                return
+            }
             account = Account(id: UUID().uuidString, email: mail, displayName: name.stringValue, provider: .imap, username: mail,
-                              imapHost: imapHost.stringValue, imapPort: UInt16(imapPort.stringValue) ?? 993,
-                              smtpHost: smtpHost.stringValue, smtpPort: UInt16(smtpPort.stringValue) ?? 465, signature: "")
+                              imapHost: imapHost.stringValue, imapPort: pIn,
+                              smtpHost: smtpHost.stringValue, smtpPort: pOut, signature: "")
         }
         if account.displayName.isEmpty { account.displayName = String(mail.split(separator: "@").first ?? "") }
         error.stringValue = ""
         spinner.startAnimation(nil)
         signIn.isEnabled = false
-        Task {
+        probeTask = Task { [weak self] in
             do {
                 try await MailService.shared.addAccount(account, password: pass)
-                spinner.stopAnimation(nil)
-                if let w = window { w.sheetParent?.endSheet(w) }
+                // The sheet may have been cancelled while the probe was running: undo the add.
+                guard !Task.isCancelled else { MailService.shared.removeAccount(account.id); return }
+                self?.spinner.stopAnimation(nil)
+                if let w = self?.window { w.sheetParent?.endSheet(w) }
                 (NSApp.delegate as? AppDelegate)?.mainWindow?.window?.makeKeyAndOrderFront(nil)
-            } catch let e {
-                spinner.stopAnimation(nil)
-                signIn.isEnabled = true
-                var msg = (e as? LocalizedError)?.errorDescription ?? e.localizedDescription
-                if account.provider == .gmail, case NetError.auth = e {
+            } catch {
+                guard !Task.isCancelled else { return }
+                self?.spinner.stopAnimation(nil)
+                self?.signIn.isEnabled = true
+                var msg = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                if account.provider == .gmail, case NetError.auth = error {
                     msg += " Use an App Password, not your normal Google password. 2-Step Verification must be on."
                 }
-                error.stringValue = msg
+                self?.error.stringValue = msg
             }
         }
     }
+
+    /// The in-flight credential probe, cancelled if the sheet closes first.
+    private var probeTask: Task<Void, Never>?
+
+    /// Cancels a running probe without touching the sheet (also called when the sheet ends).
+    func cancelProbe() { probeTask?.cancel() }
 }

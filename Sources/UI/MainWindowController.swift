@@ -56,7 +56,7 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSSearc
         ])
 
         sidebar.onSelect = { [weak self] source in self?.showSource(source) }
-        list.onSelectionChange = { [weak self] rows in self?.selectionChanged(rows) }
+        list.onSelectionChange = { [weak self] rows, userInitiated in self?.selectionChanged(rows, userInitiated: userInitiated) }
         list.onOpen = { [weak self] row in self?.openRow(row) }
         list.showToast = { [weak self] s in self?.toast.show(s) }
         preview.showToast = { [weak self] s in self?.toast.show(s) }
@@ -103,12 +103,19 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSSearc
         list.selectFirst()
     }
 
-    private func selectionChanged(_ rows: [MessageRow]) {
+    private func selectionChanged(_ rows: [MessageRow], userInitiated: Bool) {
         if rows.isEmpty {
             preview.showEmpty(text: "No message selected")
         } else if let r = list.focusedRow {
-            preview.show(messageID: r.id)
-            prefetchNeighbors(of: r)
+            if userInitiated {
+                // Only an explicit open (click, j/k, Return) marks the message read in the preview.
+                preview.show(messageID: r.id)
+                prefetchNeighbors(of: r)
+            } else {
+                // Launch / folder-switch auto-selection: the row is highlighted but not opened,
+                // so nothing is marked read or queued to the server.
+                preview.showEmpty(text: "Not opened yet — press Return to read")
+            }
         } else {
             preview.showEmpty(text: "\(rows.count) messages selected")
         }
@@ -214,11 +221,13 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSSearc
         case TB.search:
             let item = NSSearchToolbarItem(itemIdentifier: id)
             item.searchField.placeholderString = "Search — from:, subject:, has:attachment"
+            item.searchField.setAccessibilityLabel("Search mail")
             item.searchField.delegate = self
             item.searchField.sendsWholeSearchString = false
             item.searchField.sendsSearchStringImmediately = false
             item.searchField.target = self
             item.searchField.action = #selector(searchSubmitted(_:))
+            item.searchField.searchMenuTemplate = searchMenu()
             item.preferredWidthForSearchField = 260
             searchField = item.searchField
             return item
@@ -227,6 +236,51 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSSearc
     }
 
     // MARK: Search
+
+    /// Recent searches (kept small; persisted in the store's prefs table).
+    private var recentSearches: [String] {
+        get { (MailService.shared.store.pref("searchRecents") ?? "").split(separator: "\n", omittingEmptySubsequences: true).map(String.init) }
+        set { MailService.shared.store.setPref("searchRecents", newValue.prefix(5).joined(separator: "\n")) }
+    }
+
+    /// The magnifier's menu: recent searches plus query syntax help.
+    private func searchMenu() -> NSMenu {
+        let menu = NSMenu()
+        for q in recentSearches {
+            let item = NSMenuItem(title: q, action: #selector(useRecentSearch(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = q
+            item.image = NSImage(systemSymbolName: "clock", accessibilityDescription: nil)
+            menu.addItem(item)
+        }
+        if !recentSearches.isEmpty { menu.addItem(.separator()) }
+        let help = NSMenuItem(title: "Search syntax help", action: #selector(showSearchHelp(_:)), keyEquivalent: "")
+        help.target = self
+        menu.addItem(help)
+        return menu
+    }
+
+    @objc private func useRecentSearch(_ sender: NSMenuItem) {
+        guard let q = sender.representedObject as? String else { return }
+        searchField?.stringValue = q
+        searchSubmitted(searchField)
+    }
+
+    @objc private func showSearchHelp(_ sender: Any?) {
+        let alert = NSAlert()
+        alert.messageText = "Search syntax"
+        alert.informativeText = """
+        from:name — from a sender
+        to:name — to a recipient
+        subject:word — words in the subject
+        is:unread · is:starred — by state
+        has:attachment — with attachments
+        Combine freely: from:jane is:unread has:attachment
+        """
+        alert.addButton(withTitle: "OK")
+        window?.makeKeyAndOrderFront(nil)
+        if let w = window { alert.beginSheetModal(for: w) } else { alert.runModal() }
+    }
 
     func controlTextDidChange(_ obj: Notification) {
         guard let field = obj.object as? NSSearchField else { return }
@@ -237,9 +291,9 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSSearc
             return
         }
         // Local results while typing; the server search runs once typing pauses.
+        // No auto-select while typing: the preview must not mark results read per keystroke.
         sidebar.clearSelectionForSearch()
         list.showSearch(q, from: lastSource)
-        list.selectFirst()
         let work = DispatchWorkItem { [weak self] in self?.list.runServerSearch() }
         searchDebounce = work
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.6, execute: work)
@@ -250,13 +304,18 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSSearc
         searchField?.stringValue = text
         sidebar.clearSelectionForSearch()
         list.showSearch(text, from: lastSource)
-        list.selectFirst()
+        list.selectFirst(userInitiated: true)
         list.runServerSearch()
     }
 
-    @objc private func searchSubmitted(_ sender: NSSearchField) {
-        let q = sender.stringValue
+    @objc private func searchSubmitted(_ sender: Any?) {
+        let q = (sender as? NSSearchField)?.stringValue ?? searchField?.stringValue ?? ""
         guard !q.trimmingCharacters(in: .whitespaces).isEmpty else { return }
+        // Remember the search (deduped, newest first) and refresh the magnifier menu.
+        var recents = recentSearches.filter { $0 != q }
+        recents.insert(q, at: 0)
+        recentSearches = recents
+        searchField?.searchMenuTemplate = searchMenu()
         searchDebounce?.cancel()
         sidebar.clearSelectionForSearch()
         list.showSearch(q, from: lastSource)
@@ -286,19 +345,12 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSSearc
     @objc func replyAll(_ sender: Any?) { respond(.replyAll, sender) }
     @objc func forward(_ sender: Any?) { respond(.forward, sender) }
 
-    private enum Response { case reply, replyAll, forward }
-
-    private func respond(_ kind: Response, _ sender: Any?) {
+    private func respond(_ kind: MessageActions.Response, _ sender: Any?) {
         let contextRow = ((sender as? NSMenuItem)?.representedObject as? ContextRows)?.rows.first
-        guard let row = contextRow ?? list.focusedRow ?? targets.first, let d = MailService.shared.store.detail(row.id) else {
+        guard let row = contextRow ?? list.focusedRow ?? targets.first else {
             NSSound.beep(); return
         }
-        let body = MailService.shared.store.body(row.id)
-        switch kind {
-        case .reply: ComposeWindowController.open(.reply(d, body, all: false))
-        case .replyAll: ComposeWindowController.open(.reply(d, body, all: true))
-        case .forward: ComposeWindowController.open(.forward(d, body))
-        }
+        MessageActions.respond(kind, row: row) { [weak self] s in self?.toast.show(s) }
     }
 
     private func editDraft(_ d: MessageDetail) {
@@ -327,15 +379,8 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSSearc
     @objc func deleteMessages(_ sender: Any?) {
         let rows = rows(for: sender)
         if !rows.isEmpty, rows.allSatisfy({ $0.folderRole == .trash || $0.folderRole == .spam }) {
-            let alert = NSAlert()
-            alert.messageText = rows.count == 1 ? "Delete this message permanently?" : "Delete \(rows.count) messages permanently?"
-            alert.informativeText = "Messages deleted from Trash or Spam can't be recovered."
-            alert.addButton(withTitle: "Delete")
-            alert.addButton(withTitle: "Cancel")
-            alert.buttons.first?.hasDestructiveAction = true
-            guard let w = window else { return }
-            alert.beginSheetModal(for: w) { [weak self] resp in
-                if resp == .alertFirstButtonReturn { self?.move(rows, to: .trash) }
+            MessageActions.confirmPermanentDelete(rows, in: window) { [weak self] in
+                self?.move(rows, to: .trash)
             }
             return
         }
@@ -347,9 +392,62 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSSearc
         move(rows, to: rows.allSatisfy({ $0.folderRole == .spam }) ? .inbox : .spam)
     }
 
-    @objc private func moveToFolder(_ sender: NSMenuItem) {
-        guard let choice = sender.representedObject as? MoveChoice else { return }
-        move(choice.rows, to: .folder(choice.path))
+    /// Toolbar Move menu items carry a MoveChoice; the Message ▸ Move to… item opens a searchable picker.
+    @objc func moveToFolder(_ sender: Any?) {
+        if let choice = (sender as? NSMenuItem)?.representedObject as? MoveChoice {
+            move(choice.rows, to: .folder(choice.path))
+            return
+        }
+        let rows = rows(for: sender)
+        guard !rows.isEmpty, let acct = rows.first?.accountID, rows.allSatisfy({ $0.accountID == acct }) else {
+            NSSound.beep(); return
+        }
+        folderPicker = FolderPicker(account: acct) { [weak self] path in
+            self?.move(rows, to: .folder(path))
+        }
+        folderPicker?.beginSheet(on: window)
+    }
+
+    /// Menu key equivalents ⌘1…⌘9: select the nth folder in the sidebar.
+    @objc func selectFolderAtIndex(_ sender: NSMenuItem) {
+        guard (1...9).contains(sender.tag), let source = sidebar.folderSource(at: sender.tag - 1) else { return }
+        showSource(source)
+    }
+
+    /// Cycles keyboard focus: sidebar → list → preview → sidebar.
+    @objc func focusNextPane(_ sender: Any?) {
+        guard let w = window else { return }
+        func pane(of responder: NSResponder?) -> Int {
+            var view = responder as? NSView
+            while let v = view {
+                if v === list.view { return 1 }
+                if v === preview.view { return 2 }
+                view = v.superview
+            }
+            return 0
+        }
+        switch pane(of: w.firstResponder) {
+        case 0: list.focusList()
+        case 1:
+            if let web = Self.firstFocusable(in: preview.view) { w.makeFirstResponder(web) }
+            else { sidebar.focus() }
+        default: sidebar.focus()
+        }
+    }
+
+    private static func firstFocusable(in view: NSView) -> NSView? {
+        if view.acceptsFirstResponder && view.canBecomeKeyView { return view }
+        for sub in view.subviews {
+            if let hit = firstFocusable(in: sub) { return hit }
+        }
+        return nil
+    }
+
+    private var folderPicker: FolderPicker?
+
+    /// Move entry point for the swipe actions (they act on a row, not the selection).
+    func moveRows(_ rows: [MessageRow], to target: MailService.MoveTarget) {
+        move(rows, to: target)
     }
 
     private func move(_ rows: [MessageRow], to target: MailService.MoveTarget) {
@@ -361,7 +459,8 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSSearc
         if let label = MailService.shared.move(rows, to: target) {
             if touchesSelection {
                 list.reload(keepSelection: false)
-                list.selectAfterRemoval(previousIndex: index)
+                // The cursor move after archive/delete never marks the next message read.
+                list.selectAfterRemoval(previousIndex: index, userInitiated: false)
             } else {
                 list.reload(keepSelection: true)
             }
@@ -420,7 +519,7 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSSearc
             if item?.representedObject is ContextRows { return !rows.isEmpty }
             return list.focusedRow != nil || rows.count == 1
         case #selector(archiveMessages(_:)), #selector(deleteMessages(_:)), #selector(toggleSpam(_:)),
-             #selector(toggleFlag(_:)), #selector(toggleRead(_:)), #selector(markUnread(_:)):
+             #selector(toggleFlag(_:)), #selector(toggleRead(_:)), #selector(markUnread(_:)), #selector(moveToFolder(_:)):
             if action == #selector(toggleConversations(_:)) { return true }
             return !rows.isEmpty
         case #selector(toggleConversations(_:)):
@@ -436,9 +535,9 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSSearc
     // MARK: Window
 
     func windowWillClose(_ notification: Notification) {
-        // Closing the window quits: nothing keeps running in the background.
-        if !MailService.shared.hasPendingSends && ComposeWindowController.openCount == 0
-            && MessageWindowController.openCount == 0 { NSApp.terminate(nil) }
+        // Closing the window quits, even with message or compose windows open: pending sends and
+        // unsaved drafts get their own prompts from applicationShouldTerminate.
+        NSApp.terminate(nil)
     }
 }
 
@@ -449,6 +548,114 @@ extension MainWindowController: NSMenuDelegate {
             item.menu?.removeItem(item)
             menu.addItem(item)
         }
+    }
+}
+
+/// A searchable "Move to folder" sheet for the Message ▸ Move to… command.
+@MainActor
+final class FolderPicker: NSObject, NSTableViewDataSource, NSTableViewDelegate {
+    private let onPick: (String) -> Void
+    private let field = NSSearchField()
+    private let table = NSTableView()
+    private var all: [Folder]
+    private var shown: [Folder] = []
+    private var sheet: NSWindow?
+
+    init(account: String, onPick: @escaping (String) -> Void) {
+        self.onPick = onPick
+        all = MailService.shared.store.folders(account: account).filter { $0.selectable }
+        super.init()
+        shown = all
+    }
+
+    func beginSheet(on parent: NSWindow?) {
+        guard let parent, sheet == nil else { return }
+        field.placeholderString = "Filter folders"
+        field.target = self
+        field.action = #selector(filterChanged)
+        let col = NSTableColumn(identifier: .init("f"))
+        table.addTableColumn(col)
+        table.headerView = nil
+        table.rowHeight = 24
+        table.dataSource = self
+        table.delegate = self
+        table.doubleAction = #selector(commit)
+        table.target = self
+        let scroll = NSScrollView()
+        scroll.documentView = table
+        scroll.hasVerticalScroller = true
+        scroll.autohidesScrollers = true
+        scroll.borderType = .bezelBorder
+        let move = NSButton(title: "Move", target: self, action: #selector(commit))
+        move.bezelStyle = .rounded
+        move.keyEquivalent = "\r"
+        let cancel = NSButton(title: "Cancel", target: self, action: #selector(dismiss))
+        cancel.bezelStyle = .rounded
+        cancel.keyEquivalent = "\u{1b}"
+        let content = NSView(frame: NSRect(x: 0, y: 0, width: 300, height: 300))
+        for v in [field, scroll, move, cancel] as [NSView] {
+            v.translatesAutoresizingMaskIntoConstraints = false
+            content.addSubview(v)
+        }
+        NSLayoutConstraint.activate([
+            field.topAnchor.constraint(equalTo: content.topAnchor, constant: 12),
+            field.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 14),
+            field.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -14),
+            scroll.topAnchor.constraint(equalTo: field.bottomAnchor, constant: 8),
+            scroll.leadingAnchor.constraint(equalTo: field.leadingAnchor),
+            scroll.trailingAnchor.constraint(equalTo: field.trailingAnchor),
+            scroll.bottomAnchor.constraint(equalTo: move.topAnchor, constant: -10),
+            move.trailingAnchor.constraint(equalTo: field.trailingAnchor),
+            move.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -12),
+            cancel.centerYAnchor.constraint(equalTo: move.centerYAnchor),
+            cancel.trailingAnchor.constraint(equalTo: move.leadingAnchor, constant: -8),
+        ])
+        let w = NSWindow(contentRect: content.frame, styleMask: [.titled], backing: .buffered, defer: false)
+        w.title = "Move to folder"
+        w.contentView = content
+        sheet = w
+        parent.beginSheet(w)
+        parent.makeFirstResponder(field)
+    }
+
+    @objc private func filterChanged() {
+        let q = field.stringValue.trimmingCharacters(in: .whitespaces)
+        shown = q.isEmpty ? all : all.filter { $0.name.localizedCaseInsensitiveContains(q) }
+        table.reloadData()
+        if !shown.isEmpty { table.selectRowIndexes([0], byExtendingSelection: false) }
+    }
+
+    @objc private func commit() {
+        guard let f = selected, let s = sheet else { return }
+        s.sheetParent?.endSheet(s)
+        sheet = nil
+        onPick(f.path)
+    }
+
+    @objc private func dismiss() {
+        sheet?.sheetParent?.endSheet(sheet!)
+        sheet = nil
+    }
+
+    private var selected: Folder? {
+        table.selectedRow >= 0 && table.selectedRow < shown.count ? shown[table.selectedRow] : nil
+    }
+
+    func numberOfRows(in tableView: NSTableView) -> Int { shown.count }
+
+    func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
+        let cell = NSTableCellView()
+        let label = NSTextField(labelWithString: shown[row].name)
+        label.lineBreakMode = .byTruncatingTail
+        label.translatesAutoresizingMaskIntoConstraints = false
+        cell.addSubview(label)
+        cell.textField = label
+        NSLayoutConstraint.activate([
+            label.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 4),
+            label.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -4),
+            label.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
+        ])
+        return cell
     }
 }
 
@@ -495,9 +702,15 @@ final class ToastView: NSView {
         button.isHidden = action == nil
         isHidden = false
         alphaValue = 1
+        // VoiceOver hears the toast; the Undo button joins the keyboard loop so it's Tab-reachable.
+        NSAccessibility.post(element: self, notification: .announcementRequested,
+                             userInfo: [.announcement: text + (action.map { " — \($0.0) available" } ?? "")])
+        if action != nil { window?.recalculateKeyViewLoop() }
         hideWork?.cancel()
         let work = DispatchWorkItem { [weak self] in
-            NSAnimationContext.runAnimationGroup({ $0.duration = 0.25; self?.animator().alphaValue = 0 }) { self?.isHidden = true }
+            guard let self else { return }
+            NSAnimationContext.runAnimationGroup({ $0.duration = 0.25; self.animator().alphaValue = 0 }) { self.isHidden = true }
+            if self.button.nextKeyView != nil || action != nil { self.window?.recalculateKeyViewLoop() }
         }
         hideWork = work
         DispatchQueue.main.asyncAfter(deadline: .now() + duration, execute: work)

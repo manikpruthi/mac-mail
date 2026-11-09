@@ -13,17 +13,24 @@ final class SidebarItem: NSObject {
     let symbol: String
     var children: [SidebarItem] = []
     var unread = 0
+    var hasError = false
+    var pendingOps = 0
 
     init(kind: Kind, title: String, symbol: String) {
         self.kind = kind
         self.title = title
         self.symbol = symbol
     }
+
+    var accountID: String? {
+        if case .account(let id) = kind { return id }
+        return nil
+    }
 }
 
 /// Accounts and their folders (Gmail labels), plus a Unified Inbox when there is more than one account.
 @MainActor
-final class SidebarViewController: NSViewController, NSOutlineViewDataSource, NSOutlineViewDelegate {
+final class SidebarViewController: NSViewController, NSOutlineViewDataSource, NSOutlineViewDelegate, NSMenuDelegate {
     private let outline = NSOutlineView()
     private var roots: [SidebarItem] = []
     private let status = NSTextField(labelWithString: "")
@@ -49,6 +56,9 @@ final class SidebarViewController: NSViewController, NSOutlineViewDataSource, NS
         outline.dataSource = self
         outline.delegate = self
         outline.autoresizesOutlineColumn = false
+        let menu = NSMenu()
+        menu.delegate = self
+        outline.menu = menu
         scroll.documentView = outline
 
         status.font = .systemFont(ofSize: 11)
@@ -78,6 +88,9 @@ final class SidebarViewController: NSViewController, NSOutlineViewDataSource, NS
         ])
         view = root
         reload()
+        let click = NSClickGestureRecognizer(target: self, action: #selector(statusClicked))
+        status.addGestureRecognizer(click)
+        status.setAccessibilityElement(true)
         let nc = NotificationCenter.default
         nc.addObserver(self, selector: #selector(reloadNote), name: .mailFoldersChanged, object: nil)
         nc.addObserver(self, selector: #selector(reloadNote), name: .mailAccountsChanged, object: nil)
@@ -86,8 +99,21 @@ final class SidebarViewController: NSViewController, NSOutlineViewDataSource, NS
     }
 
     @objc private func reloadNote() { reload() }
-    @objc private func countsNote() { refreshCounts() }
+
+    /// Unread recounts run per folder on every data change; coalesce bursts (P10) behind 250 ms.
+    private var countsWork: DispatchWorkItem?
+    @objc private func countsNote() {
+        countsWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in self?.refreshCounts() }
+        countsWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25, execute: work)
+    }
     @objc private func statusNote() { updateStatus() }
+
+    @objc private func statusClicked() {
+        MailService.shared.flushAll()
+        updateStatus()
+    }
 
     func reload() {
         let service = MailService.shared
@@ -116,31 +142,49 @@ final class SidebarViewController: NSViewController, NSOutlineViewDataSource, NS
     }
 
     private func refreshCounts(reloadOutline: Bool = true) {
-        let store = MailService.shared.store
+        let service = MailService.shared
+        let store = service.store
         for r in roots {
             if r.kind == .unified { r.unread = store.unifiedUnreadCount() }
+            switch r.kind {
+            case .account(let id):
+                // Broken account / offline queue state surfaces on the account row.
+                r.hasError = service.engines[id]?.lastError != nil
+                r.pendingOps = store.ops(account: id).count
+            default: break
+            }
             for c in r.children {
-                if case .folder(let id) = c.kind, let f = store.folder(id) {
-                    // Counts only where they help: Inbox and user labels, like Gmail.
-                    c.unread = (f.role == .inbox || f.role == .none) ? store.unreadCount(folderID: id) : 0
+                if case .folder(let id) = c.kind {
+                    // Unread for every folder from the offline cache (no network per refresh).
+                    c.unread = store.unreadCount(folderID: id)
                 }
             }
         }
         if reloadOutline {
             for row in 0..<outline.numberOfRows {
-                if let item = outline.item(atRow: row) as? SidebarItem,
-                   let cell = outline.view(atColumn: 0, row: row, makeIfNecessary: false) as? SidebarCell {
+                guard let item = outline.item(atRow: row) as? SidebarItem else { continue }
+                if case .account = item.kind, let cell = outline.view(atColumn: 0, row: row, makeIfNecessary: false) as? AccountCell {
+                    cell.configure(item)
+                } else if let cell = outline.view(atColumn: 0, row: row, makeIfNecessary: false) as? SidebarCell {
                     cell.configure(item)
                 }
             }
         }
+        updateStatus()
     }
 
     private func updateStatus() {
         let service = MailService.shared
+        let store = service.store
+        let pending = service.accounts.reduce(0) { $0 + store.ops(account: $1.id).count }
+        let last = status.stringValue
         if let err = service.statusError {
             status.stringValue = err
             status.textColor = .systemRed
+        } else if pending > 0 {
+            // Offline queue: "N actions waiting — click to retry" (the queue is flushed after syncs too).
+            status.stringValue = "\(pending) action\(pending == 1 ? "" : "s") waiting — Retry"
+            status.textColor = .systemOrange
         } else if service.isSyncing {
             status.stringValue = "Syncing…"
             status.textColor = .secondaryLabelColor
@@ -149,6 +193,10 @@ final class SidebarViewController: NSViewController, NSOutlineViewDataSource, NS
             status.textColor = .secondaryLabelColor
         }
         if service.isSyncing { statusSpinner.startAnimation(nil) } else { statusSpinner.stopAnimation(nil) }
+        if status.stringValue != last {
+            NSAccessibility.post(element: status, notification: .announcementRequested,
+                                 userInfo: [.announcement: status.stringValue])
+        }
     }
 
     private var selectedKind: SidebarItem.Kind? {
@@ -181,6 +229,45 @@ final class SidebarViewController: NSViewController, NSOutlineViewDataSource, NS
         MailService.shared.store.folders(account: account).filter { $0.selectable }
     }
 
+    /// The nth selectable folder in display order, for the ⌘1…⌘9 Go-to-folder shortcuts.
+    func folderSource(at index: Int) -> MailSource? {
+        var folders: [Int64] = []
+        for root in roots {
+            for child in root.children {
+                if case .folder(let id) = child.kind { folders.append(id) }
+            }
+        }
+        guard index >= 0, index < folders.count else { return nil }
+        return .folder(folders[index])
+    }
+
+    func focus() { view.window?.makeFirstResponder(outline) }
+
+    // MARK: Account row menu
+
+    @objc private func syncAccount(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String,
+              let inbox = MailService.shared.store.folder(account: id, role: .inbox) else { return }
+        MailService.shared.sync(folderID: inbox.id)
+        if let e = MailService.shared.engines[id] { Task { await e.refreshFolders(); await e.flushOps() } }
+    }
+
+    @objc private func signInAgain(_ sender: NSMenuItem) {
+        (NSApp.delegate as? AppDelegate)?.showSettings(addAccount: false)
+    }
+
+    @objc private func removeAccount(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String, let a = MailService.shared.account(id), let w = view.window else { return }
+        let alert = NSAlert()
+        alert.messageText = "Remove \(a.email)?"
+        alert.informativeText = "Its offline mail is deleted from this Mac. Nothing is deleted from the server."
+        alert.addButton(withTitle: "Remove")
+        alert.addButton(withTitle: "Cancel")
+        alert.beginSheetModal(for: w) { r in
+            if r == .alertFirstButtonReturn { MailService.shared.removeAccount(id) }
+        }
+    }
+
     // MARK: Data source / delegate
 
     func outlineView(_ outlineView: NSOutlineView, numberOfChildrenOfItem item: Any?) -> Int {
@@ -201,32 +288,16 @@ final class SidebarViewController: NSViewController, NSOutlineViewDataSource, NS
     }
 
     func outlineView(_ outlineView: NSOutlineView, shouldSelectItem item: Any) -> Bool {
-        if case .account = (item as? SidebarItem)?.kind { return false }
-        return true
+        // Accounts are selectable rows too (context menu: Sync Now, Sign in again, Remove).
+        true
     }
 
     func outlineView(_ outlineView: NSOutlineView, viewFor tableColumn: NSTableColumn?, item: Any) -> NSView? {
         guard let item = item as? SidebarItem else { return nil }
         if case .account = item.kind {
-            let id = NSUserInterfaceItemIdentifier("header")
-            let cell = (outlineView.makeView(withIdentifier: id, owner: nil) as? NSTableCellView) ?? {
-                let c = NSTableCellView()
-                c.identifier = id
-                let t = NSTextField(labelWithString: "")
-                t.font = .systemFont(ofSize: 11, weight: .semibold)
-                t.textColor = .secondaryLabelColor
-                t.lineBreakMode = .byTruncatingTail
-                t.translatesAutoresizingMaskIntoConstraints = false
-                c.addSubview(t)
-                c.textField = t
-                NSLayoutConstraint.activate([
-                    t.leadingAnchor.constraint(equalTo: c.leadingAnchor, constant: 2),
-                    t.trailingAnchor.constraint(equalTo: c.trailingAnchor, constant: -4),
-                    t.centerYAnchor.constraint(equalTo: c.centerYAnchor),
-                ])
-                return c
-            }()
-            cell.textField?.stringValue = item.title
+            let id = NSUserInterfaceItemIdentifier("account")
+            let cell = (outlineView.makeView(withIdentifier: id, owner: nil) as? AccountCell) ?? AccountCell(identifier: id)
+            cell.configure(item)
             return cell
         }
         let id = NSUserInterfaceItemIdentifier("folder")
@@ -242,6 +313,69 @@ final class SidebarViewController: NSViewController, NSOutlineViewDataSource, NS
         case .folder(let id): onSelect?(.folder(id))
         case .account: break
         }
+    }
+
+    // MARK: Context menu
+
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        menu.removeAllItems()
+        guard let item = outline.item(atRow: outline.clickedRow) as? SidebarItem, let id = item.accountID else { return }
+        let sync = NSMenuItem(title: "Sync Now", action: #selector(syncAccount(_:)), keyEquivalent: "")
+        sync.target = self
+        sync.representedObject = id
+        menu.addItem(sync)
+        let signIn = NSMenuItem(title: "Sign in again…", action: #selector(signInAgain(_:)), keyEquivalent: "")
+        signIn.target = self
+        menu.addItem(signIn)
+        menu.addItem(.separator())
+        let remove = NSMenuItem(title: "Remove…", action: #selector(removeAccount(_:)), keyEquivalent: "")
+        remove.target = self
+        remove.representedObject = id
+        menu.addItem(remove)
+    }
+}
+
+/// The account row: name, a warning icon when sign-in/sync is failing, and the offline-queue count.
+final class AccountCell: NSTableCellView {
+    private let warning = NSImageView(image: NSImage(systemSymbolName: "exclamationmark.triangle.fill", accessibilityDescription: "Account needs attention") ?? NSImage())
+    private let ops = NSTextField(labelWithString: "")
+
+    init(identifier: NSUserInterfaceItemIdentifier) {
+        super.init(frame: .zero)
+        self.identifier = identifier
+        let label = NSTextField(labelWithString: "")
+        label.font = .systemFont(ofSize: 11, weight: .semibold)
+        label.textColor = .secondaryLabelColor
+        label.lineBreakMode = .byTruncatingTail
+        warning.contentTintColor = .systemOrange
+        warning.symbolConfiguration = .init(pointSize: 10, weight: .regular)
+        ops.font = .monospacedDigitSystemFont(ofSize: 10, weight: .medium)
+        ops.textColor = .systemOrange
+        for v in [label, warning, ops] as [NSView] {
+            v.translatesAutoresizingMaskIntoConstraints = false
+            addSubview(v)
+        }
+        textField = label
+        label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        NSLayoutConstraint.activate([
+            label.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 2),
+            label.centerYAnchor.constraint(equalTo: centerYAnchor),
+            label.trailingAnchor.constraint(lessThanOrEqualTo: warning.leadingAnchor, constant: -4),
+            warning.leadingAnchor.constraint(greaterThanOrEqualTo: label.trailingAnchor, constant: 4),
+            warning.centerYAnchor.constraint(equalTo: centerYAnchor),
+            ops.leadingAnchor.constraint(equalTo: warning.trailingAnchor, constant: 3),
+            ops.centerYAnchor.constraint(equalTo: centerYAnchor),
+            ops.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -4),
+        ])
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    func configure(_ item: SidebarItem) {
+        textField?.stringValue = item.title
+        warning.isHidden = !item.hasError
+        ops.stringValue = item.pendingOps > 0 ? "✉\(item.pendingOps)" : ""
+        ops.isHidden = item.pendingOps == 0
     }
 }
 
