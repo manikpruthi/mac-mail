@@ -15,11 +15,13 @@ extension MailService {
     /// an offline Mac can still be saved ("save without verifying") and fixed later.
     /// An empty password keeps the saved one.
     func saveCredentialsWithoutVerifying(_ account: Account, password: String?) throws {
-        guard self.account(account.id) != nil else { throw NetError.server("The account no longer exists.") }
+        guard let saved = self.account(account.id) else { throw NetError.server("The account no longer exists.") }
         if let password, !password.isEmpty { try Keychain.set(password, for: account.id) }
+        let connectionChanged = account.connectionDiffers(from: saved)
         updateAccount(account)
-        // Reconnect with the new settings now; a failure is recorded as the account's last error, not lost.
-        engines[account.id]?.resetConnections()
+        // updateAccount() already reset the connections when the servers changed (W-16); otherwise
+        // reconnect once here so the saved password is used. A failure is recorded as the last error.
+        if !connectionChanged { engines[account.id]?.resetConnections() }
     }
 
     /// The settings and password an edit is about to replace (nil if the account is gone).
@@ -31,9 +33,13 @@ extension MailService {
     /// Puts back settings and password captured by restorePoint(), for an edit the user cancelled while
     /// its check was still running. Does nothing if the account was removed in the meantime.
     func restore(_ point: AccountRestorePoint) {
-        guard account(point.account.id) != nil else { return }
-        updateAccount(point.account)
+        guard let current = account(point.account.id) else { return }
+        let connectionChanged = point.account.connectionDiffers(from: current)
+        // Restore the password before the reconnect below, so it reads the old one, not the cancelled edit's.
         if let password = point.password { try? Keychain.set(password, for: point.account.id) }
-        engines[point.account.id]?.resetConnections()
+        updateAccount(point.account)
+        // updateAccount() already reset the connections when the servers changed (W-16); otherwise
+        // reconnect once so the restored password is used.
+        if !connectionChanged { engines[point.account.id]?.resetConnections() }
     }
 }

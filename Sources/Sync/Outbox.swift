@@ -39,9 +39,10 @@ final class Outbox {
             let item = (try? Data(contentsOf: f.appendingPathComponent("item.json")))
                 .flatMap { try? JSONDecoder().decode(Item.self, from: $0) }
             // A record that won't decode, has a non-UUID id (which would escape the Outbox folder),
-            // or a message without its MIME, can never be sent (C-26).
-            guard let item, UUID(uuidString: item.id) != nil,
-                  fm.fileExists(atPath: f.appendingPathComponent("message.eml").path) else {
+            // doesn't live in its own folder, or has no regular MIME file, can never be sent (C-26).
+            let eml = f.appendingPathComponent("message.eml")
+            guard let item, UUID(uuidString: item.id) != nil, f.lastPathComponent == item.id,
+                  (try? eml.resourceValues(forKeys: [.isRegularFileKey]))?.isRegularFile == true else {
                 corrupt.append(f)
                 continue
             }
