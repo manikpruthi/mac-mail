@@ -16,6 +16,7 @@ final class AccountEngine {
     private var connecting: [Lane: Task<IMAPClient, Error>] = [:]
     private var syncing: Set<Int64> = []
     private var syncPending: Set<Int64> = []
+    private var syncWaiters: [Int64: [CheckedContinuation<Void, Never>]] = [:]
     /// One gate per connection: "select folder, then act" must run as a unit on that connection.
     private let syncGate = AsyncGate()
     private let fetchGate = AsyncGate()
@@ -306,6 +307,7 @@ final class AccountEngine {
         beginSync()
         defer {
             syncing.remove(folderID); endSync()
+            for c in syncWaiters.removeValue(forKey: folderID) ?? [] { c.resume() }
             if syncPending.remove(folderID) != nil { Task { await self.sync(folderID: folderID, prefetch: prefetch) } }
         }
         var prefetchLimit = 0
@@ -358,15 +360,6 @@ final class AccountEngine {
                                                        uidNext: info.uidNext > 0 ? info.uidNext : (store.maxUID(folderID: folderID) ?? 0) + 1,
                                                        modseq: state.modseq)
                 }
-                // Don't let server flag writes clobber what the user just changed: UIDs with a queued
-                // flag op keep their local (and soon server) state. Ops queued by older builds carry no
-                // folder id, so fall back to the path they recorded.
-                let pendingFlagUIDs = Set(store.ops(account: account.id)
-                    .filter { op in
-                        guard PendingOpKind(op)?.isFlagChange == true else { return false }
-                        return op.folderID == folderID || (op.folderID == 0 && op.folderPath == folder.path)
-                    }
-                    .flatMap { $0.uids })
                 var flagsOK = true
                 if let minUID = store.minUID(folderID: folderID) {
                     // Flag changes.
@@ -374,8 +367,9 @@ final class AccountEngine {
                         if await c.hasCondstore, state.modseq > 0 {
                             if info.highestModseq != state.modseq {
                                 let changed = try await c.fetch("1:*", items: "(UID FLAGS)", changedSince: state.modseq)
+                                let pending = pendingFlagUIDs(folderID: folderID, folder: folder)
                                 flagChangedUIDs += try store.updateFlagsChecked(folderID: folderID, changed.compactMap { r in
-                                    guard let uid = r.uid, !pendingFlagUIDs.contains(uid) else { return nil }
+                                    guard let uid = r.uid, !pending.contains(uid) else { return nil }
                                     return (uid, MessageFlags.from(imapFlags: r.items["FLAGS"]?.list?.compactMap { $0.text } ?? []))
                                 })
                             }
@@ -390,8 +384,9 @@ final class AccountEngine {
                                 from = max(minUID, recent.last ?? minUID)
                             }
                             let all = try await c.fetch("\(from):*", items: "(UID FLAGS)")
+                            let pending = pendingFlagUIDs(folderID: folderID, folder: folder)
                             flagChangedUIDs += try store.updateFlagsChecked(folderID: folderID, all.compactMap { r in
-                                guard let uid = r.uid, !pendingFlagUIDs.contains(uid) else { return nil }
+                                guard let uid = r.uid, !pending.contains(uid) else { return nil }
                                 return (uid, MessageFlags.from(imapFlags: r.items["FLAGS"]?.list?.compactMap { $0.text } ?? []))
                             })
                         }
@@ -446,6 +441,26 @@ final class AccountEngine {
         MailService.shared.updateBadge()
         // Parsing a big FETCH leaves freed pages behind; hand them back.
         if syncingFolders <= 1 { Memory.relieve() }
+    }
+
+    /// Don't let server flag writes clobber what the user just changed: UIDs with a queued flag op keep
+    /// their local (and soon server) state. Ops queued by older builds carry no folder id, so fall back
+    /// to the path they recorded. Call this after a FETCH returns, not before: a flag changed while the
+    /// fetch was in flight must not be overwritten by the older server value.
+    private func pendingFlagUIDs(folderID: Int64, folder: Folder) -> Set<UInt32> {
+        Set(store.ops(account: account.id)
+            .filter { op in
+                guard PendingOpKind(op)?.isFlagChange == true else { return false }
+                return op.folderID == folderID || (op.folderID == 0 && op.folderPath == folder.path)
+            }
+            .flatMap { $0.uids })
+    }
+
+    /// Waits until no sync is running for the folder, so a caller can then run one that is not coalesced.
+    private func waitForSyncToFinish(folderID: Int64) async {
+        while syncing.contains(folderID) {
+            await withCheckedContinuation { syncWaiters[folderID, default: []].append($0) }
+        }
     }
 
     /// Caches the text of the newest messages so they open instantly and show a preview line.
@@ -533,7 +548,7 @@ final class AccountEngine {
                     let lo = max(1, hi - window + 1)
                     found += try await c.uidSearch("UID \(lo):\(hi)").filter { Int($0) <= hi }
                     hi = lo - 1
-                    window = min(window * 2, 100_000)
+                    window = min(window * 2, 20_000)
                 }
                 let older = found.sorted(by: >).prefix(200)
                 guard !older.isEmpty else { return [] }
@@ -877,6 +892,9 @@ final class AccountEngine {
                     continue
                 }
                 report(e)
+                // Only a server refusal says something about the op. A dropped or timed-out connection
+                // must leave it queued and must not count toward the three-strike drop.
+                guard case .server = e else { return }
                 let n = (attempts[op.id] ?? 0) + 1
                 if n >= 3 {
                     // Temporary refusal that won't clear: give up and undo the optimistic local delete.
@@ -922,6 +940,12 @@ final class AccountEngine {
         }
         await sync(folderID: drafts.id, prefetch: false)
         guard let messageID else { return nil }
+        if let id = store.messageID(folderID: drafts.id, messageIDHeader: messageID) { return id }
+        // That sync may have coalesced with one already running and returned at once, before the
+        // appended draft was fetched. Wait for it, then sync once more if the row is still missing.
+        await waitForSyncToFinish(folderID: drafts.id)
+        if let id = store.messageID(folderID: drafts.id, messageIDHeader: messageID) { return id }
+        await sync(folderID: drafts.id, prefetch: false)
         return store.messageID(folderID: drafts.id, messageIDHeader: messageID)
     }
 
