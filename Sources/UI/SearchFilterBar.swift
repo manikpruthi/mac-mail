@@ -158,6 +158,8 @@ final class SearchFilterBar: NSView, NSPopoverDelegate {
         filters.unread = unread.state == .on
         filters.flagged = flagged.state == .on
         filters.attachments = attachments.state == .on
+        // A toggle must also reveal/hide Clear without waiting for the next layout pass.
+        updateMoreTitle()
         NotificationCenter.default.post(name: .mailSearchFiltersChanged, object: filters)
         onChange?(filters)
     }
