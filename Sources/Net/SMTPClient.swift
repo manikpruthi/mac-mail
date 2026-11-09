@@ -45,6 +45,7 @@ enum SMTPClient {
             }
             defer { watchdog.cancel() }
             var text = ""
+            var totalBytes = 0
             var lines = 0
             while true {
                 let line: String
@@ -52,7 +53,9 @@ enum SMTPClient {
                     throw fired.didFire ? NetError.timeout : error
                 }
                 lines += 1
-                guard lines < 1000 else { throw NetError.protocolError("reply too long") }
+                totalBytes += line.utf8.count + 1
+                // Both a line-count and a total-size cap: a broken server must not grow the reply forever.
+                guard lines < 1000, totalBytes <= 64 * 1024 else { throw NetError.protocolError("reply too long") }
                 text += line + "\n"
                 guard line.count >= 3, let code = Int(line.prefix(3)) else { throw NetError.protocolError(line) }
                 if line.count == 3 || line[line.index(line.startIndex, offsetBy: 3)] == " " { return (code, text) }

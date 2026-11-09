@@ -349,7 +349,10 @@ actor IMAPClient {
             let ours = Set(try await uidSearch("ALL"))
             guard !ours.isEmpty else { return }
             try await run("UID STORE 1:* +FLAGS.SILENT (\\Deleted)")
-            guard Set(try await uidSearch("DELETED")) == ours else { return }
+            guard Set(try await uidSearch("DELETED")) == ours else {
+                // Not expunged: reporting success here would tell the user the folder is empty when it isn't.
+                throw NetError.server("The folder changed while it was being emptied. Try again.")
+            }
             try await run("EXPUNGE", timeout: 300)
         }
     }
@@ -391,7 +394,7 @@ actor IMAPClient {
 
     @discardableResult
     func select(_ path: String, readOnly: Bool = false, force: Bool = true) async throws -> SelectInfo? {
-        if !force, selectedPath == path, selectedReadOnly == readOnly || (!selectedReadOnly && readOnly) { return nil }
+        if !force, selectedPath == path, readOnly || !selectedReadOnly { return nil }
         let verb = readOnly ? "EXAMINE" : "SELECT"
         let suffix = hasCondstore ? " (CONDSTORE)" : ""
         let rs = try await run("\(verb) \(MailboxName.encode(path).imapQuoted)\(suffix)")
@@ -519,7 +522,8 @@ actor IMAPClient {
         guard let s = stream else { throw NetError.closed }
         let tag = nextTag()
         try await s.send("\(tag) IDLE\r\n")
-        let first = try await readResponse()
+        // The initial "+" is as unbound as any other read: a silent server must not hang the idle lane.
+        let first = try await withReadTimeout(Limits.greetingTimeout) { try await self.readResponse() }
         guard first.isContinuation else {
             if first.tag == tag { throw NetError.server(first.text) }
             return true
@@ -675,10 +679,9 @@ actor IMAPClient {
             }
             if enc == "base64" { handle.write(b64.finish()) }
             if enc == "quoted-printable" { handle.write(MIME.decodeQuotedPrintable(qpBuffer)) }
-            // Verify the decoded size against BODYSTRUCTURE: short chunks don't end the fetch, a short
-            // total does mean truncation.
-            let written = Int64(handle.offsetInFile)
-            if part.decodedSize > 0 && written != Int64(part.decodedSize) {
+            // Verify the bytes received against BODYSTRUCTURE: its size is the transfer-encoded octet
+            // count, which is exactly what BODY[part] returns, so a short total means truncation.
+            if part.size > 0 && offset != part.size {
                 throw NetError.server("The attachment arrived incomplete from the server. Try downloading it again.")
             }
         } catch {

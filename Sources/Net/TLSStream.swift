@@ -361,7 +361,7 @@ actor TLSStream {
         guard security == .startTLS, !isEncrypted else { return }
         buffer.removeAll()
         start = 0
-        try await transport.discardBuffered()
+        transport.discardBuffered()
         try await transport.startTLS()
         isEncrypted = true
     }
