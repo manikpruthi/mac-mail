@@ -38,11 +38,16 @@ over TLS; capabilities are asked for again.
 2. **Actions** — optimistic local change, then a row in `pending_ops` bound to folder id + UIDVALIDITY.
    Moves/deletes first wait out an 8 s Undo window (`MailService.undoables`, restored from `Store.Snapshot`).
    Empty Trash/Spam flags every message and uses `UID EXPUNGE` where the server has UIDPLUS; without it a
-   bare `EXPUNGE` runs only when the server's `\Deleted` set is exactly the UIDs just flagged.
+   bare `EXPUNGE` runs only when the server's `\Deleted` set is exactly the UIDs just flagged (the ones
+   present when the command started); on a mismatch the flags it added are taken back.
 3. **Sending** — `MailService.queueSend`: *waiting* (undoable) → *uploading* → done. A safety draft is
    appended while uploading; connection failures move the finished MIME into the `Outbox` folder on disk.
-   Each record (`item.json` plus `message.eml`) is written and read back before the queue reports it, and an
-   unreadable record is moved to `Outbox Corrupt` off the main thread instead of being dropped.
+   Each record (`item.json` plus `message.eml`) is written into a `.tmp` staging folder, renamed into place
+   and read back before the queue reports it; an unreadable record is moved to `Outbox Corrupt` off the main
+   thread instead of being dropped. A decision the item's own folder can't store (it refused a delete) is
+   kept in `<id>.decision` beside it.
+   The composer hands the autosave queue a private copy of the body; the live text storage is only read
+   on the main thread.
 4. **Composer autosave** — `ComposerAutosave` JSON per open composer in Application Support/…/Autosave,
    removed on send/save/discard, reopened at launch otherwise.
 
@@ -54,6 +59,9 @@ FTS5 indexes for headers (`fts`, external content) and cached text (`body_fts`);
 ordered and windowed in SQL (newest or oldest, with an id tiebreak) in `Store+ListQueries`; search results
 are ordered in memory and paged. `Store+Maintenance` reads the Storage figures and clears the text and
 search cache on their own connections, off the main thread. Pruning runs on its own connection too.
+`SQLiteDB.transaction` reports whether the batch committed; folder-list saves, renames, flag changes and
+local deletes stop (and say so) instead of carrying on as if a skipped write had landed. A cached folder is
+pruned only after two consecutive LIST replies omit it.
 
 ## Rendering
 

@@ -32,20 +32,17 @@ extension Store {
 
     /// Drops every cached body, its search index and the snippets, then compacts the file. Runs on the
     /// caller's queue with its own connection so two DELETEs and a VACUUM never block the UI (C-06).
-    /// Returns true once the cache really is empty.
-    @discardableResult
-    nonisolated static func clearBodies(path: String) -> Bool {
-        guard let db = try? SQLiteDB(path: path) else { return false }
+    /// `cleared` is true once the cache really is empty; `compacted` once the file was shrunk too.
+    nonisolated static func clearBodies(path: String) -> (cleared: Bool, compacted: Bool) {
+        guard let db = try? SQLiteDB(path: path) else { return (false, false) }
         db.transaction {
             db.run("DELETE FROM bodies")
             db.run("DELETE FROM body_fts")
             db.run("UPDATE messages SET snippet=''")
         }
         // VACUUM must run outside a transaction; it rewrites the file so the space goes back to macOS.
-        // run() logs the underlying error; this records that the deletes landed but compaction did not.
-        if !db.run("VACUUM") || !db.run("PRAGMA optimize") {
-            NSLog("Mac Mail cache: text cleared, compaction skipped")
-        }
-        return db.scalarInt("SELECT COUNT(*) FROM bodies") == 0
+        let compacted = db.run("VACUUM")
+        db.run("PRAGMA optimize")
+        return (db.scalarInt("SELECT COUNT(*) FROM bodies") == 0, compacted)
     }
 }

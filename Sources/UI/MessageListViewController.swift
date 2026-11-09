@@ -216,7 +216,8 @@ final class MessageListViewController: NSViewController, NSOutlineViewDataSource
     private func refreshSearchRows() {
         guard case .search = source else { return }
         var merged = MailService.shared.store.search(currentQuery, folderID: scopeFolderID)
-            + MailService.shared.store.rows(ids: serverHitIDs)
+            // Server hits are kept by id, so they must pass the live read/flag filter again.
+            + MailService.shared.store.rows(ids: serverHitIDs).filter { flagsMatchSource($0.flags) }
         merged.sort { $0.date > $1.date }
         searchRows = Array(Self.dedupe(merged).prefix(2000))
     }

@@ -36,32 +36,36 @@ final class Outbox {
         (try? Data(contentsOf: url)).flatMap { try? JSONDecoder().decode(Item.self, from: $0) }
     }
 
+    /// Where a decision is recorded when the item's own folder can't be written (it is outside that
+    /// folder on purpose: the folder that refused a delete usually refuses writes too).
+    private func marker(_ id: String) -> URL { dir.appendingPathComponent(id + ".decision") }
+
     private func load() {
         let fm = FileManager.default
         let folders = (try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.isDirectoryKey])) ?? []
         var found: [Item] = []
         var corrupt: [URL] = []
-        for f in folders {
+        for var f in folders {
             guard (try? f.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true else { continue }
-            let record = f.appendingPathComponent("item.json")
-            let staged = f.appendingPathComponent("item.json.tmp")
-            var pendingRecord = false
-            var item = Self.decode(record)
-            if item == nil, let stagedItem = Self.decode(staged) {
-                item = stagedItem
-                pendingRecord = true
+            // A crash before add() renamed its staging folder into place: finish the rename. A complete
+            // one loads below; an incomplete one is quarantined with the other unreadable folders.
+            if f.pathExtension == "tmp" {
+                let final = f.deletingPathExtension()
+                if (try? fm.moveItem(at: f, to: final)) != nil { f = final }
             }
             // A record that won't decode, has a non-UUID id (which would escape the Outbox folder),
             // doesn't live in its own folder, or has no regular MIME file, can never be sent (C-26).
             let eml = f.appendingPathComponent("message.eml")
-            guard let item, UUID(uuidString: item.id) != nil, f.lastPathComponent == item.id,
+            guard var item = Self.decode(f.appendingPathComponent("item.json")), UUID(uuidString: item.id) != nil,
+                  f.lastPathComponent == item.id,
                   (try? eml.resourceValues(forKeys: [.isRegularFileKey]))?.isRegularFile == true else {
                 corrupt.append(f)
                 continue
             }
-            // A crash between the MIME and the record rename leaves a complete staged record beside a
-            // complete MIME: finish the commit instead of losing the message (F-19).
-            if pendingRecord { try? fm.moveItem(at: staged, to: record) }
+            if let reason = try? String(contentsOf: marker(item.id), encoding: .utf8) {
+                item.attempts = max(item.attempts, Self.maxAttempts)
+                item.lastError = reason
+            }
             found.append(item)
         }
         items = found.sorted { $0.created < $1.created }
@@ -102,25 +106,25 @@ final class Outbox {
                         subject: message.subject, created: Date(), replyToID: replyToID,
                         draftToDeleteID: draftToDeleteID, safetyDraftID: safetyDraftID)
         let f = folder(item.id)
-        let record = f.appendingPathComponent("item.json")
-        let staged = f.appendingPathComponent("item.json.tmp")
+        let staging = f.appendingPathExtension("tmp")
+        let fm = FileManager.default
         do {
-            try FileManager.default.createDirectory(at: f, withIntermediateDirectories: true,
-                                                    attributes: [.posixPermissions: 0o700])
-            // The record is staged before the MIME and renamed into place after it, so a crash can only
-            // leave a complete record beside a complete MIME or nothing sendable (F-19).
+            // Both files are written into a staging folder that is renamed into place in one step, so a
+            // crash leaves either a whole queued message or nothing that looks like one.
+            try fm.createDirectory(at: staging, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
             let data = try JSONEncoder().encode(item)
-            try data.write(to: staged, options: .atomic)
-            try (mime ?? MessageBuilder.build(message)).write(to: f.appendingPathComponent("message.eml"), options: .atomic)
-            try FileManager.default.moveItem(at: staged, to: record)
+            try (mime ?? MessageBuilder.build(message)).write(to: staging.appendingPathComponent("message.eml"), options: .atomic)
+            try data.write(to: staging.appendingPathComponent("item.json"), options: .atomic)
+            try fm.moveItem(at: staging, to: f)
             // A queued message is only real once its record is verifiably on disk (C-02).
-            guard (try? Data(contentsOf: record)) == data else {
+            guard (try? Data(contentsOf: f.appendingPathComponent("item.json"))) == data else {
                 throw CocoaError(.fileWriteUnknown,
                                  userInfo: [NSLocalizedDescriptionKey: "The Outbox record couldn't be verified on disk."])
             }
         } catch {
             // Nothing counts as queued unless the record is fully on disk; leave no half-written folder (C-02).
-            try? FileManager.default.removeItem(at: f)
+            try? fm.removeItem(at: staging)
+            try? fm.removeItem(at: f)
             throw error
         }
         items.append(item)
@@ -142,6 +146,7 @@ final class Outbox {
                 return
             }
         }
+        try? FileManager.default.removeItem(at: marker(id))
         items.removeAll { $0.id == id }
         NotificationCenter.default.post(name: .mailOutboxChanged, object: nil)
     }
@@ -153,7 +158,11 @@ final class Outbox {
         items[i].attempts = max(items[i].attempts, Self.maxAttempts)
         items[i].lastError = reason
         do { try write(items[i]) } catch {
-            DiagnosticsLog.record("Outbox: couldn't update the failure record for a queued message: \(error.localizedDescription)")
+            // The decision must survive a relaunch or the message could be sent twice: record it beside
+            // the folder instead.
+            do { try Data(reason.utf8).write(to: marker(id), options: .atomic) } catch {
+                DiagnosticsLog.record("Outbox: couldn't update the failure record for a queued message: \(error.localizedDescription)")
+            }
         }
         NotificationCenter.default.post(name: .mailOutboxChanged, object: nil)
     }
@@ -163,6 +172,7 @@ final class Outbox {
         guard let i = items.firstIndex(where: { $0.id == id }) else { return }
         items[i].attempts = 0
         items[i].lastError = nil
+        try? FileManager.default.removeItem(at: marker(id))
         do { try write(items[i]) } catch {
             DiagnosticsLog.record("Outbox: couldn't reset the failure record for a queued message: \(error.localizedDescription)")
         }

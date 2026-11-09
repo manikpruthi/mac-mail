@@ -276,10 +276,15 @@ final class Store {
         return out
     }
 
+    /// Folder paths each account's previous LIST left out (see upsertFolders).
+    private var missingFolders: [String: Set<String>] = [:]
+
     /// Replaces the account's folder list with what the server reported, keeping sync state for known folders.
-    /// The prune is skipped when the LIST result looks broken (empty, or INBOX missing): a bad response must
-    /// never cascade-delete every cached folder.
-    func upsertFolders(account: String, _ listed: [ListedFolder], isGmail: Bool) {
+    /// The prune is skipped when the LIST result looks broken (empty, or INBOX missing), and a cached folder
+    /// is only dropped once two LISTs in a row leave it out: one truncated reply must never cascade-delete
+    /// live mail and queued actions. Returns false when nothing was saved.
+    @discardableResult
+    func upsertFolders(account: String, _ listed: [ListedFolder], isGmail: Bool) -> Bool {
         db.transaction {
             var keep = Set<String>()
             for f in listed {
@@ -292,16 +297,13 @@ final class Store {
                     """, [account, f.path, name, f.role.rawValue, f.delimiter, f.selectable])
             }
             guard !listed.isEmpty, listed.contains(where: { $0.role == .inbox }) else { return }
-            var stale: [Int64] = []
-            var cached = 0
+            var stale: [(id: Int64, path: String)] = []
             db.query("SELECT id, path FROM folders WHERE account=?", [account]) {
-                cached += 1
-                if !keep.contains($0.text(1)) { stale.append($0.int64(0)) }
+                if !keep.contains($0.text(1)) { stale.append(($0.int64(0), $0.text(1))) }
             }
-            // A partial LIST (truncated or glitching server) can drop most of the cache in one reply;
-            // if more than half the folders vanished, keep them and wait for a good reply.
-            guard stale.count * 2 <= cached else { return }
-            for id in stale {
+            let missedBefore = missingFolders[account] ?? []
+            missingFolders[account] = Set(stale.map { $0.path })
+            for (id, path) in stale where missedBefore.contains(path) {
                 db.run("DELETE FROM pending_ops WHERE folder_id=?", [id])
                 // Explicit delete so the FTS/contacts triggers run for every message (B-14).
                 db.run("DELETE FROM messages WHERE folder_id=?", [id])
@@ -375,7 +377,8 @@ final class Store {
     /// Renames a folder and repoints everything that stored its path (C-28): queued actions for the folder,
     /// queued moves whose destination it is, and child folders under the old prefix — a child was renamed
     /// with its parent on the server, so its cache and queued actions must follow, not be pruned as stale.
-    func renameFolder(_ id: Int64, path: String, name: String) {
+    @discardableResult
+    func renameFolder(_ id: Int64, path: String, name: String) -> Bool {
         db.transaction {
             var oldPath = "", account = "", delim = "/"
             db.query("SELECT path, account, delim FROM folders WHERE id=?", [id]) {
@@ -466,7 +469,8 @@ final class Store {
         return changed
     }
 
-    func setFlag(messageIDs: [Int64], flag: MessageFlags, on: Bool) {
+    @discardableResult
+    func setFlag(messageIDs: [Int64], flag: MessageFlags, on: Bool) -> Bool {
         db.transaction {
             for id in messageIDs {
                 if on {
@@ -485,7 +489,8 @@ final class Store {
         }
     }
 
-    func deleteMessages(ids: [Int64]) {
+    @discardableResult
+    func deleteMessages(ids: [Int64]) -> Bool {
         db.transaction {
             for id in ids { db.run("DELETE FROM messages WHERE id=?", [id]) }
         }

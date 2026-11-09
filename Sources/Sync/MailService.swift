@@ -220,8 +220,9 @@ final class MailService {
         }
         let changing = rows.filter { $0.flags.contains(flag) != on }
         guard !changing.isEmpty else { return }
+        // A write the cache refused changes nothing: no row, no queued server action.
+        guard store.setFlag(messageIDs: changing.map { $0.id }, flag: flag, on: on) else { NSSound.beep(); return }
         for r in changing { if on { r.flags.insert(flag) } else { r.flags.remove(flag) } }
-        store.setFlag(messageIDs: changing.map { $0.id }, flag: flag, on: on)
         for (acct, list) in Dictionary(grouping: changing, by: { $0.accountID }) {
             engines[acct]?.queue(.flag(set: on, flag: imapFlag), rows: list)
         }
@@ -314,7 +315,8 @@ final class MailService {
         var undoID: UUID?
         if !removedIDs.isEmpty {
             let snapshot = store.snapshot(ids: removedIDs)
-            store.deleteMessages(ids: removedIDs)
+            // Rows the cache couldn't remove stay where they are, and the server is told nothing.
+            guard store.deleteMessages(ids: removedIDs) else { return nil }
             let id = UUID()
             let commitAll = { for c in commits { c() } }
             let timer = DispatchWorkItem { MainActor.assumeIsolated { MailService.shared.commitUndoable(id) } }

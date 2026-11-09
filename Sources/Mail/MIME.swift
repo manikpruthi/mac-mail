@@ -19,6 +19,8 @@ enum MIME {
         clean.reserveCapacity(data.count)
         // Ignore every '=' (valid or misplaced) and re-pad, so malformed padding can't blank the payload.
         for b in data where isBase64Char(b) && b != UInt8(ascii: "=") { clean.append(b) }
+        // One leftover character carries no whole byte; padding it would make the entire payload undecodable.
+        if clean.count % 4 == 1 { clean.removeLast() }
         while clean.count % 4 != 0 { clean.append(UInt8(ascii: "=")) }
         return Data(base64Encoded: Data(clean)) ?? Data()
     }

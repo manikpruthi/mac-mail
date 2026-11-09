@@ -352,7 +352,13 @@ actor TLSStream {
             t.close()
         }
         defer { watchdog.cancel() }
-        try await transport.open()
+        do { try await transport.open() } catch {
+            // A connection that failed to open is still alive underneath (an NWConnection keeps waiting
+            // for the network, the STARTTLS thread keeps running): release it, or every attempt made
+            // while offline leaks one.
+            transport.close()
+            throw error
+        }
     }
 
     /// Upgrades a STARTTLS connection once the server agreed. Any bytes the server sent before the

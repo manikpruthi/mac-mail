@@ -111,6 +111,12 @@ final class AccountEngine {
         connecting[lane] = task
         do {
             let c = try await task.value
+            // The engine was shut down or its connections were reset while this one was opening: it
+            // belongs to the old settings, so close it instead of keeping it.
+            guard connecting[lane] == task else {
+                Task { await c.disconnect() }
+                throw CancellationError()
+            }
             Debug.log("\(lane) connection ready: \(Debug.ms(since: t0))")
             clients[lane] = c
             isGmail = await c.isGmail
@@ -118,7 +124,7 @@ final class AccountEngine {
             connecting[lane] = nil
             return c
         } catch {
-            connecting[lane] = nil
+            if connecting[lane] == task { connecting[lane] = nil }
             throw error
         }
     }
@@ -238,7 +244,10 @@ final class AccountEngine {
                 let (list, counts) = try await c.listWithStatus()
                 return (list, counts, await c.isGmail)
             }
-            store.upsertFolders(account: account.id, listed, isGmail: gmail)
+            guard store.upsertFolders(account: account.id, listed, isGmail: gmail) else {
+                report(NetError.server("The folder list couldn't be saved to the mail cache."))
+                return
+            }
             NotificationCenter.default.post(name: .mailFoldersChanged, object: self)
             report(nil)
             if !counts.isEmpty {
@@ -701,9 +710,10 @@ final class AccountEngine {
             let c = try await client(.sync)
             try await c.renameMailbox(folder.path, to: newPath)
         }
-        store.renameFolder(folder.id, path: newPath, name: isGmail ? Store.displayName(ListedFolder(path: newPath, delimiter: folder.delimiter, attributes: []), isGmail: true) : clean)
+        let saved = store.renameFolder(folder.id, path: newPath, name: isGmail ? Store.displayName(ListedFolder(path: newPath, delimiter: folder.delimiter, attributes: []), isGmail: true) : clean)
         NotificationCenter.default.post(name: .mailFoldersChanged, object: self)
         await refreshFolders()
+        if !saved { throw NetError.server("The folder was renamed on the server, but the mail cache couldn't be updated.") }
     }
 
     func deleteFolder(_ folder: Folder) async throws {

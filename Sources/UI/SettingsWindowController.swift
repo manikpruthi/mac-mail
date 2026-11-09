@@ -449,11 +449,15 @@ final class SettingsWindowController: NSWindowController, NSTableViewDataSource,
             "Offline window:  \(Prefs.offlineDays) days (newest 200 per folder always kept)",
             "Last prune:      \(prune)",
         ]
+        if compactionSkipped { lines.append("Note:            text cleared, but the cache file couldn't be compacted; clear again later") }
         for e in service.engines.values where e.lastError != nil {
             lines.append("Last error:      \(e.account.email): \(e.lastError ?? "")")
         }
         storageInfo.stringValue = lines.joined(separator: "\n")
     }
+
+    /// The last clear emptied the cache but VACUUM failed, so the file kept its size.
+    private var compactionSkipped = false
 
     @objc private func clearBodies() {
         guard let w = window, w.attachedSheet == nil else { return }
@@ -470,7 +474,7 @@ final class SettingsWindowController: NSWindowController, NSTableViewDataSource,
             let path = MailService.shared.store.path
             // Two DELETEs and a full VACUUM go to their own connection on a utility queue (C-06).
             DispatchQueue.global(qos: .utility).async { [weak self] in
-                let cleared = Store.clearBodies(path: path)
+                let (cleared, compacted) = Store.clearBodies(path: path)
                 DispatchQueue.main.async {
                     MainActor.assumeIsolated {
                         guard let self else { return }
@@ -479,6 +483,7 @@ final class SettingsWindowController: NSWindowController, NSTableViewDataSource,
                             self.storageInfo.stringValue = "The message text cache couldn't be cleared. Try again."
                             return
                         }
+                        self.compactionSkipped = !compacted
                         NotificationCenter.default.postMailDataChanged(.all)
                         self.refreshStorage()
                         Memory.relieve()

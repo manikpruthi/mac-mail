@@ -351,15 +351,18 @@ actor IMAPClient {
         } else {
             // Without UIDPLUS a bare EXPUNGE would also purge messages another client flagged \Deleted;
             // expunge only when the pending deletions are exactly the ones we just made.
-            let ours = Set(try await uidSearch("ALL"))
+            let before = Set(try await uidSearch("DELETED"))
+            let ours = try await uidSearch("ALL")
             guard !ours.isEmpty else { return }
-            try await run("UID STORE 1:* +FLAGS.SILENT (\\Deleted)")
+            // Only the snapshot is flagged, never 1:*, so mail that arrives meanwhile is left alone.
+            for chunk in ours.chunked(1000) { try await run("UID STORE \(imapUIDSet(chunk)) +FLAGS.SILENT (\\Deleted)") }
             let deleted = Set(try await uidSearch("DELETED"))
-            guard deleted == ours else {
-                // Undo the flag on UIDs that arrived after the ALL snapshot; ours stay marked so a
-                // retry only has to empty them.
-                let extra = deleted.subtracting(ours)
-                if !extra.isEmpty { try? await run("UID STORE \(imapUIDSet(extra)) -FLAGS.SILENT (\\Deleted)") }
+            guard deleted == Set(ours) else {
+                // A message arrived already deleted by another client. Take back only the flags this
+                // command added (theirs stay), so a later EXPUNGE from any client can't purge the folder
+                // after the user was told it failed.
+                let mine = ours.filter { !before.contains($0) }
+                for chunk in mine.chunked(1000) { _ = try? await run("UID STORE \(imapUIDSet(chunk)) -FLAGS.SILENT (\\Deleted)") }
                 // Not expunged: reporting success here would tell the user the folder is empty when it isn't.
                 throw NetError.server("The folder changed while it was being emptied. Try again.")
             }

@@ -583,6 +583,8 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSSearc
             // undoID is set exactly when the move removed rows; "Already archived" (or archive-folder
             // creation) removed none, so the list and cursor must stay as they are.
             guard result.undoID != nil else {
+                // No reload follows, so nothing covers the next data change.
+                list.skipNextFullReload = false
                 toast.show(result.label)
                 return
             }

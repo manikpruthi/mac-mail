@@ -119,9 +119,11 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
         // would record a body that can never get its images back; pipelineEnded schedules the save instead.
         guard dirty, !sentOrDiscarded, pipelineTasks == 0, !waitingForDraftBody, let account else { return }
         commitEditing()
-        // The text storage is main-actor bound: only snapshot the string (and field values) here; encoding
-        // the RTFD — every inline image — and measuring widths run on the autosave queue.
+        // textView.attributedString() is the live text storage. Everything that reads it or its
+        // attachments happens here; the autosave queue only encodes a private copy.
         let attr = textView.attributedString()
+        let widths = InlineImage.widths(attr).map { Double($0) }
+        nonisolated(unsafe) let copy = InlineImage.detached(attr)
         let base = ComposerAutosave(
             // While the original account is gone, record it rather than the fallback the From popup shows:
             // restoring into another account would silently send from the wrong address (C-27).
@@ -134,11 +136,11 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
         autosaveQueue.async {
             // RTFD keeps inline images; old autosaves are plain RTF and still load. A body that can't be
             // encoded would replace a good autosave with an empty one, so keep the previous file (C-21).
-            let rtf = InlineImage.rtfd(attr)
-            if attr.length > 0, rtf == nil { return }
+            let rtf = copy.rtfd(from: NSRange(location: 0, length: copy.length), documentAttributes: [:])
+            if copy.length > 0, rtf == nil { return }
             var record = base
             record.bodyRTF = rtf
-            record.imageWidths = InlineImage.widths(attr).map { Double($0) }
+            record.imageWidths = widths
             record.write()
         }
     }

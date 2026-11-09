@@ -213,34 +213,31 @@ final class AttachmentChip: NSButton, NSDraggingSource {
     var dragProvider: (() -> NSFilePromiseProvider?)?
     private var mouseDownPoint: NSPoint?
 
+    // The press is followed through the ordinary responder methods, not a private event loop: a press
+    // that moves becomes a file drag, one that ends inside the chip is a click, and nothing else in the
+    // app (keys, other windows, sheets) ever waits on it.
     override func mouseDown(with event: NSEvent) {
+        guard isEnabled else { return }
         mouseDownPoint = event.locationInWindow
-        // Track the drag ourselves: a press that moves becomes a file drag, a press that doesn't and ends
-        // inside the chip is a click. The wait is capped, and a mouse-up outside the chip is not a click,
-        // so a missed mouse-up can never wedge the event loop or swallow the next click (C-23).
-        guard let window else { super.mouseDown(with: event); return }
-        let trackingWindow = window
-        let deadline = Date().addingTimeInterval(10)
-        while let next = trackingWindow.nextEvent(matching: [.leftMouseUp, .leftMouseDragged], until: deadline, inMode: .eventTracking, dequeue: true) {
-            // A click in another window, a sheet, or the window closing/being replaced ends the wait at
-            // once, leaving those events to the normal event loop instead of swallowing them here.
-            if next.window !== trackingWindow || self.window !== trackingWindow
-                || trackingWindow.attachedSheet != nil || !trackingWindow.isVisible { break }
-            if next.type == .leftMouseUp {
-                mouseDownPoint = nil
-                if isEnabled, bounds.contains(convert(next.locationInWindow, from: nil)) { performClick(nil) }
-                return
-            }
-            if let start = mouseDownPoint, hypot(next.locationInWindow.x - start.x, next.locationInWindow.y - start.y) > 4,
-               isEnabled, let provider = dragProvider?() {
-                mouseDownPoint = nil
-                let item = NSDraggingItem(pasteboardWriter: provider)
-                item.setDraggingFrame(bounds, contents: image)
-                beginDraggingSession(with: [item], event: event, source: self)
-                return
-            }
-        }
+        highlight(true)
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        guard let start = mouseDownPoint,
+              hypot(event.locationInWindow.x - start.x, event.locationInWindow.y - start.y) > 4 else { return }
         mouseDownPoint = nil
+        highlight(false)
+        guard let provider = dragProvider?() else { return }
+        let item = NSDraggingItem(pasteboardWriter: provider)
+        item.setDraggingFrame(bounds, contents: image)
+        beginDraggingSession(with: [item], event: event, source: self)
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        guard mouseDownPoint != nil else { return }
+        mouseDownPoint = nil
+        highlight(false)
+        if bounds.contains(convert(event.locationInWindow, from: nil)) { performClick(nil) }
     }
 
     func draggingSession(_ session: NSDraggingSession, sourceOperationMaskFor context: NSDraggingContext) -> NSDragOperation {

@@ -138,20 +138,22 @@ final class SQLiteDB {
     }
 
     /// Runs `body` as one transaction. If any statement inside it failed, the whole batch is rolled back:
-    /// a half-applied write is worse than none at all (C-10).
-    func transaction(_ body: () -> Void) {
+    /// a half-applied write is worse than none at all (C-10). Returns whether the batch was committed.
+    @discardableResult
+    func transaction(_ body: () -> Void) -> Bool {
         do { try exec("BEGIN IMMEDIATE") } catch {
             logError("BEGIN", error.localizedDescription)
             // No transaction is open, so the body must not run in autocommit: report the failure
             // through the same flag a failed statement sets.
             failedWrite = true
-            return
+            return false
         }
         failedWrite = false
         body()
         if failedWrite {
             failedWrite = false
             do { try exec("ROLLBACK") } catch { logError("ROLLBACK", error.localizedDescription) }
+            return false
         } else {
             do { try exec("COMMIT") } catch {
                 logError("COMMIT", error.localizedDescription)
@@ -159,8 +161,10 @@ final class SQLiteDB {
                 // transaction doesn't silently join it.
                 do { try exec("ROLLBACK") } catch { logError("ROLLBACK", error.localizedDescription) }
                 failedWrite = true
+                return false
             }
         }
+        return true
     }
 
     /// Like `transaction(_:)`, but a failure rolls the batch back and is rethrown, so sync can tell that

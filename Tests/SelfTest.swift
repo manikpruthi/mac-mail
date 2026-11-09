@@ -608,21 +608,24 @@ do {
     check("failed BEGIN skips body", (db.scalarInt("SELECT COUNT(*) FROM t") ?? -1) == 0)
 }
 
-// F-11: a partial LIST that drops more than half the cached folders must not cascade-delete them.
+// A truncated base64 payload (one dangling character) still decodes everything before it.
+check("base64 with a dangling char decodes", MIME.decodeBase64(Data("aGVsbG8h\r\nQ".utf8)) == Data("hello!".utf8))
+
+// F-11 / G-08: one LIST that leaves folders out must not cascade-delete them; two in a row prune.
 MainActor.assumeIsolated {
     guard let store = try? Store(path: scratchDir("upsert-\(UUID().uuidString)").appendingPathComponent("s.sqlite").path) else {
         check("upsert store opens", false); return
     }
-    store.upsertFolders(account: "f", [ListedFolder(path: "INBOX", delimiter: "/", attributes: []),
-                                       ListedFolder(path: "A", delimiter: "/", attributes: []),
-                                       ListedFolder(path: "B", delimiter: "/", attributes: []),
-                                       ListedFolder(path: "C", delimiter: "/", attributes: [])], isGmail: false)
-    store.upsertFolders(account: "f", [ListedFolder(path: "INBOX", delimiter: "/", attributes: [])], isGmail: false)
-    check("partial LIST keeps folders", store.folder(account: "f", path: "A") != nil && store.folder(account: "f", path: "C") != nil)
-    store.upsertFolders(account: "f", [ListedFolder(path: "INBOX", delimiter: "/", attributes: []),
-                                       ListedFolder(path: "A", delimiter: "/", attributes: []),
-                                       ListedFolder(path: "B", delimiter: "/", attributes: [])], isGmail: false)
-    check("normal LIST prunes stale folder", store.folder(account: "f", path: "C") == nil)
+    let full = ["INBOX", "A", "B", "C"].map { ListedFolder(path: $0, delimiter: "/", attributes: []) }
+    store.upsertFolders(account: "f", full, isGmail: false)
+    store.upsertFolders(account: "f", Array(full.prefix(3)), isGmail: false)
+    check("one partial LIST keeps the folder", store.folder(account: "f", path: "C") != nil)
+    store.upsertFolders(account: "f", full, isGmail: false)
+    store.upsertFolders(account: "f", Array(full.prefix(3)), isGmail: false)
+    check("a miss after a full LIST still keeps it", store.folder(account: "f", path: "C") != nil)
+    store.upsertFolders(account: "f", Array(full.prefix(3)), isGmail: false)
+    check("two LISTs in a row prune the folder", store.folder(account: "f", path: "C") == nil
+          && store.folder(account: "f", path: "B") != nil)
 }
 
 // F-22: repairEmptyBodies must drop the matching body_fts rows, not just the bodies.
@@ -747,32 +750,33 @@ do {
     try? FileManager.default.removeItem(at: pngFile)
 }
 
-// F-05 / F-19: an undeletable folder stays queued (not forgotten and sent again); a record staged before
-// the MIME finishes a commit a crash interrupted.
+// F-05 / G-07: an undeletable folder stays queued (not forgotten and sent again); a staging folder a
+// crash left behind is committed when complete and quarantined when not.
 MainActor.assumeIsolated {
     let stagedDir = scratchDir("outbox-staged-\(UUID().uuidString)")
     let id = UUID().uuidString
-    let folder = stagedDir.appendingPathComponent(id, isDirectory: true)
+    let folder = stagedDir.appendingPathComponent(id + ".tmp", isDirectory: true)
     try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
     let staged = #"{"id":"\#(id)","accountID":"acc","recipients":["z@example.com"],"subject":"staged","created":6500000000,"attempts":0}"#
-    try? Data(staged.utf8).write(to: folder.appendingPathComponent("item.json.tmp"))
+    try? Data(staged.utf8).write(to: folder.appendingPathComponent("item.json"))
     try? Data("From: m@example.com\r\nSubject: staged\r\n\r\nbody\r\n".utf8)
         .write(to: folder.appendingPathComponent("message.eml"))
     let recovered = Outbox(directory: stagedDir)
-    check("staged record recovered", recovered.items.count == 1 && recovered.items.first?.id == id
+    check("staged folder recovered", recovered.items.count == 1 && recovered.items.first?.id == id
           && recovered.items.first?.recipients == ["z@example.com"]
-          && FileManager.default.fileExists(atPath: folder.appendingPathComponent("item.json").path)
-          && !FileManager.default.fileExists(atPath: folder.appendingPathComponent("item.json.tmp").path))
+          && FileManager.default.fileExists(atPath: stagedDir.appendingPathComponent(id).appendingPathComponent("item.json").path)
+          && !FileManager.default.fileExists(atPath: folder.path))
     check("recovered item reloads", Outbox(directory: stagedDir).items.count == 1)
 
-    // Without a MIME there is nothing sendable, so the folder stays quarantined.
+    // A staging folder the crash left incomplete has nothing sendable, so it is quarantined.
     let noMimeDir = scratchDir("outbox-staged-nomime-\(UUID().uuidString)")
-    let orphan = noMimeDir.appendingPathComponent(UUID().uuidString, isDirectory: true)
+    let orphanID = UUID().uuidString
+    let orphan = noMimeDir.appendingPathComponent(orphanID + ".tmp", isDirectory: true)
     try? FileManager.default.createDirectory(at: orphan, withIntermediateDirectories: true)
-    try? Data(#"{"id":"\#(orphan.lastPathComponent)","accountID":"acc","recipients":[],"subject":"s","created":6500000000,"attempts":0}"#.utf8)
-        .write(to: orphan.appendingPathComponent("item.json.tmp"))
-    check("staged record without mime isn't loaded", Outbox(directory: noMimeDir).items.isEmpty
+    try? Data("From: m@example.com\r\n\r\nbody\r\n".utf8).write(to: orphan.appendingPathComponent("message.eml"))
+    check("incomplete staging folder isn't loaded", Outbox(directory: noMimeDir).items.isEmpty
           && waitFor { !FileManager.default.fileExists(atPath: orphan.path)
+                       && !FileManager.default.fileExists(atPath: noMimeDir.appendingPathComponent(orphanID).path)
                        && FileManager.default.fileExists(atPath: noMimeDir.path + " Corrupt") })
 
     // The rest stores records with Foundation's atomic write, which this sandbox may deny (see the probe).
@@ -793,9 +797,14 @@ MainActor.assumeIsolated {
     try? FileManager.default.setAttributes([.immutable: false], ofItemAtPath: itemFolder.path)
     check("failed delete keeps the item", box.items.count == 1
           && (box.items.first?.lastError?.contains("Couldn't delete") ?? false))
-    check("failed delete survives relaunch", Outbox(directory: dir).items.count == 1)
+    // G-02: the folder refused the record write too, so the decision must come back from its marker.
+    let relaunched = Outbox(directory: dir).items
+    check("failed delete survives relaunch with its decision", relaunched.count == 1
+          && relaunched.first?.attempts == Outbox.maxAttempts
+          && (relaunched.first?.lastError?.contains("Couldn't delete") ?? false))
     box.remove(item.id)
-    check("delete works once the folder can go", box.items.isEmpty && Outbox(directory: dir).items.isEmpty)
+    check("delete works once the folder can go", box.items.isEmpty && Outbox(directory: dir).items.isEmpty
+          && ((try? FileManager.default.contentsOfDirectory(atPath: dir.path))?.isEmpty ?? false))
 
     // F-01 / F-23: a terminal failure blocks automatic retries until the user retries or deletes.
     let retryDir = scratchDir("outbox-decision-\(UUID().uuidString)")

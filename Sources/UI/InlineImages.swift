@@ -152,15 +152,25 @@ enum InlineImage {
         storage.endEditing()
     }
 
-    /// RTFD of the body with each image's original bytes (AppKit may have rewritten the display file wrapper).
-    static func rtfd(_ attr: NSAttributedString) -> Data? {
+    /// A private copy of the body in which every attachment is a fresh object holding the image's
+    /// original bytes (AppKit may have rewritten the display file wrapper). Nothing in it is shared
+    /// with the editor, so it can be encoded on another queue while the user keeps typing.
+    static func detached(_ attr: NSAttributedString) -> NSAttributedString {
         let copy = NSMutableAttributedString(attributedString: attr)
         attr.enumerateAttribute(.attachment, in: NSRange(location: 0, length: attr.length)) { v, r, _ in
-            guard let a = v as? InlineImageAttachment, !a.payload.isEmpty else { return }
-            let w = FileWrapper(regularFileWithContents: a.payload)
+            guard let a = v as? NSTextAttachment else { return }
+            let inline = (a as? InlineImageAttachment)?.payload ?? Data()
+            guard let data = inline.isEmpty ? a.fileWrapper?.regularFileContents : inline else { return }
+            let w = FileWrapper(regularFileWithContents: data)
             w.preferredFilename = a.fileWrapper?.preferredFilename ?? "image.png"
             copy.addAttribute(.attachment, value: NSTextAttachment(fileWrapper: w), range: r)
         }
+        return copy
+    }
+
+    /// RTFD of the body with each image's original bytes.
+    static func rtfd(_ attr: NSAttributedString) -> Data? {
+        let copy = detached(attr)
         return copy.rtfd(from: NSRange(location: 0, length: copy.length), documentAttributes: [:])
     }
 
