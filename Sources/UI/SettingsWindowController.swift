@@ -1,21 +1,31 @@
 import AppKit
+import UserNotifications
 
 /// Settings: Accounts (add / remove / signature) and General (offline window, images, reading, sending).
 @MainActor
 final class SettingsWindowController: NSWindowController, NSTableViewDataSource, NSTableViewDelegate, NSTextViewDelegate,
-                                       NSTextFieldDelegate {
+                                       NSTextFieldDelegate, NSTabViewDelegate {
     private let tabs = NSTabView()
     private let table = NSTableView()
     private let signature = NSTextView()
     private let nameField = NSTextField()
+    private let addButton = NSButton(title: "Add Account…", target: nil, action: nil)
     private let removeButton = NSButton(title: "Remove", target: nil, action: nil)
     private let defaultButton = NSButton(title: "Make Default", target: nil, action: nil)
     private let editButton = NSButton(title: "Edit Account…", target: nil, action: nil)
     private let notifyBox = NSButton(checkboxWithTitle: "Notify about new mail in this account", target: nil, action: nil)
+    private let notifyNote = NSTextField(wrappingLabelWithString: "")
+    private let notifyFix = NSButton(title: "Open System Settings…", target: nil, action: nil)
     private let saveButton = NSButton(title: "Save", target: nil, action: nil)
     /// Name/signature edits not yet saved, and which account they belong to (B-10).
     private var detailsDirty = false
     private var loadedAccountID: String?
+    /// The one sheet open on this window, if any (C-17).
+    private var accountSheet: AddAccountSheet?
+    /// Bumped per storage refresh so a slow background read can't overwrite newer figures (C-33).
+    private var storageGeneration = 0
+    /// Bumped per notification-status query so a late answer can't label the wrong account (C-32).
+    private var notifyGeneration = 0
 
     init() {
         let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 620, height: 470), styleMask: [.titled, .closable],
@@ -44,8 +54,13 @@ final class SettingsWindowController: NSWindowController, NSTableViewDataSource,
             tabs.bottomAnchor.constraint(equalTo: w.contentView!.bottomAnchor, constant: -12),
         ])
         w.center()
+        tabs.delegate = self
         NotificationCenter.default.addObserver(self, selector: #selector(reloadAccounts), name: .mailAccountsChanged, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(syncThemePopup), name: .themeChanged, object: nil)
+        // Closing the window must not silently drop edited name/signature text (C-16).
+        NotificationCenter.default.addObserver(self, selector: #selector(settingsWindowWillClose), name: NSWindow.willCloseNotification, object: w)
+        // Coming back from System Settings re-reads whether notifications are allowed (C-32).
+        NotificationCenter.default.addObserver(self, selector: #selector(appDidBecomeActive), name: NSApplication.didBecomeActiveNotification, object: nil)
     }
 
     required init?(coder: NSCoder) { fatalError() }
@@ -67,7 +82,9 @@ final class SettingsWindowController: NSWindowController, NSTableViewDataSource,
         table.usesAlternatingRowBackgroundColors = false
         scroll.documentView = table
 
-        let add = NSButton(title: "Add Account…", target: self, action: #selector(addAccount))
+        let add = addButton
+        add.target = self
+        add.action = #selector(addAccount)
         add.bezelStyle = .rounded
         removeButton.bezelStyle = .rounded
         removeButton.target = self
@@ -80,6 +97,16 @@ final class SettingsWindowController: NSWindowController, NSTableViewDataSource,
         editButton.action = #selector(editSelectedAccount)
         notifyBox.target = self
         notifyBox.action = #selector(notifyToggled)
+        // Shown only when macOS authorization is denied, so an "On" switch is never a silent lie (C-32).
+        notifyNote.font = .systemFont(ofSize: 11)
+        notifyNote.textColor = .systemOrange
+        notifyNote.isHidden = true
+        notifyFix.bezelStyle = .inline
+        notifyFix.isBordered = false
+        notifyFix.contentTintColor = .linkColor
+        notifyFix.target = self
+        notifyFix.action = #selector(openNotificationSettings)
+        notifyFix.isHidden = true
 
         let nameLabel = NSTextField(labelWithString: "Your name:")
         nameField.placeholderString = "Shown as the sender"
@@ -103,7 +130,8 @@ final class SettingsWindowController: NSWindowController, NSTableViewDataSource,
         save.action = #selector(saveDetails)
         save.bezelStyle = .rounded
 
-        for x in [scroll, add, removeButton, defaultButton, editButton, nameLabel, nameField, sigLabel, sigScroll, save, notifyBox] as [NSView] {
+        for x in [scroll, add, removeButton, defaultButton, editButton, nameLabel, nameField, sigLabel, sigScroll, save, notifyBox,
+                  notifyNote, notifyFix] as [NSView] {
             x.translatesAutoresizingMaskIntoConstraints = false
             v.addSubview(x)
         }
@@ -135,12 +163,19 @@ final class SettingsWindowController: NSWindowController, NSTableViewDataSource,
             save.trailingAnchor.constraint(equalTo: scroll.trailingAnchor),
             notifyBox.centerYAnchor.constraint(equalTo: save.centerYAnchor),
             notifyBox.leadingAnchor.constraint(equalTo: sigScroll.leadingAnchor),
+            notifyNote.topAnchor.constraint(equalTo: save.bottomAnchor, constant: 10),
+            notifyNote.leadingAnchor.constraint(equalTo: scroll.leadingAnchor),
+            notifyNote.trailingAnchor.constraint(equalTo: notifyFix.leadingAnchor, constant: -8),
+            notifyFix.trailingAnchor.constraint(equalTo: scroll.trailingAnchor),
+            notifyFix.centerYAnchor.constraint(equalTo: notifyNote.centerYAnchor),
         ])
         reloadAccounts()
         return v
     }
 
     @objc private func reloadAccounts() {
+        // An account added, edited or removed elsewhere must not silently drop text typed here.
+        commitDetails(for: loadedAccountID)
         table.reloadData()
         if table.selectedRow < 0 && !MailService.shared.accounts.isEmpty { table.selectRowIndexes([0], byExtendingSelection: false) }
         loadDetails()
@@ -158,13 +193,15 @@ final class SettingsWindowController: NSWindowController, NSTableViewDataSource,
         signature.string = a?.signature ?? ""
         nameField.isEnabled = a != nil
         signature.isEditable = a != nil
+        addButton.isEnabled = accountSheet == nil
         removeButton.isEnabled = a != nil
-        editButton.isEnabled = a != nil && a?.provider != .demo
+        editButton.isEnabled = a != nil && a?.provider != .demo && accountSheet == nil
         notifyBox.isEnabled = a != nil
         notifyBox.state = a.map { Prefs.notifications(for: $0.id) } ?? false ? .on : .off
         defaultButton.isEnabled = a != nil && MailService.shared.accounts.count > 1
         detailsDirty = false
         saveButton.isEnabled = false
+        refreshNotificationStatus()
     }
 
     func textDidChange(_ notification: Notification) { markDetailsDirty() }
@@ -189,9 +226,65 @@ final class SettingsWindowController: NSWindowController, NSTableViewDataSource,
         MailService.shared.updateAccount(a)
     }
 
+    /// Closing the window saves pending edits instead of losing them (C-16).
+    @objc private func settingsWindowWillClose() {
+        commitPendingEdits()
+    }
+
+    /// Saves name/signature edits typed but not committed (window close and quit, C-16).
+    func commitPendingEdits() {
+        // A text field's value lives in its editor until editing ends; commit it to the control first.
+        window?.makeFirstResponder(nil)
+        commitDetails(for: loadedAccountID)
+    }
+
     @objc private func notifyToggled() {
         guard let a = selectedAccount else { return }
-        Prefs.setNotifications(notifyBox.state == .on, for: a.id)
+        let on = notifyBox.state == .on
+        Prefs.setNotifications(on, for: a.id)
+        guard on else {
+            refreshNotificationStatus()
+            return
+        }
+        // Ask macOS now, when the user switches notifications on, not at the first delivery (C-32).
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound, .badge]) { [weak self] _, _ in
+            DispatchQueue.main.async { MainActor.assumeIsolated { self?.refreshNotificationStatus() } }
+        }
+    }
+
+    @objc private func openNotificationSettings() {
+        if let url = URL(string: "x-apple.systempreferences:com.apple.Notifications-Settings.extension") {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
+    @objc private func appDidBecomeActive() {
+        refreshNotificationStatus()
+    }
+
+    /// Says that macOS is blocking alerts, so an "On" switch is never a silent lie (C-32).
+    private func refreshNotificationStatus() {
+        notifyGeneration += 1
+        let generation = notifyGeneration
+        guard let a = selectedAccount, Prefs.notifications(for: a.id) else {
+            setNotificationWarning(false)
+            return
+        }
+        UNUserNotificationCenter.current().getNotificationSettings { [weak self] settings in
+            let denied = settings.authorizationStatus == .denied
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated {
+                    guard let self, self.notifyGeneration == generation, self.selectedAccount?.id == a.id else { return }
+                    self.setNotificationWarning(denied)
+                }
+            }
+        }
+    }
+
+    private func setNotificationWarning(_ show: Bool) {
+        notifyNote.stringValue = show ? "macOS is blocking Mac Mail notifications." : ""
+        notifyNote.isHidden = !show
+        notifyFix.isHidden = !show
     }
 
     @objc private func editSelectedAccount() {
@@ -201,26 +294,31 @@ final class SettingsWindowController: NSWindowController, NSTableViewDataSource,
 
     /// Account editor / Sign in again (F-04): servers, ports, logins, security and the password.
     func editAccount(_ id: String) {
-        guard let w = window, let a = MailService.shared.account(id), a.provider != .demo else { return }
-        let sheet = AddAccountSheet(editing: a)
-        w.beginSheet(sheet.window!) { _ in
-            sheet.cancelProbe()
-            _ = sheet
-        }
+        guard let a = MailService.shared.account(id), a.provider != .demo else { return }
+        present(AddAccountSheet(editing: a))
     }
 
     @objc func addAccount() {
-        guard let w = window else { return }
-        let sheet = AddAccountSheet()
-        w.beginSheet(sheet.window!) { _ in
+        present(AddAccountSheet())
+    }
+
+    /// One sheet at a time (C-17): a second click or menu command must not stack a sheet on the window
+    /// (AppKit raises) or leave the first probe running out of sight.
+    private func present(_ sheet: AddAccountSheet) {
+        guard let w = window, w.attachedSheet == nil, accountSheet == nil else { return }
+        accountSheet = sheet
+        addButton.isEnabled = false
+        editButton.isEnabled = false
+        w.beginSheet(sheet.window!) { [weak self] _ in
             // Ending the sheet (Cancel, Esc or success) stops an in-flight credential probe.
             sheet.cancelProbe()
-            _ = sheet
+            self?.accountSheet = nil
+            self?.loadDetails()
         }
     }
 
     @objc private func removeAccount() {
-        guard let a = selectedAccount, let w = window else { return }
+        guard let a = selectedAccount, let w = window, w.attachedSheet == nil else { return }
         let alert = NSAlert()
         alert.messageText = "Remove \(a.email)?"
         alert.informativeText = "Its offline mail is deleted from this Mac. Nothing is deleted from the server."
@@ -259,24 +357,32 @@ final class SettingsWindowController: NSWindowController, NSTableViewDataSource,
         loadDetails()
     }
 
+    /// Storage figures are read when that tab is opened, not when Settings is created (C-33).
+    func tabView(_ tabView: NSTabView, didSelect tabViewItem: NSTabViewItem?) {
+        guard tabViewItem?.identifier as? String == "storage" else { return }
+        refreshStorage()
+    }
+
     // MARK: Storage tab (F-26)
 
     private let storageInfo = NSTextField(wrappingLabelWithString: "")
+    private let clearBodiesButton = NSButton(title: "Clear Message Text Cache…", target: nil, action: nil)
 
     private func storageView() -> NSView {
         let v = NSView()
         storageInfo.font = .monospacedDigitSystemFont(ofSize: 12, weight: .regular)
         storageInfo.isSelectable = true
         let refresh = NSButton(title: "Refresh", target: self, action: #selector(refreshStorage))
-        let clearBodies = NSButton(title: "Clear Message Text Cache…", target: self, action: #selector(clearBodies))
+        clearBodiesButton.target = self
+        clearBodiesButton.action = #selector(clearBodies)
         let clearImages = NSButton(title: "Clear Image Cache", target: self, action: #selector(clearImages))
         let pruneNow = NSButton(title: "Prune Now", target: self, action: #selector(pruneNow))
         let exportLog = NSButton(title: "Export Diagnostics Log…", target: self, action: #selector(exportLog))
-        for b in [refresh, clearBodies, clearImages, pruneNow, exportLog] { b.bezelStyle = .rounded }
+        for b in [refresh, clearBodiesButton, clearImages, pruneNow, exportLog] { b.bezelStyle = .rounded }
         let note = NSTextField(wrappingLabelWithString: "Cleared message text is downloaded again when you open a message. Nothing is deleted from the server. The diagnostics log holds connection and sync errors only — never message content or passwords.")
         note.font = .systemFont(ofSize: 11)
         note.textColor = .secondaryLabelColor
-        let buttons = NSStackView(views: [refresh, pruneNow, clearBodies, clearImages])
+        let buttons = NSStackView(views: [refresh, pruneNow, clearBodiesButton, clearImages])
         buttons.orientation = .horizontal
         buttons.spacing = 8
         for x in [storageInfo, buttons, exportLog, note] as [NSView] {
@@ -295,23 +401,47 @@ final class SettingsWindowController: NSWindowController, NSTableViewDataSource,
             note.leadingAnchor.constraint(equalTo: storageInfo.leadingAnchor),
             note.trailingAnchor.constraint(equalTo: storageInfo.trailingAnchor),
         ])
-        refreshStorage()
+        // The figures are read when the tab is opened, never while Settings is being created (C-33).
         return v
     }
 
+    /// Storage figures are counted on a utility queue with its own connection: the SQL and the file sizes
+    /// never run on the main thread (C-33).
     @objc private func refreshStorage() {
         let service = MailService.shared
-        let store = service.store
-        let fmt = ByteCountFormatter()
-        let db = fmt.string(fromByteCount: store.databaseBytes)
-        let messages = store.cachedMessageCount
-        let bodies = store.cachedBodyCount
         let prune = service.lastPrune.map { DateFormatter.localizedString(from: $0, dateStyle: .short, timeStyle: .short) } ?? "not yet this session"
-        var lines = [
-            "Mail cache:      \(db)  (\(messages) messages, \(bodies) with text)",
+        storageInfo.stringValue = [
+            "Mail cache:      calculating…",
             "Image cache:     calculating…",
             "Outbox:          \(service.outbox.items.count) waiting",
-            "Queued actions:  \(store.opCounts().values.reduce(0, +))",
+            "Queued actions:  calculating…",
+            "Offline window:  \(Prefs.offlineDays) days (newest 200 per folder always kept)",
+            "Last prune:      \(prune)",
+        ].joined(separator: "\n")
+        storageGeneration += 1
+        let generation = storageGeneration
+        let path = service.store.path
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let stats = Store.stats(path: path)
+            let images = AppPaths.directorySize(AppPaths.imageCache)
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated {
+                    guard let self, self.storageGeneration == generation else { return }
+                    self.showStorage(stats, images: images)
+                }
+            }
+        }
+    }
+
+    private func showStorage(_ stats: MailCacheStats, images: Int64) {
+        let service = MailService.shared
+        let fmt = ByteCountFormatter()
+        let prune = service.lastPrune.map { DateFormatter.localizedString(from: $0, dateStyle: .short, timeStyle: .short) } ?? "not yet this session"
+        var lines = [
+            "Mail cache:      \(fmt.string(fromByteCount: stats.databaseBytes))  (\(stats.messages) messages, \(stats.bodies) with text)",
+            "Image cache:     \(fmt.string(fromByteCount: images)) (limit 200 MB)",
+            "Outbox:          \(service.outbox.items.count) waiting",
+            "Queued actions:  \(stats.queuedOps)",
             "Offline window:  \(Prefs.offlineDays) days (newest 200 per folder always kept)",
             "Last prune:      \(prune)",
         ]
@@ -319,28 +449,38 @@ final class SettingsWindowController: NSWindowController, NSTableViewDataSource,
             lines.append("Last error:      \(e.account.email): \(e.lastError ?? "")")
         }
         storageInfo.stringValue = lines.joined(separator: "\n")
-        DispatchQueue.global(qos: .utility).async { [weak self] in
-            let images = ByteCountFormatter().string(fromByteCount: AppPaths.directorySize(AppPaths.imageCache))
-            DispatchQueue.main.async {
-                guard let self else { return }
-                self.storageInfo.stringValue = self.storageInfo.stringValue
-                    .replacingOccurrences(of: "Image cache:     calculating…", with: "Image cache:     \(images) (limit 200 MB)")
-            }
-        }
     }
 
     @objc private func clearBodies() {
-        guard let w = window else { return }
+        guard let w = window, w.attachedSheet == nil else { return }
         let a = NSAlert()
         a.messageText = "Clear the cached message text?"
         a.informativeText = "Messages stay in the list; their text is downloaded again when opened. Offline reading needs a fresh download."
         a.addButton(withTitle: "Clear")
         a.addButton(withTitle: "Cancel")
         a.beginSheetModal(for: w) { [weak self] r in
-            guard r == .alertFirstButtonReturn else { return }
-            MailService.shared.store.clearBodyCache()
-            NotificationCenter.default.postMailDataChanged(.all)
-            self?.refreshStorage()
+            guard r == .alertFirstButtonReturn, let self else { return }
+            self.clearBodiesButton.isEnabled = false
+            self.storageGeneration += 1
+            self.storageInfo.stringValue = "Clearing the cached message text…"
+            let path = MailService.shared.store.path
+            // Two DELETEs and a full VACUUM go to their own connection on a utility queue (C-06).
+            DispatchQueue.global(qos: .utility).async { [weak self] in
+                let cleared = Store.clearBodies(path: path)
+                DispatchQueue.main.async {
+                    MainActor.assumeIsolated {
+                        guard let self else { return }
+                        self.clearBodiesButton.isEnabled = true
+                        guard cleared else {
+                            self.storageInfo.stringValue = "The message text cache couldn't be cleared. Try again."
+                            return
+                        }
+                        NotificationCenter.default.postMailDataChanged(.all)
+                        self.refreshStorage()
+                        Memory.relieve()
+                    }
+                }
+            }
         }
     }
 
@@ -512,6 +652,8 @@ final class SettingsWindowController: NSWindowController, NSTableViewDataSource,
 
     func show(tab: String) {
         tabs.selectTabViewItem(withIdentifier: tab)
+        // selectTabViewItem doesn't always tell the delegate, so the figures are kicked off here too.
+        if tab == "storage" { refreshStorage() }
         showWindow(nil)
         window?.makeKeyAndOrderFront(nil)
     }
@@ -537,6 +679,8 @@ final class AddAccountSheet: NSWindowController {
     private let error = NSTextField(wrappingLabelWithString: "")
     private let spinner = NSProgressIndicator()
     private let signIn = NSButton(title: "Sign In", target: nil, action: nil)
+    /// Saves an edit without contacting the servers, so an offline Mac can still fix its settings (C-18).
+    private let saveOffline = NSButton(title: "Save Without Verifying", target: nil, action: nil)
     private var serverRows: [NSGridRow] = []
 
     init(editing: Account? = nil) {
@@ -627,11 +771,16 @@ final class AddAccountSheet: NSWindowController {
         signIn.keyEquivalent = "\r"
         signIn.target = self
         signIn.action = #selector(submit)
-        let note = NSTextField(wrappingLabelWithString: "The password is stored only in your Mac's Keychain. Mac Mail signs in to both incoming (IMAP) and outgoing (SMTP) mail before saving, and never sends a password without TLS.")
+        saveOffline.bezelStyle = .rounded
+        saveOffline.target = self
+        saveOffline.action = #selector(saveWithoutVerifying)
+        saveOffline.isHidden = editing == nil
+        saveOffline.toolTip = "Keep these settings and reconnect later, without checking the password now."
+        let note = NSTextField(wrappingLabelWithString: "The password is stored only in your Mac's Keychain. Mac Mail signs in to IMAP and SMTP before saving (or saves unchecked if you choose) and never sends a password without TLS.")
         note.font = .systemFont(ofSize: 11)
         note.textColor = .secondaryLabelColor
 
-        for v in [title, grid, error, note, spinner, cancel, signIn] as [NSView] {
+        for v in [title, grid, error, note, spinner, cancel, signIn, saveOffline] as [NSView] {
             v.translatesAutoresizingMaskIntoConstraints = false
             content.addSubview(v)
         }
@@ -654,6 +803,8 @@ final class AddAccountSheet: NSWindowController {
             cancel.trailingAnchor.constraint(equalTo: signIn.leadingAnchor, constant: -8),
             spinner.centerYAnchor.constraint(equalTo: signIn.centerYAnchor),
             spinner.trailingAnchor.constraint(equalTo: cancel.leadingAnchor, constant: -10),
+            saveOffline.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 20),
+            saveOffline.centerYAnchor.constraint(equalTo: signIn.centerYAnchor),
         ])
         providerChanged()
     }
@@ -680,7 +831,10 @@ final class AddAccountSheet: NSWindowController {
         let other = provider.indexOfSelectedItem == 1
         for r in serverRows { r.isHidden = !other }
         email.placeholderString = other ? "you@example.com" : "you@gmail.com"
-        password.placeholderString = other ? "Password or app password" : "16-character App Password"
+        // An edited account keeps its saved password unless a new one is typed.
+        password.placeholderString = editing == nil
+            ? (other ? "Password or app password" : "16-character App Password")
+            : "Leave empty to keep the saved password"
     }
 
     @objc private func openHelp() {
@@ -689,75 +843,90 @@ final class AddAccountSheet: NSWindowController {
 
     @objc private func cancel() {
         probeTask?.cancel()
-        guard let w = window else { return }
-        w.sheetParent?.endSheet(w)
+        closeSheet()
     }
 
-    @objc private func submit() {
+    /// Validates the form and builds the account from the fields the editor shows (C-31). When editing,
+    /// the saved account is the starting point, so settings this sheet doesn't show are kept as they are.
+    private func formAccount() -> Account? {
         let mail = email.stringValue.trimmingCharacters(in: .whitespaces)
         // App Passwords are shown with spaces; Google accepts them without.
         let pass = password.stringValue.replacingOccurrences(of: " ", with: "")
         guard mail.contains("@"), !pass.isEmpty || editing != nil else {
             error.stringValue = "Enter your email address and App Password."
-            return
+            return nil
         }
         if editing == nil, MailService.shared.accounts.contains(where: { $0.email.lowercased() == mail.lowercased() }) {
             error.stringValue = "\(mail) is already added."
-            return
+            return nil
         }
-        var account: Account
-        if provider.indexOfSelectedItem == 0 {
-            account = Account.gmail(email: mail, name: name.stringValue)
-            if let e = editing { account.id = e.id; account.signature = e.signature }
-        } else {
+        // Keeping the saved account means a custom login, SMTP login, port or security mode survives an
+        // edit; only the fields this sheet exposes are replaced (C-31).
+        var account = editing ?? Account.gmail(email: mail, name: name.stringValue)
+        account.email = mail
+        account.displayName = name.stringValue
+        if provider.indexOfSelectedItem == 1 {
             guard !imapHost.stringValue.isEmpty, !smtpHost.stringValue.isEmpty else {
                 error.stringValue = "Enter the IMAP and SMTP servers."
-                return
+                return nil
             }
             // Invalid ports would silently fall back to 993/465 before; now they stop the submit.
-            func port(_ text: String, _ name: String) -> UInt16? {
+            func port(_ text: String) -> UInt16? {
                 guard let n = Int(text.trimmingCharacters(in: .whitespaces)), (1...65535).contains(n) else { return nil }
                 return UInt16(n)
             }
-            guard let pIn = port(imapPort.stringValue, "IMAP") else {
+            guard let pIn = port(imapPort.stringValue) else {
                 error.stringValue = "The IMAP port must be a number between 1 and 65535."
-                return
+                return nil
             }
-            guard let pOut = port(smtpPort.stringValue, "SMTP") else {
+            guard let pOut = port(smtpPort.stringValue) else {
                 error.stringValue = "The SMTP port must be a number between 1 and 65535."
-                return
+                return nil
             }
             let login = username.stringValue.trimmingCharacters(in: .whitespaces)
-            account = Account(id: editing?.id ?? UUID().uuidString, email: mail, displayName: name.stringValue, provider: .imap,
-                              username: login.isEmpty ? mail : login,
-                              imapHost: imapHost.stringValue.trimmingCharacters(in: .whitespaces), imapPort: pIn,
-                              smtpHost: smtpHost.stringValue.trimmingCharacters(in: .whitespaces), smtpPort: pOut,
-                              signature: editing?.signature ?? "",
-                              imapSecurity: ConnectionSecurity.allCases[max(0, imapSecurity.indexOfSelectedItem)],
-                              smtpSecurity: ConnectionSecurity.allCases[max(0, smtpSecurity.indexOfSelectedItem)],
-                              smtpUsername: smtpUsername.stringValue.trimmingCharacters(in: .whitespaces))
+            account.provider = .imap
+            account.username = login.isEmpty ? mail : login
+            account.imapHost = imapHost.stringValue.trimmingCharacters(in: .whitespaces)
+            account.imapPort = pIn
+            account.smtpHost = smtpHost.stringValue.trimmingCharacters(in: .whitespaces)
+            account.smtpPort = pOut
+            account.imapSecurity = ConnectionSecurity.allCases[max(0, imapSecurity.indexOfSelectedItem)]
+            account.smtpSecurity = ConnectionSecurity.allCases[max(0, smtpSecurity.indexOfSelectedItem)]
+            account.smtpUsername = smtpUsername.stringValue.trimmingCharacters(in: .whitespaces)
         }
         if account.displayName.isEmpty { account.displayName = String(mail.split(separator: "@").first ?? "") }
+        return account
+    }
+
+    @objc private func submit() {
+        guard let account = formAccount() else { return }
+        let pass = password.stringValue.replacingOccurrences(of: " ", with: "")
         error.stringValue = ""
-        spinner.startAnimation(nil)
-        signIn.isEnabled = false
+        setProbing(true)
         probeTask = Task { [weak self] in
+            // Cancelled before the task got to run: don't contact the servers at all.
+            guard !Task.isCancelled else { return }
             do {
                 if self?.editing != nil {
+                    // What the edit replaces, in case the sheet is cancelled while the check runs.
+                    let restore = MailService.shared.restorePoint(for: account.id)
                     try await MailService.shared.updateCredentials(account, password: pass)
-                    guard !Task.isCancelled else { return }
+                    guard !Task.isCancelled else {
+                        // Cancelled during the check: leave the account exactly as the user found it.
+                        if let restore { MailService.shared.restore(restore) }
+                        return
+                    }
                 } else {
                     try await MailService.shared.addAccount(account, password: pass)
                     // The sheet may have been cancelled while the probe was running: undo the add.
                     guard !Task.isCancelled else { MailService.shared.removeAccount(account.id); return }
                 }
-                self?.spinner.stopAnimation(nil)
-                if let w = self?.window { w.sheetParent?.endSheet(w) }
+                self?.setProbing(false)
+                self?.closeSheet()
                 (NSApp.delegate as? AppDelegate)?.mainWindow?.window?.makeKeyAndOrderFront(nil)
             } catch {
                 guard !Task.isCancelled else { return }
-                self?.spinner.stopAnimation(nil)
-                self?.signIn.isEnabled = true
+                self?.setProbing(false)
                 var msg = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
                 if account.provider == .gmail, case NetError.auth = error {
                     msg += " Use an App Password, not your normal Google password. 2-Step Verification must be on."
@@ -765,6 +934,30 @@ final class AddAccountSheet: NSWindowController {
                 self?.error.stringValue = msg
             }
         }
+    }
+
+    /// Saves an edited account without a network check, so a mistyped host or an offline Mac is fixable (C-18).
+    @objc private func saveWithoutVerifying() {
+        guard editing != nil, let account = formAccount() else { return }
+        let pass = password.stringValue.replacingOccurrences(of: " ", with: "")
+        do {
+            try MailService.shared.saveCredentialsWithoutVerifying(account, password: pass)
+        } catch {
+            self.error.stringValue = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            return
+        }
+        closeSheet()
+    }
+
+    private func setProbing(_ probing: Bool) {
+        if probing { spinner.startAnimation(nil) } else { spinner.stopAnimation(nil) }
+        signIn.isEnabled = !probing
+        saveOffline.isEnabled = !probing
+    }
+
+    private func closeSheet() {
+        guard let w = window else { return }
+        w.sheetParent?.endSheet(w)
     }
 
     /// The in-flight credential probe, cancelled if the sheet closes first.
