@@ -176,6 +176,9 @@ struct MessageDetail {
     var structure: BodyPart?
     var size: Int
     var folderRole: FolderRole
+    /// Header-only fields not carried by every query: In-Reply-To for reply drafts, Bcc for drafts.
+    var inReplyTo: String = ""
+    var bcc: String = ""
 }
 
 /// Parsed header + structure data for a message, built off the main thread from an IMAP FETCH.

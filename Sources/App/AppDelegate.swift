@@ -49,6 +49,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             MainActor.assumeIsolated {
                 self?.idleWork?.cancel()
                 self?.mainWindow?.preview.restoreWebViewIfNeeded()
+                PreviewViewController.restoreWebViews(except: self?.mainWindow?.preview)
+                ComposeWindowController.restoreQuoteWebViews()
                 self?.mainWindow?.appBecameActive()
             }
         }
@@ -66,11 +68,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             }
         }
         nc.addObserver(forName: NSWindow.didDeminiaturizeNotification, object: nil, queue: .main) { [weak self] _ in
-            MainActor.assumeIsolated { self?.mainWindow?.preview.restoreWebViewIfNeeded() }
+            MainActor.assumeIsolated {
+                self?.mainWindow?.preview.restoreWebViewIfNeeded()
+                PreviewViewController.restoreWebViews(except: self?.mainWindow?.preview)
+            }
         }
         memoryPressure.setEventHandler { [weak self] in
             MainActor.assumeIsolated {
-                if !NSApp.isActive { self?.mainWindow?.preview.releaseWebView() }
+                if !NSApp.isActive {
+                    self?.mainWindow?.preview.releaseWebView()
+                    PreviewViewController.releaseWebViews(except: self?.mainWindow?.preview)
+                    ComposeWindowController.releaseQuoteWebViews()
+                }
                 Memory.relieve()
             }
         }
@@ -85,6 +94,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         let work = DispatchWorkItem { [weak self] in
             guard !NSApp.isActive || self?.mainWindow?.window?.isMiniaturized == true else { return }
             self?.mainWindow?.preview.releaseWebView()
+            PreviewViewController.releaseWebViews(except: self?.mainWindow?.preview)
+            ComposeWindowController.releaseQuoteWebViews()
             Memory.relieve()
         }
         idleWork = work
@@ -114,7 +125,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
                 return .terminateCancel
             }
         }
-        return .terminateNow
+        // Quitting must never lose a message being written: every dirty composer is asked first
+        // (windowShouldClose does not run at termination time).
+        let composers = ComposeWindowController.composersNeedingSave
+        guard !composers.isEmpty else { return .terminateNow }
+        var remaining = composers.count
+        var proceed = true
+        for c in composers {
+            c.confirmBeforeQuit { ok in
+                if !ok { proceed = false }
+                remaining -= 1
+                if remaining == 0 { sender.reply(toApplicationShouldTerminate: proceed) }
+            }
+        }
+        return .terminateLater
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -137,27 +161,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         NSApp.activate(ignoringOtherApps: true)
     }
 
+    /// RFC 6068: every header value is percent-decoded exactly once, here; nothing downstream decodes again.
+    /// An address is kept only if its addr-spec passes the strict header check, so a chip always shows the
+    /// same address the envelope will carry.
     func compose(mailto url: URL) {
-        let raw = url.absoluteString.dropFirst("mailto:".count)
+        let raw = String(url.absoluteString.dropFirst("mailto:".count))
         let parts = raw.split(separator: "?", maxSplits: 1)
-        let to = MIME.parseAddresses((parts.first.map(String.init) ?? "").removingPercentEncoding ?? "")
+        let to = Self.mailtoAddresses(parts.first.map(String.init)?.removingPercentEncoding ?? "")
         var cc: [EmailAddress] = []
+        var bcc: [EmailAddress] = []
         var subject = ""
         var body = ""
+        var inReplyTo: String?
+        var references: String?
         if parts.count > 1 {
             for pair in parts[1].split(separator: "&") {
                 let kv = pair.split(separator: "=", maxSplits: 1)
                 let key = kv.first.map { String($0).lowercased() } ?? ""
-                let value = kv.count > 1 ? (String(kv[1]).replacingOccurrences(of: "+", with: "%20").removingPercentEncoding ?? "") : ""
+                let value = kv.count > 1 ? MailSafety.stripControls(kv[1].replacingOccurrences(of: "+", with: "%20").removingPercentEncoding ?? "") : ""
                 switch key {
-                case "subject": subject = value
+                case "subject": subject = MailSafety.stripControls(value)
                 case "body": body = value
-                case "cc": cc = MIME.parseAddresses(value)
+                case "cc": cc = Self.mailtoAddresses(value)
+                case "bcc": bcc = Self.mailtoAddresses(value)
+                case "in-reply-to": inReplyTo = MailSafety.stripControls(value)
+                case "references": references = MailSafety.stripControls(value)
                 default: break
                 }
             }
         }
-        ComposeWindowController.open(.mailto(to: to, cc: cc, subject: subject, body: body))
+        ComposeWindowController.open(.mailto(to: to, cc: cc, bcc: bcc, subject: subject, body: body,
+                                             inReplyTo: inReplyTo, references: references))
+    }
+
+    private static func mailtoAddresses(_ value: String) -> [EmailAddress] {
+        MIME.parseAddresses(value).filter { MailSafety.isValidAddrSpec($0.email) }
     }
 
     // MARK: Theme
@@ -223,6 +261,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             .separator(),
             item("Quit Mac Mail", #selector(NSApplication.terminate(_:)), "q"),
         ])
+        // Standard Services menu (BUG-36).
+        let services = NSMenuItem(title: "Services", action: nil, keyEquivalent: "")
+        let servicesMenu = NSMenu(title: "Services")
+        services.submenu = servicesMenu
+        if let appMenu = main.items.first?.submenu {
+            appMenu.addItem(.separator())
+            appMenu.addItem(services)
+        }
+        NSApp.servicesMenu = servicesMenu
         _ = submenu("File", [
             item("New Message", #selector(MainWindowController.newMessage(_:)), "n"),
             item("Attach Files…", #selector(ComposeWindowController.attachFiles(_:)), "a", [.command, .shift]),
@@ -260,10 +307,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             appearance,
             item("Show Message with Light Background", #selector(MainWindowController.toggleLightBackground(_:)), "l", [.command, .option]),
             .separator(),
+            // Reading-pane zoom, via first-responder actions on the preview (UX-03).
+            item("Actual Size", Selector(("resetReadingZoom:")), "0"),
+            item("Zoom In", Selector(("zoomInReading:")), "="),
+            item("Zoom Out", Selector(("zoomOutReading:")), "-"),
+            .separator(),
             item("Sync Now", #selector(MainWindowController.syncNow(_:)), "r", [.command, .option]),
             .separator(),
             item("Toggle Sidebar", #selector(NSSplitViewController.toggleSidebar(_:)), "s", [.command, .control]),
         ])
+        // Go menu: Cmd+1…9 pick folders, Ctrl+Tab moves between panes (UX-04; the actions live on MainWindowController).
+        var goItems: [NSMenuItem] = []
+        for i in 1...9 {
+            let it = item("Folder \(i)", Selector(("selectFolderAtIndex:")), "\(i)")
+            it.tag = i
+            goItems.append(it)
+        }
+        goItems.append(.separator())
+        goItems.append(item("Focus Next Pane", Selector(("focusNextPane:")), "\t", [.control]))
+        _ = submenu("Go", goItems)
         _ = submenu("Message", [
             item("Reply", #selector(MainWindowController.reply(_:)), "r"),
             item("Reply All", #selector(MainWindowController.replyAll(_:)), "r", [.command, .shift]),
@@ -271,6 +333,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             .separator(),
             item("Mark as Read / Unread", #selector(MainWindowController.toggleRead(_:)), "u", [.command, .shift]),
             item("Flag / Unflag", #selector(MainWindowController.toggleFlag(_:)), "l", [.command, .shift]),
+            item("Move to…", Selector(("moveToFolder:")), ""),
             .separator(),
             item("Archive", #selector(MainWindowController.archiveMessages(_:)), "a", [.command, .control]),
             item("Delete", #selector(MainWindowController.deleteMessages(_:)), "\u{8}"),
@@ -296,7 +359,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             item("Zoom", #selector(NSWindow.performZoom(_:)), ""),
         ])
         NSApp.windowsMenu = window.submenu
+        // Standard Help menu (BUG-36).
+        let help = submenu("Help", [item("Mac Mail Help", Selector(("showHelp:")), "?")])
+        NSApp.helpMenu = help.submenu
         NSApp.mainMenu = main
+    }
+
+    // MARK: Dock menu (UX-13)
+
+    func applicationDockMenu(_ sender: NSApplication) -> NSMenu? {
+        let m = NSMenu()
+        let compose = NSMenuItem(title: "New Message", action: #selector(MainWindowController.newMessage(_:)), keyEquivalent: "")
+        compose.target = mainWindow
+        m.addItem(compose)
+        let sync = NSMenuItem(title: "Sync Now", action: #selector(MainWindowController.syncNow(_:)), keyEquivalent: "")
+        sync.target = mainWindow
+        m.addItem(sync)
+        return m
     }
 
     // MARK: Benchmark (MAC_MAIL_BENCH=1 MAC_MAIL_DEBUG=1): opens the 10 newest messages read-only, logs timings and memory.

@@ -33,6 +33,8 @@ final class MailService {
         NotificationCenter.default.addObserver(forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main) { _ in
             MainActor.assumeIsolated { MailService.shared.flushAll() }
         }
+        // Tapping a notification opens the message it refers to (BUG-35).
+        UNUserNotificationCenter.current().delegate = NotificationTapHandler.shared
         updateBadge()
     }
 
@@ -68,6 +70,8 @@ final class MailService {
         accounts.append(account)
         Prefs.accounts = accounts.filter { $0.provider != .demo }
         makeEngine(account)
+        // Ask for notification permission when the first account is added, not at first delivery (UX-09).
+        if accounts.count == 1 { requestNotificationPermission() }
         NotificationCenter.default.post(name: .mailAccountsChanged, object: nil)
     }
 
@@ -213,8 +217,24 @@ final class MailService {
             guard let self, !Task.isCancelled else { self?.pendingSends[p.id] = nil; return }
             defer { self.pendingSends[p.id] = nil }
             guard let engine = self.engines[p.accountID] else { onResult(NetError.server("Account not found")); return }
+            // A draft copy is written while the send runs so a quit or a failure can't lose the message
+            // (the composer is hidden by then); it is deleted once SMTP accepts (V2-08).
+            var safetyDraft: MessageRow?
+            do {
+                try await engine.saveDraft(try MessageBuilder.build(p.message))
+                if let drafts = self.store.folder(account: p.accountID, role: .drafts) {
+                    safetyDraft = self.store.rows(folderID: drafts.id).first { $0.subject == p.message.subject }
+                }
+            } catch {
+                // The safety copy failed; the send itself can still go out.
+            }
+            if Task.isCancelled {
+                if let d = safetyDraft { self.store.deleteMessages(ids: [d.id]); engine.queue(kind: "expunge", rows: [d]) }
+                return
+            }
             do {
                 try await engine.send(p.message)
+                if let d = safetyDraft { self.store.deleteMessages(ids: [d.id]); engine.queue(kind: "expunge", rows: [d]) }
                 if let r = p.replyTo { self.setFlag([r], flag: .answered, on: true) }
                 if let d = p.draftToDelete { engine.queue(kind: "expunge", rows: [d]); self.store.deleteMessages(ids: [d.id]) }
                 onResult(nil)
@@ -237,8 +257,19 @@ final class MailService {
     // MARK: Badge and notifications
 
     func updateBadge() {
+        // "Show unread count on Dock icon" preference (default on).
+        guard UserDefaults.standard.object(forKey: "showDockBadge") == nil
+            || UserDefaults.standard.bool(forKey: "showDockBadge") else {
+            NSApp.dockTile.badgeLabel = nil
+            return
+        }
         let n = store.unifiedUnreadCount()
         NSApp.dockTile.badgeLabel = n > 0 ? (n > 999 ? "999+" : "\(n)") : nil
+    }
+
+    /// Asks for notification permission up front (when the first account is added), not at first delivery.
+    func requestNotificationPermission() {
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound, .badge]) { _, _ in }
     }
 
     private var askedForNotifications = false
@@ -253,6 +284,7 @@ final class MailService {
                 content.title = h.from.display
                 content.subtitle = h.subject
                 content.sound = .default
+                content.userInfo = ["messageID": MailService.shared.store.messageID(account: engine.account.id, uid: h.uid) ?? 0]
                 center.add(UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil))
             }
             if headers.count > 3 {
@@ -269,6 +301,23 @@ final class MailService {
             center.requestAuthorization(options: [.alert, .sound, .badge]) { granted, _ in
                 if granted { DispatchQueue.main.async { post() } }
             }
+        }
+    }
+}
+
+/// Opens the message a notification refers to when the user taps it (BUG-35).
+final class NotificationTapHandler: NSObject, UNUserNotificationCenterDelegate {
+    static let shared = NotificationTapHandler()
+
+    func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse,
+                                withCompletionHandler completionHandler: @escaping () -> Void) {
+        completionHandler()
+        let id = (response.notification.request.content.userInfo["messageID"] as? NSNumber)?.int64Value ?? 0
+        guard id != 0 else { return }
+        // UNUserNotificationCenter calls its delegate on the main thread.
+        MainActor.assumeIsolated {
+            NSApp.activate(ignoringOtherApps: true)
+            MessageWindowController.show(messageID: id)
         }
     }
 }

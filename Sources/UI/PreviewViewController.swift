@@ -48,7 +48,10 @@ final class PreviewViewController: NSViewController, WKNavigationDelegate, WKUID
         UserDefaults.standard.bool(forKey: Self.lightKey(d.from.email))
     }
 
+    private static let live = NSHashTable<PreviewViewController>.weakObjects()
+
     override func loadView() {
+        Self.live.add(self)
         let root = ReadingPaneView()
         root.onAppearanceChange = { [weak self] in self?.appearanceChanged() }
 
@@ -467,7 +470,7 @@ final class PreviewViewController: NSViewController, WKNavigationDelegate, WKUID
                         let name = Self.uniqueName(p.suggestedFilename, used: &used)
                         try await engine.download(messageID: d.id, part: p, to: dir.appendingPathComponent(name))
                     }
-                    try await Self.zip(directory: dir, to: dest)
+                    try await AttachmentZip.zip(directory: dir, to: dest)
                     self?.attachmentBar.setBusy(false)
                     self?.showToast?("Saved \(dest.lastPathComponent)")
                 } catch {
@@ -489,21 +492,6 @@ final class PreviewViewController: NSViewController, WKNavigationDelegate, WKUID
         }
         used.insert(candidate.lowercased())
         return candidate
-    }
-
-    /// Zips a folder's contents with the system's ditto (no third-party code).
-    static func zip(directory: URL, to dest: URL) async throws {
-        try? FileManager.default.removeItem(at: dest)
-        try await withCheckedThrowingContinuation { (c: CheckedContinuation<Void, Error>) in
-            let p = Process()
-            p.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
-            p.arguments = ["-c", "-k", "--sequesterRsrc", directory.path, dest.path]
-            p.terminationHandler = { proc in
-                if proc.terminationStatus == 0 { c.resume() }
-                else { c.resume(throwing: NetError.server("Couldn't create the zip file (ditto exited \(proc.terminationStatus)).")) }
-            }
-            do { try p.run() } catch { c.resume(throwing: error) }
-        }
     }
 
     // MARK: Header buttons
@@ -611,6 +599,19 @@ final class PreviewViewController: NSViewController, WKNavigationDelegate, WKUID
         render(d, b)
     }
 
+    // MARK: App-wide web view trimming (BUG-28)
+
+    /// Releases the web views of every reading pane except the main window's (message windows keep one each),
+    /// so idle/memory-pressure trims reach them all without the app delegate knowing about the windows.
+    static func releaseWebViews(except main: PreviewViewController?) {
+        for p in live.allObjects where p !== main { p.releaseWebView() }
+    }
+
+    /// Restores the reading panes whose window is actually visible.
+    static func restoreWebViews(except main: PreviewViewController?) {
+        for p in live.allObjects where p !== main && p.view.window?.isVisible == true { p.restoreWebViewIfNeeded() }
+    }
+
     // MARK: Text zoom (View > Larger/Smaller/Actual Text)
 
     private var readingZoom: CGFloat {
@@ -628,6 +629,11 @@ final class PreviewViewController: NSViewController, WKNavigationDelegate, WKUID
     func zoomIn() { readingZoom += 0.1 }
     func zoomOut() { readingZoom -= 0.1 }
     func resetZoom() { readingZoom = 1 }
+
+    // First-responder actions for the View menu (View > Actual Size / Zoom In / Zoom Out).
+    @objc func zoomInReading(_ sender: Any?) { zoomIn() }
+    @objc func zoomOutReading(_ sender: Any?) { zoomOut() }
+    @objc func resetReadingZoom(_ sender: Any?) { resetZoom() }
 
     // MARK: Theme
 

@@ -63,7 +63,8 @@ final class Store {
         """)
         // Migration ladder: a v0 database (tables exist, user_version 0) migrates in place, no data loss.
         if db.userVersion < 2 { try migrate_1_to_2() }
-        db.run("PRAGMA user_version=2")
+        if db.userVersion < 3 { try migrate_2_to_3() }
+        db.run("PRAGMA user_version=3")
     }
 
     /// v1 → v2: pending ops bound to folder id + UIDVALIDITY, body full-text index, body-cache index, contacts table.
@@ -101,6 +102,14 @@ final class Store {
             INSERT INTO contacts(email, name, count) SELECT from_addr, from_name, COUNT(*) FROM messages GROUP BY from_addr
             ON CONFLICT(email) DO UPDATE SET count=count+excluded.count
             """)
+    }
+
+    // v2 → v3: the Bcc line is remembered per message so editing a draft restores its Bcc recipients
+    // (Bcc never travels in the draft MIME itself).
+    private func migrate_2_to_3() throws {
+        if !db.columnExists(table: "messages", column: "bcc") {
+            try db.exec("ALTER TABLE messages ADD COLUMN bcc TEXT NOT NULL DEFAULT ''")
+        }
     }
 
     // MARK: Folders
@@ -326,7 +335,8 @@ final class Store {
         var out: MessageDetail?
         db.query("""
             SELECT m.id, m.folder_id, f.account, m.uid, m.date, m.flags, m.subject, m.from_name, m.from_addr, m.to_list,
-                   m.cc_list, m.reply_to, m.message_id, m.refs, m.list_unsub, m.structure, m.size, f.role
+                   m.cc_list, m.reply_to, m.message_id, m.refs, m.list_unsub, m.structure, m.size, f.role,
+                   m.in_reply_to, m.bcc
             FROM messages m JOIN folders f ON f.id=m.folder_id WHERE m.id=?
             """, [id]) { s in
             out = MessageDetail(
@@ -334,12 +344,30 @@ final class Store {
                 date: Date(timeIntervalSince1970: s.double(4)), flags: MessageFlags(rawValue: s.int(5)), subject: s.text(6),
                 from: EmailAddress(name: s.text(7), email: s.text(8)), toList: s.text(9), ccList: s.text(10),
                 replyTo: s.text(11), messageIDHeader: s.text(12), references: s.text(13), listUnsubscribe: s.text(14),
-                structure: BodyPart.fromJSON(s.string(15)), size: s.int(16), folderRole: FolderRole(rawValue: s.text(17)) ?? .none)
+                structure: BodyPart.fromJSON(s.string(15)), size: s.int(16), folderRole: FolderRole(rawValue: s.text(17)) ?? .none,
+                inReplyTo: s.text(18), bcc: s.text(19))
         }
         return out
     }
 
     // MARK: Bodies
+
+    /// The cached row for a server UID, for opening a message from a notification tap.
+    func messageID(account: String, uid: UInt32) -> Int64? {
+        var out: Int64?
+        db.query("""
+            SELECT m.id FROM messages m JOIN folders f ON f.id=m.folder_id WHERE f.account=? AND m.uid=? LIMIT 1
+            """, [account, Int(uid)]) { out = $0.int64(0) }
+        return out
+    }
+
+    /// Remembers the Bcc header line for messages (drafts), whose MIME never carries it.
+    func setBcc(ids: [Int64], bcc: String) {
+        guard !ids.isEmpty else { return }
+        db.transaction {
+            for id in ids { db.run("UPDATE messages SET bcc=? WHERE id=?", [bcc, id]) }
+        }
+    }
 
     func body(_ id: Int64) -> StoredBody? {
         var out: StoredBody?

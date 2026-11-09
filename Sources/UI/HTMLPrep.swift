@@ -89,20 +89,7 @@ enum HTMLPrep {
             let tns = t as NSString
             let tlen = tns.length
             // Dimensions from attributes and inline CSS (width/height in px) — for tracking-pixel detection.
-            var dims: [String: Int] = [:]
-            for m in dimAttr.matches(in: t, range: NSRange(location: 0, length: tlen)) {
-                dims[tns.substring(with: m.range(at: 1)).lowercased()] = Int(tns.substring(with: m.range(at: 2)))
-            }
-            for m in styleAttr.matches(in: t, range: NSRange(location: 0, length: tlen)) {
-                let raw = m.range(at: 1).location != NSNotFound ? m.range(at: 1) : m.range(at: 2)
-                let style = MIME.decodeEntities(tns.substring(with: raw))
-                let sns = style as NSString
-                for c in cssDim.matches(in: style, range: NSRange(location: 0, length: sns.length)) {
-                    dims[sns.substring(with: c.range(at: 1)).lowercased()] =
-                        Int((Double(sns.substring(with: c.range(at: 2))) ?? 0).rounded())
-                }
-            }
-            let known = [dims["width"], dims["height"]].compactMap { $0 }
+            let known = Array(pixelDims(t).values)
             t = srcsetAttr.stringByReplacingMatches(in: t, range: NSRange(location: 0, length: tlen), withTemplate: "")
             t = posterAttr.stringByReplacingMatches(in: t, range: NSRange(location: 0, length: tlen), withTemplate: "")
             let tn = t as NSString
@@ -280,6 +267,56 @@ enum HTMLPrep {
         }
         out += ns.substring(from: last)
         return out
+    }
+
+    /// Dimensions declared by an <img> tag: attributes and inline CSS (width/height in px).
+    private static func pixelDims(_ tag: String) -> [String: Int] {
+        let tns = tag as NSString
+        let tlen = tns.length
+        var dims: [String: Int] = [:]
+        for m in dimAttr.matches(in: tag, range: NSRange(location: 0, length: tlen)) {
+            dims[tns.substring(with: m.range(at: 1)).lowercased()] = Int(tns.substring(with: m.range(at: 2)))
+        }
+        for m in styleAttr.matches(in: tag, range: NSRange(location: 0, length: tlen)) {
+            let raw = m.range(at: 1).location != NSNotFound ? m.range(at: 1) : m.range(at: 2)
+            let style = MIME.decodeEntities(tns.substring(with: raw))
+            let sns = style as NSString
+            for c in cssDim.matches(in: style, range: NSRange(location: 0, length: sns.length)) {
+                dims[sns.substring(with: c.range(at: 1)).lowercased()] =
+                    Int((Double(sns.substring(with: c.range(at: 2))) ?? 0).rounded())
+            }
+        }
+        return dims
+    }
+
+    /// First src/href-style attribute value of a tag, if any.
+    private static func attrValue(_ tag: String, _ re: NSRegularExpression) -> String? {
+        guard let m = re.firstMatch(in: tag, range: NSRange(location: 0, length: (tag as NSString).length)) else { return nil }
+        for g in 1...3 where m.range(at: g).location != NSNotFound {
+            return (tag as NSString).substring(with: m.range(at: g))
+        }
+        return nil
+    }
+
+    /// Tracking pixels: remote images whose known dimensions are all ≤ 2px (attrs, CSS, or one of them).
+    private static func isTrackingPixel(_ tag: String) -> Bool {
+        guard let src = attrValue(tag, srcAttr) ?? attrValue(tag, hrefAttr) else { return false }
+        let lower = MIME.decodeEntities(src).trimmingCharacters(in: .whitespaces).lowercased()
+        let dims = pixelDims(tag)
+        return lower.hasPrefix("http") && !dims.isEmpty && dims.values.allSatisfy { $0 <= 2 }
+    }
+
+    /// Body fragment safe to quote into an outgoing reply/forward: the same sanitising as the display
+    /// path (active content, remote-setting meta/base/link tags, srcset and tracking pixels removed),
+    /// but images keep their original URLs — the recipient's mail client loads them.
+    static func quoteSanitized(_ html: String) -> String {
+        var s = stripActive(html)
+        s = replace(voidActive, in: s) { _, _ in "" }
+        s = replace(srcsetAttr, in: s) { _, _ in "" }
+        s = replace(posterAttr, in: s) { _, _ in "" }
+        s = replace(cssImport, in: s) { _, _ in "" }
+        s = replace(imgTag, in: s) { tag, _ in isTrackingPixel(tag) ? "" : tag }
+        return s
     }
 
     /// Body inner HTML, for quoting in replies.

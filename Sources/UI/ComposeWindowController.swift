@@ -10,7 +10,8 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
     enum Kind {
         case new
         case files([URL])
-        case mailto(to: [EmailAddress], cc: [EmailAddress], subject: String, body: String)
+        case mailto(to: [EmailAddress], cc: [EmailAddress], bcc: [EmailAddress], subject: String, body: String,
+                    inReplyTo: String?, references: String?)
         case reply(MessageDetail, StoredBody?, all: Bool)
         case forward(MessageDetail, StoredBody?)
         case draft(MessageDetail, StoredBody?)
@@ -132,10 +133,15 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
         textView.usesFindBar = true
         textView.delegate = self
         textView.onDropFiles = { [weak self] urls in self?.addAttachments(urls) }
+        textView.onPasteImage = { [weak self] data in self?.addPastedImage(data) }
         textView.isVerticallyResizable = true
         textView.isHorizontallyResizable = false
         textView.autoresizingMask = [.width]
         textView.textContainer?.widthTracksTextView = true
+        // Standard scroll-view recipe: without it the text sits low and the hidden quote pane reserves space (BUG-34).
+        textView.minSize = NSSize(width: 0, height: 0)
+        textView.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
+        textView.textContainer?.containerSize = NSSize(width: 0, height: CGFloat.greatestFiniteMagnitude)
         let scroll = NSScrollView()
         scroll.documentView = textView
         scroll.hasVerticalScroller = true
@@ -236,6 +242,7 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
         attachmentScroll.isHidden = true
         attachmentHeight = attachmentScroll.constraints.first { $0.firstAttribute == .height }
         attachmentHeight?.constant = 0
+        sendButton = send
     }
 
     private var attachmentHeight: NSLayoutConstraint?
@@ -257,10 +264,13 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
             addAttachments(urls)
             if urls.count == 1 { subjectField.stringValue = urls[0].lastPathComponent }
             window?.makeFirstResponder(toField)
-        case .mailto(let to, let cc, let subject, let body):
+        case .mailto(let to, let cc, let bcc, let subject, let body, let inReplyTo, let references):
             toField.objectValue = to.map { $0.full }
             ccField.objectValue = cc.map { $0.full }
+            bccField.objectValue = bcc.map { $0.full }
             subjectField.stringValue = subject
+            if let inReplyTo, !inReplyTo.isEmpty { self.inReplyTo = inReplyTo }
+            if let references, !references.isEmpty { self.references = references }
             setBody(body, signature: true)
             window?.makeFirstResponder(to.isEmpty ? toField : textView)
         case .reply(let d, let body, let all):
@@ -299,20 +309,18 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
             setQuote(d, body, header: header, blockquote: false)
             setBody("", signature: true)
             window?.title = subjectField.stringValue
-            fetchForwardAttachments(d)
+            fetchMessageAttachments(d)
             window?.makeFirstResponder(toField)
         case .draft(let d, let body):
             selectAccount(d.accountID)
             toField.objectValue = MIME.parseAddresses(d.toList).map { $0.full }
             ccField.objectValue = MIME.parseAddresses(d.ccList).map { $0.full }
+            bccField.objectValue = MIME.parseAddresses(d.bcc).map { $0.full }
             subjectField.stringValue = d.subject
+            inReplyTo = d.inReplyTo.isEmpty ? nil : d.inReplyTo
+            references = d.references.isEmpty ? nil : d.references
             draftRow = MailService.shared.store.rows(ids: [d.id]).first
-            if let html = body?.html, let data = html.data(using: .utf8),
-               let attr = NSAttributedString(html: data, documentAttributes: nil) {
-                textView.textStorage?.setAttributedString(attr)
-            } else {
-                setBody(body?.text ?? "", signature: false)
-            }
+            loadDraftBody(d, body)
             window?.title = d.subject.isEmpty ? "Draft" : d.subject
             window?.makeFirstResponder(textView)
         }
@@ -335,10 +343,70 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
 
     private func setBody(_ text: String, signature: Bool) {
         var s = text
-        if signature, let sig = account?.signature, !sig.isEmpty { s += "\n\n" + sig }
+        var sig: String?
+        if signature, let sg = account?.signature, !sg.isEmpty { s += "\n\n" + sg; sig = sg }
+        currentSignature = sig
         textView.string = ""
         textView.textStorage?.setAttributedString(NSAttributedString(string: s, attributes: [
             .font: NSFont.systemFont(ofSize: 14), .foregroundColor: NSColor.textColor]))
+    }
+
+    /// The signature currently appended to the body, so changing the From account can swap it (BUG-20).
+    private var currentSignature: String?
+    /// True while a draft's body is still being fetched: Send/Save wait for it rather than writing a blank.
+    private var waitingForDraftBody = false
+
+    /// Changing the From account replaces the signature at the end of the body with the new account's one.
+    private func swapSignature() {
+        let newSig = account?.signature ?? ""
+        guard newSig != currentSignature else { return }
+        let storage = textView.textStorage
+        if let old = currentSignature, !old.isEmpty {
+            let tail = "\n\n" + old
+            let text = textView.string
+            if text.hasSuffix(tail) {
+                let len = (text as NSString).length
+                storage?.replaceCharacters(in: NSRange(location: len - (tail as NSString).length,
+                                                       length: (tail as NSString).length), with: "")
+            }
+        }
+        if !newSig.isEmpty {
+            let len = (textView.string as NSString).length
+            storage?.replaceCharacters(in: NSRange(location: len, length: 0), with: "\n\n" + newSig)
+        }
+        currentSignature = newSig
+    }
+
+    /// Fills the editor with a draft's cached body; when it isn't cached yet, fetches it instead of
+    /// opening a blank editor that a later save would turn into a real empty draft (V2-04).
+    private func loadDraftBody(_ d: MessageDetail, _ body: StoredBody?) {
+        let hasContent = !(body?.html ?? "").isEmpty || !(body?.text ?? "").isEmpty
+        guard hasContent else {
+            waitingForDraftBody = true
+            status.stringValue = "Loading draft…"
+            let id = d.id
+            Task { [weak self] in
+                do {
+                    guard let engine = MailService.shared.engine(d.accountID) else { return }
+                    let fetched = try await engine.loadBody(messageID: id)
+                    guard let self, !self.sentOrDiscarded else { return }
+                    self.status.stringValue = ""
+                    self.loadDraftBody(d, fetched)
+                } catch {
+                    guard let self, !self.sentOrDiscarded else { return }
+                    self.waitingForDraftBody = false
+                    self.status.stringValue = "Couldn't load the draft's body"
+                }
+            }
+            return
+        }
+        waitingForDraftBody = false
+        if let html = body?.html, let data = html.data(using: .utf8),
+           let attr = NSAttributedString(html: data, documentAttributes: nil) {
+            textView.textStorage?.setAttributedString(attr)
+        } else {
+            setBody(body?.text ?? "", signature: false)
+        }
     }
 
     // MARK: Original message pane
@@ -347,6 +415,8 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
     private let quotePane = NSView()
     private var quoteWeb: WKWebView?
     private let quoteLoader = ImageLoader()
+    /// What the quote pane was built from, so it can be rebuilt after the web view was released (BUG-28).
+    private var quoteSource: (detail: MessageDetail, body: StoredBody?, header: String, blockquote: Bool)?
 
     /// Shows the message being replied to / forwarded under the editor, rendered like the reading pane
     /// (same image limits, remote content blocked, scripts off). It's what gets quoted when you send.
@@ -428,14 +498,18 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
     @objc private func includeOriginalChanged() {
         quotePane.isHidden = includeOriginal.state != .on
         split.adjustSubviews()
+        if quotePane.isHidden, split.bounds.height > 0 { split.setPosition(split.bounds.height, ofDividerAt: 0) }
         dirty = true
     }
 
     private func setQuote(_ d: MessageDetail, _ body: StoredBody?, header: String, blockquote: Bool = true) {
         showOriginal(d, body, header: header)
+        quoteSource = (d, body, header, blockquote)
         let originalHTML: String
         if let h = body?.html, !h.isEmpty {
-            originalHTML = HTMLPrep.bodyInner(h)
+            // Sanitised exactly like the reading pane: no scripts, forms, iframes or tracking pixels
+            // may ride along into the outgoing message.
+            originalHTML = HTMLPrep.quoteSanitized(HTMLPrep.bodyInner(h))
         } else {
             originalHTML = "<div style=\"white-space:pre-wrap\">" + MIME.escapeHTML(body?.text ?? "") + "</div>"
         }
@@ -451,26 +525,48 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
         includeOriginal.title = blockquote ? "Include original message" : "Include forwarded message"
     }
 
-    private func fetchForwardAttachments(_ d: MessageDetail) {
+    /// Downloads a message's attachments (forward, or a saved draft being reopened). Send stays disabled
+    /// until the pipeline drains, and the task is cancelled with the window (V2-09/V2-10).
+    private func fetchMessageAttachments(_ d: MessageDetail) {
         guard let parts = d.structure?.attachments(), !parts.isEmpty, let engine = MailService.shared.engine(d.accountID) else { return }
         status.stringValue = "Fetching \(parts.count) attachment\(parts.count == 1 ? "" : "s")…"
         let dir = AppPaths.tempDir("forward")
         tempDirs.append(dir)
-        Task {
+        pipelineBegan()
+        fetchTask = Task { [weak self] in
+            defer { self?.pipelineEnded() }
             var used = Set<String>()
             var urls: [URL] = []
             for p in parts {
+                if Task.isCancelled { return }
                 let url = dir.appendingPathComponent(PreviewViewController.uniqueName(p.suggestedFilename, used: &used))
                 do {
                     try await engine.download(messageID: d.id, part: p, to: url)
                     urls.append(url)
                 } catch {
-                    status.stringValue = "Couldn't fetch \(p.suggestedFilename)"
+                    self?.status.stringValue = "Couldn't fetch \(p.suggestedFilename)"
                 }
             }
-            addAttachments(urls)
-            if status.stringValue.hasPrefix("Fetching") { status.stringValue = "" }
+            guard !Task.isCancelled else { return }
+            self?.addAttachments(urls)
+            if self?.status.stringValue.hasPrefix("Fetching") == true { self?.status.stringValue = "" }
         }
+    }
+
+    /// Attachment downloads and folder zips still running; Send is disabled while this is non-zero.
+    private var pipelineTasks = 0
+    private var fetchTask: Task<Void, Never>?
+    private var zipTasks: [Task<Void, Never>] = []
+    private var sendButton: NSButton?
+
+    private func pipelineBegan() {
+        pipelineTasks += 1
+        sendButton?.isEnabled = false
+    }
+
+    private func pipelineEnded() {
+        pipelineTasks = max(0, pipelineTasks - 1)
+        if pipelineTasks == 0 { sendButton?.isEnabled = true }
     }
 
     // MARK: Attachments
@@ -496,15 +592,19 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
         tempDirs.append(dir)
         let dest = dir.appendingPathComponent(url.lastPathComponent + ".zip")
         status.stringValue = "Zipping \(url.lastPathComponent)…"
-        Task {
-            let p = Process()
-            p.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
-            p.arguments = ["-c", "-k", "--sequesterRsrc", "--keepParent", url.path, dest.path]
-            try? p.run()
-            while p.isRunning { try? await Task.sleep(nanoseconds: 50_000_000) }
-            status.stringValue = ""
-            if p.terminationStatus == 0 { addAttachments([dest]) } else { status.stringValue = "Couldn't zip \(url.lastPathComponent)" }
+        pipelineBegan()
+        let task = Task { [weak self] in
+            defer { self?.pipelineEnded() }
+            do {
+                try await AttachmentZip.zip(directory: url, to: dest, keepParent: true)
+                guard !Task.isCancelled else { return }
+                self?.status.stringValue = ""
+                self?.addAttachments([dest])
+            } catch {
+                self?.status.stringValue = "Couldn't zip \(url.lastPathComponent)"
+            }
         }
+        zipTasks.append(task)
     }
 
     private func refreshAttachments() {
@@ -554,6 +654,27 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
         }
     }
 
+    private static let attachmentStamp: DateFormatter = {
+        let f = DateFormatter()
+        f.dateStyle = .none
+        f.timeStyle = .medium
+        return f
+    }()
+
+    /// A screenshot pasted into the body becomes a PNG attachment (UX-08).
+    private func addPastedImage(_ data: Data) {
+        let dir = AppPaths.tempDir("paste")
+        tempDirs.append(dir)
+        let url = dir.appendingPathComponent("Pasted image \(Self.attachmentStamp.string(from: Date())).png")
+        do {
+            try data.write(to: url)
+        } catch {
+            status.stringValue = "Couldn't save the pasted image"
+            return
+        }
+        addAttachments([url])
+    }
+
     // MARK: Building the message
 
     private func addresses(_ field: NSTokenField) -> [EmailAddress] {
@@ -562,6 +683,7 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
     }
 
     private func buildMessage() -> OutgoingMessage? {
+        commitEditing()
         guard let account else { return nil }
         let attr = textView.attributedString()
         var html = RichText.html(from: attr)
@@ -576,7 +698,25 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
                                inReplyTo: inReplyTo, references: references, attachments: attachments)
     }
 
+    /// Commits in-progress field editing so a half-typed recipient or subject reaches the message (BUG-18).
+    private func commitEditing() {
+        for f in [toField, ccField, bccField, subjectField] as [NSControl] {
+            if f.currentEditor() != nil { f.validateEditing() }
+        }
+    }
+
     @objc func send(_ sender: Any?) {
+        guard !waitingForDraftBody else {
+            let a = NSAlert()
+            a.messageText = "The draft is still loading — try again in a moment."
+            a.beginSheetModal(for: window!, completionHandler: nil)
+            return
+        }
+        guard pipelineTasks == 0 else {
+            NSSound.beep()
+            status.stringValue = "Attachments are still being prepared…"
+            return
+        }
         guard let message = buildMessage(), let account else { return }
         if message.allRecipients.isEmpty {
             let a = NSAlert()
@@ -610,6 +750,8 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
                                               draftToDelete: draftRow, composer: self)
         let id = MailService.shared.queueSend(pending) { [weak self] error in
             guard let self else { return }
+            // The pending id is dead either way; leaving it set would block cleanup on close (V2-11).
+            self.pendingSendID = nil
             if let error {
                 self.sentOrDiscarded = false
                 self.status.stringValue = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
@@ -626,7 +768,11 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
         }
         pendingSendID = id
         let seconds = Prefs.undoSendSeconds
-        main?.showToast("Sending…", action: ("Undo", { [weak self] in self?.undoSend() }), duration: Double(max(seconds, 1)))
+        if seconds > 0 {
+            main?.showToast("Sending…", action: ("Undo", { [weak self] in self?.undoSend() }), duration: Double(max(seconds, 1)))
+        } else {
+            main?.showToast("Sending…")
+        }
     }
 
     private func undoSend() {
@@ -660,25 +806,103 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
         return false
     }
 
-    private func saveDraftAndClose() {
-        guard let message = buildMessage(), let account, let engine = MailService.shared.engine(account.id) else { return }
+    private func saveDraftAndClose() { saveDraft { _ in } }
+
+    /// Saves the draft (server APPEND), then runs `done` with whether it saved. Used by the close prompt
+    /// and, at quit time, to keep the app alive until the save lands.
+    private func saveDraft(_ done: @escaping (Bool) -> Void) {
+        guard !waitingForDraftBody else {
+            let a = NSAlert()
+            a.messageText = "The draft is still loading — try again in a moment."
+            a.beginSheetModal(for: window!, completionHandler: nil)
+            done(false)
+            return
+        }
+        guard let message = buildMessage(), let account, let engine = MailService.shared.engine(account.id) else { done(false); return }
         sentOrDiscarded = true
         window?.orderOut(nil)
         let old = draftRow
-        Task {
+        let bccLine = addresses(bccField).map { $0.full }.joined(separator: ", ")
+        Task { [weak self] in
+            guard let self else { done(false); return }
             do {
                 try await engine.saveDraft(try MessageBuilder.build(message))
-                if let old { engine.queue(kind: "expunge", rows: [old]); MailService.shared.store.deleteMessages(ids: [old.id]) }
+                // The replacement row arrived with the sync inside saveDraft; tag it with the Bcc line,
+                // which never travels in the draft MIME (BUG-19).
+                if let drafts = MailService.shared.store.folder(account: account.id, role: .drafts) {
+                    let ids = MailService.shared.store.rows(folderID: drafts.id)
+                        .filter { $0.subject == message.subject && $0.id != old?.id }
+                        .map { $0.id }
+                    MailService.shared.store.setBcc(ids: ids, bcc: bccLine)
+                }
+                // Never expunge the previous draft if the replacement came out empty (V2-04).
+                let hasContent = !message.textBody.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    || !message.attachments.isEmpty
+                if let old, hasContent {
+                    engine.queue(kind: "expunge", rows: [old]); MailService.shared.store.deleteMessages(ids: [old.id])
+                }
                 (NSApp.delegate as? AppDelegate)?.mainWindow?.showToast("Draft saved")
-                cleanUpAndForget()
+                self.cleanUpAndForget()
+                done(true)
             } catch {
-                sentOrDiscarded = false
-                showWindow(nil)
+                self.sentOrDiscarded = false
+                self.showWindow(nil)
                 let a = NSAlert(error: error)
                 a.messageText = "Couldn't save the draft"
-                a.beginSheetModal(for: window!, completionHandler: nil)
+                a.beginSheetModal(for: self.window!, completionHandler: nil)
+                done(false)
             }
         }
+    }
+
+    /// Quit-time variant of the close prompt: Save / Don't Save / Cancel, reporting whether the quit
+    /// may proceed. windowShouldClose doesn't run during termination (V2-01).
+    func confirmBeforeQuit(_ done: @escaping (Bool) -> Void) {
+        guard dirty, !sentOrDiscarded, let window else { done(true); return }
+        let a = NSAlert()
+        a.messageText = "Save this message as a draft?"
+        a.informativeText = "Drafts are saved to the account's Drafts folder."
+        a.addButton(withTitle: "Save Draft")
+        a.addButton(withTitle: "Don't Save")
+        a.addButton(withTitle: "Cancel")
+        a.beginSheetModal(for: window) { [weak self] r in
+            guard let self else { done(true); return }
+            switch r {
+            case .alertFirstButtonReturn: self.saveDraft(done)
+            case .alertSecondButtonReturn:
+                self.sentOrDiscarded = true
+                done(true)
+            default: done(false)
+            }
+        }
+    }
+
+    static var composersNeedingSave: [ComposeWindowController] {
+        open.filter { $0.dirty && !$0.sentOrDiscarded }
+    }
+
+    // MARK: Quote web view lifecycle (BUG-28)
+
+    /// The quote web views are torn down with the reading panes when the app idles in the background or
+    /// under memory pressure, and rebuilt when their window is shown again.
+    static func releaseQuoteWebViews() {
+        for c in open { c.releaseQuoteWebView() }
+    }
+
+    static func restoreQuoteWebViews() {
+        for c in open where c.window?.isVisible == true { c.restoreQuoteWebView() }
+    }
+
+    private func releaseQuoteWebView() {
+        quoteLoader.cancelAll()
+        quoteWeb?.removeFromSuperview()
+        quoteWeb = nil
+    }
+
+    private func restoreQuoteWebView() {
+        guard quoteWeb == nil, let q = quoteSource else { return }
+        quotePane.subviews.forEach { $0.removeFromSuperview() }
+        setQuote(q.detail, q.body, header: q.header, blockquote: q.blockquote)
     }
 
     func windowWillClose(_ notification: Notification) {
@@ -686,6 +910,8 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
     }
 
     private func cleanUpAndForget() {
+        fetchTask?.cancel()
+        for t in zipTasks { t.cancel() }
         quoteLoader.cancelAll()
         quoteWeb?.removeFromSuperview()
         quoteWeb = nil
@@ -698,7 +924,10 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
         }
     }
 
-    @objc private func fromChanged() { dirty = true }
+    @objc private func fromChanged() {
+        dirty = true
+        swapSignature()
+    }
 
     func textDidChange(_ notification: Notification) { dirty = true }
 
@@ -756,14 +985,31 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
         dirty = true
     }
 
-    func controlTextDidChange(_ obj: Notification) { dirty = true }
+    func controlTextDidChange(_ obj: Notification) {
+        dirty = true
+        if (obj.object as? NSControl) === subjectField {
+            window?.title = subjectField.stringValue.isEmpty ? "New Message" : subjectField.stringValue
+        }
+    }
 }
 
 extension ComposeWindowController: NSTextFieldDelegate {}
 
-/// Body text view that turns dropped files into attachments instead of inline images.
+/// Body text view that turns dropped files and pasted screenshots into attachments instead of inline images.
 final class ComposeTextView: NSTextView {
     var onDropFiles: (([URL]) -> Void)?
+    var onPasteImage: ((Data) -> Void)?
+
+    override func paste(_ sender: Any?) {
+        let pb = NSPasteboard.general
+        if let data = pb.data(forType: .png) { onPasteImage?(data); return }
+        if let tiff = pb.data(forType: .tiff), let rep = NSBitmapImageRep(data: tiff),
+           let png = rep.representation(using: .png, properties: [:]) {
+            onPasteImage?(png)
+            return
+        }
+        super.paste(sender)
+    }
 
     override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
         let opts: [NSPasteboard.ReadingOptionKey: Any] = [.urlReadingFileURLsOnly: true]
@@ -809,7 +1055,11 @@ enum RichText {
             if !styles.isEmpty { text = "<span style=\"\(styles.joined(separator: ";"))\">\(text)</span>" }
             if let link = attrs[.link] {
                 let href = (link as? URL)?.absoluteString ?? (link as? String) ?? ""
-                text = "<a href=\"\(MIME.escapeHTML(href))\">\(text)</a>"
+                // Only safe schemes go out; a javascript:/data: link in the attributed string is dropped (SEC-14).
+                let lower = href.lowercased()
+                if lower.hasPrefix("http://") || lower.hasPrefix("https://") || lower.hasPrefix("mailto:") {
+                    text = "<a href=\"\(MIME.escapeHTML(href))\">\(text)</a>"
+                }
             }
             out += text
         }
