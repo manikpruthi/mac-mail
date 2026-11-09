@@ -464,10 +464,6 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSSearc
         MailService.shared.setFlag(rows, flag: .seen, on: anyUnread)
     }
 
-    @objc func markUnread(_ sender: Any?) {
-        MailService.shared.setFlag(rows(for: sender), flag: .seen, on: false)
-    }
-
     @objc func toggleFlag(_ sender: Any?) {
         let rows = rows(for: sender)
         guard !rows.isEmpty else { return }
@@ -584,6 +580,12 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSSearc
         // so the skip flag must stay clear or it would swallow the next genuine change (C-12).
         if case .search = list.source {} else { list.skipNextFullReload = true }
         if let result = MailService.shared.move(rows, to: target) {
+            // undoID is set exactly when the move removed rows; "Already archived" (or archive-folder
+            // creation) removed none, so the list and cursor must stay as they are.
+            guard result.undoID != nil else {
+                toast.show(result.label)
+                return
+            }
             if touchesSelection {
                 list.reload(keepSelection: false)
                 // The cursor move after archive/delete never marks the next message read.
@@ -728,7 +730,7 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSSearc
             if item?.representedObject is ContextRows { return !rows.isEmpty }
             return list.focusedRow != nil || rows.count == 1
         case #selector(archiveMessages(_:)), #selector(deleteMessages(_:)), #selector(toggleSpam(_:)),
-             #selector(toggleFlag(_:)), #selector(toggleRead(_:)), #selector(markUnread(_:)), #selector(moveToFolder(_:)):
+             #selector(toggleFlag(_:)), #selector(toggleRead(_:)), #selector(moveToFolder(_:)):
             return !rows.isEmpty
         case #selector(toggleConversations(_:)):
             item?.state = list.grouped ? .on : .off
