@@ -27,7 +27,7 @@ final class SQLiteDB {
         // A 2 MB page cache keeps the database's resident memory small; WAL keeps writes cheap.
         try exec("""
             PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON;
-            PRAGMA cache_size=-2000; PRAGMA temp_store=MEMORY; PRAGMA mmap_size=0;
+            PRAGMA busy_timeout=3000; PRAGMA cache_size=-2000; PRAGMA temp_store=MEMORY; PRAGMA mmap_size=0;
             """)
     }
 
@@ -55,25 +55,42 @@ final class SQLiteDB {
             throw DBError.sql(String(cString: sqlite3_errmsg(handle)) + " — " + sql.prefix(120))
         }
         let s = Statement(stmt!)
+        // Distinct IN-list lengths each used to live here forever; cap the cache so they can't accumulate.
+        if cache.count >= 128 { cache.removeAll() }
         cache[sql] = s
         return s
     }
 
-    /// Runs a write statement.
-    @discardableResult
-    func run(_ sql: String, _ args: [Any?] = []) -> Bool {
-        guard let s = try? statement(sql) else { return false }
-        s.bind(args)
-        let rc = s.stepRaw()
-        s.reset()
-        return rc == SQLITE_DONE || rc == SQLITE_ROW
+    private func logError(_ sql: String, _ message: String) {
+        NSLog("Mac Mail cache error: " + message + " — " + sql.prefix(160).replacingOccurrences(of: "%", with: "%%"))
     }
 
-    /// Iterates result rows.
-    func query(_ sql: String, _ args: [Any?] = [], _ row: (Statement) -> Void) {
-        guard let s = try? statement(sql) else { return }
+    /// Runs a write statement. Failures are logged and reported as false, never swallowed silently.
+    @discardableResult
+    func run(_ sql: String, _ args: [Any?] = []) -> Bool {
+        let s: Statement
+        do { s = try statement(sql) } catch { logError(sql, error.localizedDescription); return false }
         s.bind(args)
-        while s.stepRaw() == SQLITE_ROW { row(s) }
+        let rc = s.stepRaw()
+        let ok = rc == SQLITE_DONE || rc == SQLITE_ROW
+        if !ok { logError(sql, String(cString: sqlite3_errmsg(handle))) }
+        s.reset()
+        return ok
+    }
+
+    /// Iterates result rows. Failures are logged, never swallowed silently.
+    func query(_ sql: String, _ args: [Any?] = [], _ row: (Statement) -> Void) {
+        let s: Statement
+        do { s = try statement(sql) } catch { logError(sql, error.localizedDescription); return }
+        s.bind(args)
+        while true {
+            let rc = s.stepRaw()
+            if rc == SQLITE_ROW { row(s) }
+            else {
+                if rc != SQLITE_DONE { logError(sql, String(cString: sqlite3_errmsg(handle))) }
+                break
+            }
+        }
         s.reset()
     }
 
@@ -84,9 +101,21 @@ final class SQLiteDB {
     }
 
     func transaction(_ body: () -> Void) {
-        _ = try? exec("BEGIN IMMEDIATE")
+        do { try exec("BEGIN IMMEDIATE") } catch { logError("BEGIN", error.localizedDescription) }
         body()
-        _ = try? exec("COMMIT")
+        do { try exec("COMMIT") } catch { logError("COMMIT", error.localizedDescription) }
+    }
+
+    var userVersion: Int {
+        var v = 0
+        query("PRAGMA user_version") { v = $0.int(0) }
+        return v
+    }
+
+    func columnExists(table: String, column: String) -> Bool {
+        var found = false
+        query("PRAGMA table_info(\(table))") { if $0.text(1) == column { found = true } }
+        return found
     }
 
     var lastInsertID: Int64 { sqlite3_last_insert_rowid(handle) }

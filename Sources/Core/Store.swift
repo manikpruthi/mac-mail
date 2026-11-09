@@ -9,10 +9,16 @@ final class Store {
     init() throws {
         let path = AppPaths.support.appendingPathComponent("mail.sqlite").path
         db = try SQLiteDB(path: path)
+        // The mail cache is the whole mailbox on disk; keep other local users out of it.
+        let fm = FileManager.default
+        for suffix in ["", "-wal", "-shm"] {
+            try? fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: path + suffix)
+        }
         try migrate()
     }
 
     private func migrate() throws {
+        // Version 1 baseline: the original schema. CREATE IF NOT EXISTS keeps existing databases intact.
         try db.exec("""
         CREATE TABLE IF NOT EXISTS folders(
             id INTEGER PRIMARY KEY, account TEXT NOT NULL, path TEXT NOT NULL, name TEXT NOT NULL,
@@ -55,6 +61,46 @@ final class Store {
             VALUES (new.id, new.subject, new.from_name, new.from_addr, new.to_list, new.snippet);
         END;
         """)
+        // Migration ladder: a v0 database (tables exist, user_version 0) migrates in place, no data loss.
+        if db.userVersion < 2 { try migrate_1_to_2() }
+        db.run("PRAGMA user_version=2")
+    }
+
+    /// v1 → v2: pending ops bound to folder id + UIDVALIDITY, body full-text index, body-cache index, contacts table.
+    private func migrate_1_to_2() throws {
+        if !db.columnExists(table: "pending_ops", column: "folder_id") {
+            try db.exec("ALTER TABLE pending_ops ADD COLUMN folder_id INTEGER NOT NULL DEFAULT 0")
+        }
+        if !db.columnExists(table: "pending_ops", column: "uidvalidity") {
+            try db.exec("ALTER TABLE pending_ops ADD COLUMN uidvalidity INTEGER NOT NULL DEFAULT 0")
+        }
+        // Backfill existing ops from their folder path so queued actions survive the upgrade.
+        db.run("""
+            UPDATE pending_ops SET
+              folder_id = COALESCE((SELECT f.id FROM folders f WHERE f.account=pending_ops.account AND f.path=pending_ops.folder_path), 0),
+              uidvalidity = COALESCE((SELECT f.uidvalidity FROM folders f WHERE f.account=pending_ops.account AND f.path=pending_ops.folder_path), 0)
+            """)
+        try db.exec("CREATE INDEX IF NOT EXISTS bodies_fetched ON bodies(fetched)")
+        try db.exec("""
+            CREATE VIRTUAL TABLE IF NOT EXISTS body_fts USING fts5(body, tokenize='unicode61 remove_diacritics 2');
+            """)
+        try db.exec("""
+            CREATE TABLE IF NOT EXISTS contacts(
+                email TEXT PRIMARY KEY, name TEXT NOT NULL DEFAULT '', count INTEGER NOT NULL DEFAULT 0);
+            CREATE TRIGGER IF NOT EXISTS msg_contacts_ai AFTER INSERT ON messages BEGIN
+                INSERT INTO contacts(email, name, count) VALUES (new.from_addr, new.from_name, 1)
+                ON CONFLICT(email) DO UPDATE SET count=count+1, name=excluded.name;
+            END;
+            CREATE TRIGGER IF NOT EXISTS msg_contacts_ad AFTER DELETE ON messages BEGIN
+                UPDATE contacts SET count=count-1 WHERE email=old.from_addr;
+                DELETE FROM contacts WHERE email=old.from_addr AND count<=0;
+            END;
+            """)
+        // Seed contacts from what's already cached (triggers didn't exist before this migration).
+        db.run("""
+            INSERT INTO contacts(email, name, count) SELECT from_addr, from_name, COUNT(*) FROM messages GROUP BY from_addr
+            ON CONFLICT(email) DO UPDATE SET count=count+excluded.count
+            """)
     }
 
     // MARK: Folders
@@ -98,6 +144,8 @@ final class Store {
     }
 
     /// Replaces the account's folder list with what the server reported, keeping sync state for known folders.
+    /// The prune is skipped when the LIST result looks broken (empty, or INBOX missing): a bad response must
+    /// never cascade-delete every cached folder.
     func upsertFolders(account: String, _ listed: [ListedFolder], isGmail: Bool) {
         db.transaction {
             var keep = Set<String>()
@@ -110,11 +158,15 @@ final class Store {
                     delim=excluded.delim, selectable=excluded.selectable
                     """, [account, f.path, name, f.role.rawValue, f.delimiter, f.selectable])
             }
+            guard !listed.isEmpty, listed.contains(where: { $0.role == .inbox }) else { return }
             var stale: [Int64] = []
             db.query("SELECT id, path FROM folders WHERE account=?", [account]) {
                 if !keep.contains($0.text(1)) { stale.append($0.int64(0)) }
             }
-            for id in stale { db.run("DELETE FROM folders WHERE id=?", [id]) }
+            for id in stale {
+                db.run("DELETE FROM pending_ops WHERE folder_id=?", [id])
+                db.run("DELETE FROM folders WHERE id=?", [id])
+            }
         }
     }
 
@@ -137,10 +189,14 @@ final class Store {
     }
 
     func updateFolderState(_ id: Int64, uidValidity: UInt32, uidNext: UInt32, modseq: UInt64) {
-        db.run("UPDATE folders SET uidvalidity=?, uidnext=?, modseq=? WHERE id=?", [uidValidity, uidNext, modseq, id])
+        // Never persist UIDVALIDITY 0: a server that omits it must not wipe the known value (fail-closed).
+        db.run("UPDATE folders SET uidvalidity=CASE WHEN ?!=0 THEN ? ELSE uidvalidity END, uidnext=?, modseq=? WHERE id=?",
+               [uidValidity, uidValidity, uidNext, modseq, id])
     }
 
     func resetFolder(_ id: Int64) {
+        // Stale UIDs must never be applied to a recreated folder: drop its queued actions too.
+        db.run("DELETE FROM pending_ops WHERE folder_id=?", [id])
         db.run("DELETE FROM messages WHERE folder_id=?", [id])
         db.run("UPDATE folders SET uidvalidity=0, uidnext=0, modseq=0 WHERE id=?", [id])
     }
@@ -299,6 +355,13 @@ final class Store {
         db.run("INSERT OR REPLACE INTO bodies(message_id, html, text, fetched) VALUES (?,?,?,?)", [id, html, text, Date()])
         let snip = MIME.snippet(html: html, text: text)
         db.run("UPDATE messages SET snippet=? WHERE id=?", [snip, id])
+        // Body text goes into its own full-text index so search finds words deep inside a message.
+        // Capped per message; replaced (never appended) so the index tracks the cache.
+        var body = text ?? ""
+        if body.isEmpty, let html { body = MIME.plainText(fromHTML: html, limit: 65_536) }
+        if body.utf8.count > 65_536 { body = String(body.prefix(65_536)) }
+        db.run("DELETE FROM body_fts WHERE rowid=?", [id])
+        if !body.isEmpty { db.run("INSERT INTO body_fts(rowid, body) VALUES (?,?)", [id, body]) }
     }
 
     /// Newest messages in a folder whose body has not been cached yet (for background prefetch).
@@ -326,13 +389,14 @@ final class Store {
             DELETE FROM messages WHERE date < ? AND id NOT IN (
                 SELECT id FROM (SELECT id, ROW_NUMBER() OVER (PARTITION BY folder_id ORDER BY date DESC) rn FROM messages) WHERE rn <= 200)
             """, [cutoff])
-        db.run("DELETE FROM bodies WHERE message_id NOT IN (SELECT message_id FROM bodies ORDER BY fetched DESC LIMIT 3000)")
+        db.run("DELETE FROM bodies WHERE message_id NOT IN (SELECT message_id FROM (SELECT message_id, SUM(length(COALESCE(html,'')) + length(COALESCE(text,''))) OVER (ORDER BY fetched DESC) AS total FROM bodies) WHERE total <= 536870912)")
         db.run("PRAGMA optimize")
     }
 
     // MARK: Search and contacts
 
-    /// Local search over the offline cache: words via the full-text index (prefix match), operators and filters via SQL.
+    /// Local search over the offline cache: words via the full-text indexes (headers + body, prefix match),
+    /// operators and filters via SQL.
     func search(_ q: SearchQuery, folderID: Int64? = nil, limit: Int = 400) -> [MessageRow] {
         guard q.hasLocalCriteria else { return [] }
         var sql = "SELECT \(rowCols) FROM messages m JOIN folders f ON f.id=m.folder_id"
@@ -340,21 +404,21 @@ final class Store {
         var args: [Any?] = []
         let words = q.words.map { "\"" + $0.replacingOccurrences(of: "\"", with: "") + "\"*" }
         if !words.isEmpty {
-            sql += " JOIN fts ON fts.rowid=m.id"
-            conds.append("fts MATCH ?")
-            args.append(words.joined(separator: " "))
+            let match = words.joined(separator: " ")
+            conds.append("(m.id IN (SELECT rowid FROM fts WHERE fts MATCH ?) OR m.id IN (SELECT rowid FROM body_fts WHERE body_fts MATCH ?))")
+            args += [match, match]
         }
         for v in q.from {
-            conds.append("(m.from_name LIKE ? OR m.from_addr LIKE ?)")
-            args += ["%\(v)%", "%\(v)%"]
+            conds.append("(m.from_name LIKE ? ESCAPE '\\' OR m.from_addr LIKE ? ESCAPE '\\')")
+            args += [likePattern(v), likePattern(v)]
         }
         for v in q.to {
-            conds.append("(m.to_list LIKE ? OR m.cc_list LIKE ?)")
-            args += ["%\(v)%", "%\(v)%"]
+            conds.append("(m.to_list LIKE ? ESCAPE '\\' OR m.cc_list LIKE ? ESCAPE '\\')")
+            args += [likePattern(v), likePattern(v)]
         }
         for v in q.subject {
-            conds.append("m.subject LIKE ?")
-            args.append("%\(v)%")
+            conds.append("m.subject LIKE ? ESCAPE '\\'")
+            args.append(likePattern(v))
         }
         if q.hasAttachment { conds.append("m.has_att = 1") }
         if q.unread { conds.append("(m.flags & 1) = 0") }
@@ -375,12 +439,23 @@ final class Store {
         return out
     }
 
+    /// LIKE pattern with user wildcards escaped, so "%" and "_" in a query match literally.
+    private func likePattern(_ value: String) -> String {
+        var v = value.replacingOccurrences(of: "\\", with: "\\\\")
+        v = v.replacingOccurrences(of: "%", with: "\\%")
+        v = v.replacingOccurrences(of: "_", with: "\\_")
+        return "%\(v)%"
+    }
+
     func contacts(matching prefix: String, limit: Int = 8) -> [EmailAddress] {
-        let p = prefix.lowercased() + "%"
+        var v = prefix.lowercased().replacingOccurrences(of: "\\", with: "\\\\")
+        v = v.replacingOccurrences(of: "%", with: "\\%")
+        v = v.replacingOccurrences(of: "_", with: "\\_")
+        let p = v + "%"
         var out: [EmailAddress] = []
         db.query("""
-            SELECT from_name, from_addr, COUNT(*) c FROM messages WHERE from_addr LIKE ? OR from_name LIKE ?
-            GROUP BY from_addr ORDER BY c DESC LIMIT ?
+            SELECT name, email FROM contacts WHERE email LIKE ? ESCAPE '\\' OR name LIKE ? ESCAPE '\\'
+            ORDER BY count DESC LIMIT ?
             """, [p, p, limit]) { out.append(EmailAddress(name: $0.text(0), email: $0.text(1))) }
         return out
     }
@@ -410,18 +485,22 @@ final class Store {
         var folderPath: String
         var uids: [UInt32]
         var arg: String
+        var folderID: Int64
+        var uidvalidity: UInt32
     }
 
-    func addOp(account: String, kind: String, folderPath: String, uids: [UInt32], arg: String = "") {
-        db.run("INSERT INTO pending_ops(account, kind, folder_path, uids, arg, created) VALUES (?,?,?,?,?,?)",
-               [account, kind, folderPath, uids.map(String.init).joined(separator: ","), arg, Date()])
+    func addOp(account: String, kind: String, folderPath: String, uids: [UInt32], arg: String = "",
+               folderID: Int64 = 0, uidvalidity: UInt32 = 0) {
+        db.run("INSERT INTO pending_ops(account, kind, folder_path, uids, arg, created, folder_id, uidvalidity) VALUES (?,?,?,?,?,?,?,?)",
+               [account, kind, folderPath, uids.map(String.init).joined(separator: ","), arg, Date(), folderID, uidvalidity])
     }
 
     func ops(account: String) -> [PendingOp] {
         var out: [PendingOp] = []
-        db.query("SELECT id, kind, folder_path, uids, arg FROM pending_ops WHERE account=? ORDER BY id", [account]) {
+        db.query("SELECT id, kind, folder_path, uids, arg, folder_id, uidvalidity FROM pending_ops WHERE account=? ORDER BY id", [account]) {
             out.append(PendingOp(id: $0.int64(0), kind: $0.text(1), folderPath: $0.text(2),
-                                 uids: $0.text(3).split(separator: ",").compactMap { UInt32($0) }, arg: $0.text(4)))
+                                 uids: $0.text(3).split(separator: ",").compactMap { UInt32($0) }, arg: $0.text(4),
+                                 folderID: $0.int64(5), uidvalidity: UInt32(truncatingIfNeeded: $0.int64(6))))
         }
         return out
     }

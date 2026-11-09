@@ -5,6 +5,8 @@ struct SelectInfo {
     var uidValidity: UInt32 = 0
     var uidNext: UInt32 = 0
     var highestModseq: UInt64 = 0
+    /// What the server actually granted, from its tagged [READ-ONLY]/[READ-WRITE] code.
+    var readOnly: Bool = false
 }
 
 struct ListedFolder {
@@ -49,6 +51,8 @@ actor IMAPClient {
     private(set) var capabilities: Set<String> = []
     private(set) var selectedPath: String?
     private var selectedReadOnly = false
+    /// Info from the most recent successful SELECT/EXAMINE on this connection.
+    private var lastSelectInfo = SelectInfo()
     /// Response code of the last tagged OK (e.g. "CAPABILITY …" after LOGIN).
     private var lastTaggedCode: String?
     private var idleTag: String?
@@ -121,12 +125,14 @@ actor IMAPClient {
         }
         stream = nil
         selectedPath = nil
+        lastSelectInfo = SelectInfo()
     }
 
     private func drop() async {
         if let s = stream { await s.close() }
         stream = nil
         selectedPath = nil
+        lastSelectInfo = SelectInfo()
     }
 
     // MARK: Low-level
@@ -214,9 +220,11 @@ actor IMAPClient {
         var out: [ListedFolder] = []
         for r in rs where r.isUntagged {
             guard r.values.count >= 4, r.values[0].text?.uppercased() == "LIST" else { continue }
+            // A truncated LIST line means the response was cut short; refusing here keeps the caller
+            // from pruning the whole folder cache off a partial list.
             let attrs = r.values[1].list?.compactMap { $0.text } ?? []
             let delim = r.values[2].text ?? "/"
-            guard let rawName = r.values[3].text else { continue }
+            guard let rawName = r.values[3].text else { throw NetError.protocolError("truncated LIST response") }
             out.append(ListedFolder(path: MailboxName.decode(rawName), delimiter: delim, attributes: attrs))
         }
         return out
@@ -229,7 +237,6 @@ actor IMAPClient {
         let suffix = hasCondstore ? " (CONDSTORE)" : ""
         let rs = try await run("\(verb) \(MailboxName.encode(path).imapQuoted)\(suffix)")
         selectedPath = path
-        selectedReadOnly = readOnly
         var info = SelectInfo()
         for r in rs where r.isUntagged {
             if r.values.count >= 2, let n = r.values[0].number, r.values[1].text?.uppercased() == "EXISTS" {
@@ -247,11 +254,23 @@ actor IMAPClient {
                 }
             }
         }
+        // The server's tagged code, not the requested mode, decides whether writes can succeed
+        // (shared/delegated mailboxes come back [READ-ONLY] even after a plain SELECT).
+        let tagged = (lastTaggedCode ?? "").uppercased()
+        if tagged.hasPrefix("READ-ONLY") { selectedReadOnly = true }
+        else if tagged.hasPrefix("READ-WRITE") { selectedReadOnly = false }
+        else { selectedReadOnly = readOnly }
+        info.readOnly = selectedReadOnly
+        lastSelectInfo = info
         return info
     }
 
-    func ensureSelected(_ path: String, readOnly: Bool) async throws {
+    /// Selects the folder unless it's already the current one, and returns the selection info either way
+    /// (no extra round trip when the folder is unchanged).
+    @discardableResult
+    func ensureSelected(_ path: String, readOnly: Bool) async throws -> SelectInfo {
         try await select(path, readOnly: readOnly, force: false)
+        return lastSelectInfo
     }
 
     func uidSearch(_ criteria: String) async throws -> [UInt32] {
@@ -301,7 +320,10 @@ actor IMAPClient {
         } else {
             try await run("UID COPY \(set) \(mbox)")
             try await run("UID STORE \(set) +FLAGS.SILENT (\\Deleted)")
-            if capabilities.contains("UIDPLUS") { try await run("UID EXPUNGE \(set)") } else { try await run("EXPUNGE") }
+            if capabilities.contains("UIDPLUS") { try await run("UID EXPUNGE \(set)") }
+            // Without UIDPLUS a bare EXPUNGE would also purge messages another client flagged \Deleted;
+            // only expunge when exactly our UIDs are pending deletion.
+            else { try await expungeExactly(uids) }
         }
     }
 
@@ -309,7 +331,14 @@ actor IMAPClient {
         guard !uids.isEmpty else { return }
         let set = imapUIDSet(uids)
         try await run("UID STORE \(set) +FLAGS.SILENT (\\Deleted)")
-        if capabilities.contains("UIDPLUS") { try await run("UID EXPUNGE \(set)") } else { try await run("EXPUNGE") }
+        if capabilities.contains("UIDPLUS") { try await run("UID EXPUNGE \(set)") } else { try await expungeExactly(uids) }
+    }
+
+    /// Bare EXPUNGE gated on an exact UID SEARCH DELETED match, so other clients' deleted messages survive.
+    private func expungeExactly(_ uids: [UInt32]) async throws {
+        let deleted = Set(try await uidSearch("DELETED"))
+        guard Set(uids).isSubset(of: deleted) else { return }
+        try await run("EXPUNGE")
     }
 
     func append(_ path: String, flags: String, message: Data) async throws {
@@ -429,24 +458,45 @@ actor IMAPClient {
     func downloadPart(uid: UInt32, part: BodyPart, to url: URL) async throws {
         FileManager.default.createFile(atPath: url.path, contents: nil)
         let handle = try FileHandle(forWritingTo: url)
+        // A truncated or failed download must not leave a broken file behind.
         defer { try? handle.close() }
-        let chunk = 2 * 1024 * 1024
-        var offset = 0
-        var b64 = StreamingBase64Decoder()
-        let enc = part.encoding.lowercased()
-        var qpBuffer = Data()
-        while true {
-            let results = try await fetch("\(uid)", items: "(UID BODY.PEEK[\(part.partID)]<\(offset).\(chunk)>)")
-            guard let r = results.first(where: { $0.uid == uid }), let raw = r.items["BODY[\(part.partID)]"]?.data else { break }
-            switch enc {
-            case "base64": handle.write(b64.feed(raw))
-            case "quoted-printable": qpBuffer.append(raw)
-            default: handle.write(raw)
+        do {
+            let chunk = 2 * 1024 * 1024
+            var offset = 0
+            var b64 = StreamingBase64Decoder()
+            let enc = part.encoding.lowercased()
+            var qpBuffer = Data()
+            let newline = Data("\n".utf8)
+            while true {
+                let results = try await fetch("\(uid)", items: "(UID BODY.PEEK[\(part.partID)]<\(offset).\(chunk)>)")
+                guard let r = results.first(where: { $0.uid == uid }), let raw = r.items["BODY[\(part.partID)]"]?.data else { break }
+                switch enc {
+                case "base64": handle.write(b64.feed(raw))
+                case "quoted-printable":
+                    // Decode complete lines only, so a soft break or =XX never spans two chunks in RAM.
+                    qpBuffer.append(raw)
+                    if let r = qpBuffer.range(of: newline, options: [.backwards]) {
+                        let complete = qpBuffer.subdata(in: qpBuffer.startIndex..<r.upperBound)
+                        qpBuffer.removeSubrange(qpBuffer.startIndex..<r.upperBound)
+                        if !complete.isEmpty { handle.write(MIME.decodeQuotedPrintable(complete)) }
+                    }
+                default: handle.write(raw)
+                }
+                offset += raw.count
+                if raw.count < chunk { break }
             }
-            offset += raw.count
-            if raw.count < chunk { break }
+            if enc == "base64" { handle.write(b64.finish()) }
+            if enc == "quoted-printable" { handle.write(MIME.decodeQuotedPrintable(qpBuffer)) }
+            // Verify the decoded size against BODYSTRUCTURE: short chunks don't end the fetch, a short
+            // total does mean truncation.
+            let written = Int64(handle.offsetInFile)
+            if part.decodedSize > 0 && written != Int64(part.decodedSize) {
+                throw NetError.server("The attachment arrived incomplete from the server. Try downloading it again.")
+            }
+        } catch {
+            try? handle.close()
+            try? FileManager.default.removeItem(at: url)
+            throw error
         }
-        if enc == "base64" { handle.write(b64.finish()) }
-        if enc == "quoted-printable" { handle.write(MIME.decodeQuotedPrintable(qpBuffer)) }
     }
 }

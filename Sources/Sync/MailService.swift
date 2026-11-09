@@ -29,7 +29,16 @@ final class MailService {
         for a in accounts { makeEngine(a) }
         let days = Prefs.offlineDays
         DispatchQueue.main.asyncAfter(deadline: .now() + 20) { [store] in store.prune(offlineDays: days) }
+        // Coming back to the app pushes queued offline actions to the server.
+        NotificationCenter.default.addObserver(forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main) { _ in
+            MainActor.assumeIsolated { MailService.shared.flushAll() }
+        }
         updateBadge()
+    }
+
+    /// Sends any queued offline actions for every account (used on app activation).
+    func flushAll() {
+        for e in engines.values { Task { await e.flushOps() } }
     }
 
     private func makeEngine(_ a: Account) {
@@ -75,6 +84,7 @@ final class MailService {
         engines[id] = nil
         accounts.removeAll { $0.id == id }
         Prefs.accounts = accounts.filter { $0.provider != .demo }
+        if Prefs.defaultAccountID == id { Prefs.defaultAccountID = nil }
         Keychain.delete(id)
         store.deleteAccount(id)
         NotificationCenter.default.post(name: .mailAccountsChanged, object: nil)
@@ -140,7 +150,9 @@ final class MailService {
             switch target {
             case .archive:
                 label = "Archived"
+                // Gmail archives into All Mail; elsewhere fall back Archive → Trash so the action never no-ops.
                 destination = store.folder(account: acct, role: engine.isGmail ? .all : .archive)
+                    ?? store.folder(account: acct, role: .trash)
             case .trash:
                 label = "Moved to Trash"
                 destination = store.folder(account: acct, role: .trash)
@@ -171,7 +183,11 @@ final class MailService {
         }
         updateBadge()
         NotificationCenter.default.post(name: .mailDataChanged, object: nil)
-        guard done > 0 else { return nil }
+        guard done > 0 else {
+            // Everything already lives in the destination (e.g. archiving from All Mail): say so.
+            if case .archive = target { return "Already archived" }
+            return nil
+        }
         return done == 1 ? label : "\(label) · \(done) messages"
     }
 
@@ -189,12 +205,13 @@ final class MailService {
     private var pendingSends: [UUID: Task<Void, Never>] = [:]
 
     /// Queues a send behind the Undo delay. Returns the id the UI uses to cancel it.
+    /// The pending entry stays until send() returns, so a quit during the upload still waits.
     func queueSend(_ p: PendingSend, onResult: @escaping (Error?) -> Void) -> UUID {
         let delay = max(0, Prefs.undoSendSeconds)
         let task = Task { [weak self] in
             try? await Task.sleep(nanoseconds: UInt64(delay) * 1_000_000_000)
-            guard let self, !Task.isCancelled else { return }
-            self.pendingSends[p.id] = nil
+            guard let self, !Task.isCancelled else { self?.pendingSends[p.id] = nil; return }
+            defer { self.pendingSends[p.id] = nil }
             guard let engine = self.engines[p.accountID] else { onResult(NetError.server("Account not found")); return }
             do {
                 try await engine.send(p.message)

@@ -14,13 +14,18 @@ final class AccountEngine {
     private var clients: [Lane: IMAPClient] = [:]
     private var connecting: [Lane: Task<IMAPClient, Error>] = [:]
     private var syncing: Set<Int64> = []
+    private var syncPending: Set<Int64> = []
     /// One gate per connection: "select folder, then act" must run as a unit on that connection.
     private let syncGate = AsyncGate()
     private let fetchGate = AsyncGate()
     private let downloadGate = AsyncGate()
     private let prefetchGate = AsyncGate()
+    private let searchGate = AsyncGate()
+    private var searchTask: Task<[Int64], Error>?
     private var idleTask: Task<Void, Never>?
+    private var startupTasks: [Task<Void, Never>] = []
     private var flushing = false
+    private var flushPending = false
     private(set) var isGmail: Bool
     private(set) var lastError: String?
     private(set) var syncingFolders = 0
@@ -41,21 +46,29 @@ final class AccountEngine {
     func client(_ lane: Lane) async throws -> IMAPClient {
         if let c = clients[lane], await c.isConnected { return c }
         if let pending = connecting[lane] { return try await pending.value }
-        let password = try await appPassword()
+        // Publish the connecting task before anything can suspend, so a second caller shares this
+        // connection instead of opening a second one.
         let a = account
         let t0 = Date()
         let task = Task<IMAPClient, Error> {
+            let password = try await appPassword()
             let c = IMAPClient(host: a.imapHost, port: a.imapPort, username: a.username, password: password)
             try await c.connect()
             return c
         }
         connecting[lane] = task
-        defer { connecting[lane] = nil }
-        let c = try await task.value
-        Debug.log("\(lane) connection ready: \(Debug.ms(since: t0))")
-        clients[lane] = c
-        isGmail = await c.isGmail
-        return c
+        do {
+            let c = try await task.value
+            Debug.log("\(lane) connection ready: \(Debug.ms(since: t0))")
+            clients[lane] = c
+            isGmail = await c.isGmail
+            // Only now is it safe to clear: anyone who arrived while we were waiting already holds the task.
+            connecting[lane] = nil
+            return c
+        } catch {
+            connecting[lane] = nil
+            throw error
+        }
     }
 
     private var cachedPassword: String?
@@ -85,6 +98,8 @@ final class AccountEngine {
     }
 
     func shutdown() {
+        for t in startupTasks { t.cancel() }
+        startupTasks.removeAll()
         idleTask?.cancel()
         idleTask = nil
         let all = clients.values
@@ -106,20 +121,23 @@ final class AccountEngine {
         guard !isDemo else { return }
         // The click connection opens first and in parallel, so a message you open right after launch
         // isn't stuck behind the startup sync.
-        Task { await prewarmFetch() }
-        Task {
+        startupTasks.append(Task { await prewarmFetch() })
+        startupTasks.append(Task {
             if store.folder(account: account.id, role: .inbox) == nil {
                 await refreshFolders()
             }
+            if Task.isCancelled { return }
             if let inbox = store.folder(account: account.id, role: .inbox) {
                 await sync(folderID: inbox.id, prefetch: false)
-                Task { await prefetchBodies(folderID: inbox.id, limit: 60) }
+                if Task.isCancelled { return }
+                startupTasks.append(Task { await prefetchBodies(folderID: inbox.id, limit: 60) })
             }
             await flushOps()
+            if Task.isCancelled { return }
             // Refresh the folder list after the Inbox is on screen; it changes rarely.
             await refreshFolders()
             startIdle()
-        }
+        })
     }
 
     /// Opens the click connection ahead of time (TLS + login + Inbox selected), so the first message you open
@@ -160,25 +178,42 @@ final class AccountEngine {
         NotificationCenter.default.post(name: .mailStatusChanged, object: self)
     }
 
+    /// Every fetch lane checks that the folder's UIDVALIDITY still matches what's cached: after a
+    /// mismatch (folder recreated on the server) the cache is reset and the request fails loudly,
+    /// instead of UIDs silently resolving to different messages.
+    private func verifySelection(_ info: SelectInfo, folder: Folder) throws {
+        guard folder.uidValidity != 0, info.uidValidity != 0, info.uidValidity != folder.uidValidity else { return }
+        store.resetFolder(folder.id)
+        throw NetError.server("\"\(folder.name)\" changed on the server and was reloaded. Try again.")
+    }
+
     /// Delta sync of one folder: new mail since the last UIDNEXT, flag changes since the last MODSEQ, and removals.
     func sync(folderID: Int64, prefetch: Bool = true) async {
-        guard !isDemo, !syncing.contains(folderID), let folder = store.folder(folderID), folder.selectable else { return }
+        guard !isDemo, let folder = store.folder(folderID), folder.selectable else { return }
+        // A request for a folder already syncing is coalesced, not dropped: it re-runs right after.
+        guard !syncing.contains(folderID) else { syncPending.insert(folderID); return }
         syncing.insert(folderID)
         beginSync()
-        defer { syncing.remove(folderID); endSync() }
+        defer {
+            syncing.remove(folderID); endSync()
+            if syncPending.remove(folderID) != nil { Task { await self.sync(folderID: folderID, prefetch: prefetch) } }
+        }
         var prefetchLimit = 0
         do {
           try await syncGate.run {
             let c = try await client(.sync)
             guard let info = try await c.select(folder.path, readOnly: false) else { return }
             var state = folder
-            if state.uidValidity != 0 && state.uidValidity != info.uidValidity {
+            if state.uidValidity != 0 && info.uidValidity != 0 && state.uidValidity != info.uidValidity {
                 store.resetFolder(folderID)
                 state.uidNext = 0
                 state.modseq = 0
             }
             var newHeaders: [ParsedHeader] = []
             let isInitial = state.uidNext == 0 || store.messageCount(folderID: folderID) == 0
+            // The folder state advances right after headers land, so a later failure can't cause
+            // the same range to be re-fetched (and new mail re-notified) on every sync.
+            let finalUIDNext = info.uidNext > 0 ? info.uidNext : (store.maxUID(folderID: folderID) ?? 0) + 1
 
             if isInitial {
                 var uids = Set<UInt32>()
@@ -195,37 +230,51 @@ final class AccountEngine {
                     store.insert(folderID: folderID, headers)
                     NotificationCenter.default.post(name: .mailDataChanged, object: folderID)
                 }
+                store.updateFolderState(folderID, uidValidity: info.uidValidity, uidNext: finalUIDNext, modseq: info.highestModseq)
             } else {
                 let next = state.uidNext > 0 ? state.uidNext : (store.maxUID(folderID: folderID).map { $0 + 1 } ?? 1)
                 if info.uidNext == 0 || info.uidNext > next {
                     let headers = try await c.fetchHeaders("\(next):*").filter { $0.uid >= next }
                     store.insert(folderID: folderID, headers)
                     newHeaders = headers
+                    store.updateFolderState(folderID, uidValidity: info.uidValidity, uidNext: finalUIDNext, modseq: state.modseq)
                 }
+                // Don't let server flag writes clobber what the user just changed: UIDs with a queued
+                // flag op keep their local (and soon server) state.
+                let pendingFlagUIDs = Set(store.ops(account: account.id)
+                    .filter { ($0.kind == "flag+" || $0.kind == "flag-") && $0.folderPath == folder.path }
+                    .flatMap { $0.uids })
+                var flagsOK = true
                 if let minUID = store.minUID(folderID: folderID) {
                     // Flag changes.
-                    if await c.hasCondstore, state.modseq > 0 {
-                        if info.highestModseq != state.modseq {
-                            let changed = try await c.fetch("1:*", items: "(UID FLAGS)", changedSince: state.modseq)
-                            store.updateFlags(folderID: folderID, changed.compactMap { r in
-                                r.uid.map { ($0, MessageFlags.from(imapFlags: r.items["FLAGS"]?.list?.compactMap { $0.text } ?? [])) }
+                    do {
+                        if await c.hasCondstore, state.modseq > 0 {
+                            if info.highestModseq != state.modseq {
+                                let changed = try await c.fetch("1:*", items: "(UID FLAGS)", changedSince: state.modseq)
+                                store.updateFlags(folderID: folderID, changed.compactMap { r in
+                                    guard let uid = r.uid, !pendingFlagUIDs.contains(uid) else { return nil }
+                                    return (uid, MessageFlags.from(imapFlags: r.items["FLAGS"]?.list?.compactMap { $0.text } ?? []))
+                                })
+                            }
+                        } else {
+                            let all = try await c.fetch("\(minUID):*", items: "(UID FLAGS)")
+                            store.updateFlags(folderID: folderID, all.compactMap { r in
+                                guard let uid = r.uid, !pendingFlagUIDs.contains(uid) else { return nil }
+                                return (uid, MessageFlags.from(imapFlags: r.items["FLAGS"]?.list?.compactMap { $0.text } ?? []))
                             })
                         }
-                    } else {
-                        let all = try await c.fetch("\(minUID):*", items: "(UID FLAGS)")
-                        store.updateFlags(folderID: folderID, all.compactMap { r in
-                            r.uid.map { ($0, MessageFlags.from(imapFlags: r.items["FLAGS"]?.list?.compactMap { $0.text } ?? [])) }
-                        })
-                    }
-                    // Removals (moved, archived or deleted elsewhere).
-                    let present = Set(try await c.uidSearch("UID \(minUID):*"))
-                    let gone = store.localUIDs(folderID: folderID).filter { !present.contains($0) }
-                    store.deleteMessages(folderID: folderID, uids: gone)
+                    } catch { flagsOK = false; report(error) }
+                    // Removals (moved, archived or deleted elsewhere) run even if the flag stage failed.
+                    do {
+                        let present = Set(try await c.uidSearch("UID \(minUID):*"))
+                        let gone = store.localUIDs(folderID: folderID).filter { !present.contains($0) }
+                        store.deleteMessages(folderID: folderID, uids: gone)
+                    } catch { report(error) }
                 }
+                // MODSEQ only advances when the flag stage succeeded, so missed flag changes re-fetch.
+                store.updateFolderState(folderID, uidValidity: info.uidValidity, uidNext: finalUIDNext,
+                                        modseq: flagsOK ? info.highestModseq : state.modseq)
             }
-            store.updateFolderState(folderID, uidValidity: info.uidValidity,
-                                    uidNext: info.uidNext > 0 ? info.uidNext : (store.maxUID(folderID: folderID) ?? 0) + 1,
-                                    modseq: info.highestModseq)
             NotificationCenter.default.post(name: .mailDataChanged, object: folderID)
             report(nil)
             if folder.role == .inbox, !newHeaders.isEmpty {
@@ -235,8 +284,12 @@ final class AccountEngine {
           }
         } catch {
             report(error)
+            return
         }
         if prefetch, prefetchLimit > 0 { await prefetchBodies(folderID: folderID, limit: prefetchLimit) }
+        // Offline actions queued while we were away go out right after a successful sync.
+        await flushOps()
+        MailService.shared.updateBadge()
         // Parsing a big FETCH leaves freed pages behind; hand them back.
         if syncingFolders <= 1 { Memory.relieve() }
     }
@@ -272,7 +325,7 @@ final class AccountEngine {
                 let partIDs = [chunk[0].html?.partID, chunk[0].text?.partID].compactMap { $0 }
                 let raw = try? await prefetchGate.run { () async throws -> [UInt32: [String: Data]] in
                     let c = try await client(.prefetch)
-                    try await c.ensureSelected(group.folder.path, readOnly: true)
+                    try self.verifySelection(try await c.ensureSelected(group.folder.path, readOnly: true), folder: group.folder)
                     return try await c.fetchRawParts(uids: chunk.map { $0.uid }, partIDs: partIDs)
                 }
                 guard let raw else { continue }
@@ -295,17 +348,18 @@ final class AccountEngine {
         }
     }
 
-    /// Fetches the next 200 older messages for a folder ("Load older messages").
+    /// Fetches the next 200 older messages for a folder ("Load older messages"). Resolved by UID SEARCH
+    /// below the oldest cached UID, so a remotely deleted boundary message doesn't read as "no older mail".
     func loadOlder(folderID: Int64) async -> Int {
         guard !isDemo, let folder = store.folder(folderID), let minUID = store.minUID(folderID: folderID) else { return 0 }
         do {
             let headers = try await fetchGate.run { () async throws -> [ParsedHeader] in
                 let c = try await client(.fetch)
-                try await c.ensureSelected(folder.path, readOnly: true)
-                let probe = try await c.fetch("\(minUID)", items: "(UID)")
-                guard let seq = probe.first?.seq, seq > 1 else { return [] }
-                let from = max(1, Int(seq) - 200)
-                return try await c.fetchHeaders("\(from):\(seq - 1)", uid: false)
+                try self.verifySelection(try await c.ensureSelected(folder.path, readOnly: true), folder: folder)
+                let below = try await c.uidSearch("UID 1:\(max(0, Int(minUID) - 1))")
+                let older = below.sorted().prefix(200)
+                guard !older.isEmpty else { return [] }
+                return try await c.fetchHeaders(imapUIDSet(older))
             }
             store.insert(folderID: folderID, headers)
             NotificationCenter.default.post(name: .mailDataChanged, object: folderID)
@@ -332,14 +386,19 @@ final class AccountEngine {
                     if await c.hasIdle {
                         try await c.ensureSelected(inbox.path, readOnly: true)
                         // Gmail drops idle connections after ~29 minutes; re-issue every 24.
-                        if try await c.idle(maxSeconds: 24 * 60) { await self.sync(folderID: inbox.id) }
+                        // Whether the server reported a change or the window timed out, catch up on disk first.
+                        _ = try await c.idle(maxSeconds: 24 * 60)
+                        await self.sync(folderID: inbox.id)
                     } else {
                         try await Task.sleep(nanoseconds: 120_000_000_000)
                         await self.sync(folderID: inbox.id)
                     }
                 } catch {
                     if Task.isCancelled { return }
+                    // The connection dropped: after reconnecting, sync before idling again so
+                    // changes missed while offline aren't skipped.
                     try? await Task.sleep(nanoseconds: 20_000_000_000)
+                    await self.sync(folderID: inbox.id)
                 }
             }
         }
@@ -358,7 +417,7 @@ final class AccountEngine {
         let (h, t) = d.structure?.displayParts() ?? (nil, nil)
         let data = try await fetchGate.run { () async throws -> [String: Data] in
             let c = try await client(.fetch)
-            try await c.ensureSelected(folder.path, readOnly: true)
+            try self.verifySelection(try await c.ensureSelected(folder.path, readOnly: true), folder: folder)
             if d.structure != nil {
                 return try await c.fetchParts(uid: d.uid, parts: [h, t].compactMap { $0 })
             }
@@ -379,23 +438,23 @@ final class AccountEngine {
 
     /// Whole decoded part (inline images). Capped so a huge inline part can't balloon memory.
     func partData(messageID: Int64, partID: String) async throws -> Data? {
-        guard let d = store.detail(messageID), let folder = store.folder(d.folderID),
+        guard !isDemo, let d = store.detail(messageID), let folder = store.folder(d.folderID),
               let part = d.structure?.part(withID: partID), part.decodedSize < 12_000_000 else { return nil }
         return try await fetchGate.run { () async throws -> Data? in
             let c = try await client(.fetch)
-            try await c.ensureSelected(folder.path, readOnly: true)
+            try self.verifySelection(try await c.ensureSelected(folder.path, readOnly: true), folder: folder)
             return try await c.fetchParts(uid: d.uid, parts: [part])[partID]
         }
     }
 
     func download(messageID: Int64, part: BodyPart, to url: URL) async throws {
-        guard let d = store.detail(messageID), let folder = store.folder(d.folderID) else {
+        guard !isDemo, let d = store.detail(messageID), let folder = store.folder(d.folderID) else {
             throw NetError.server("This message is no longer in the cache.")
         }
         // Downloads get their own connection so a 25 MB attachment never blocks reading other mail.
         try await downloadGate.run {
             let c = try await client(.download)
-            try await c.ensureSelected(folder.path, readOnly: true)
+            try self.verifySelection(try await c.ensureSelected(folder.path, readOnly: true), folder: folder)
             try await c.downloadPart(uid: d.uid, part: part, to: url)
         }
     }
@@ -404,27 +463,37 @@ final class AccountEngine {
 
     /// Server-side search (Gmail search syntax via X-GM-RAW on Gmail, IMAP SEARCH elsewhere) in one folder,
     /// or across the whole mailbox (All Mail). Fetches headers for hits that aren't cached and returns their ids.
+    /// Runs on its own gate and cancels the previous search, so typing can't queue full searches
+    /// ahead of a message you clicked.
     func serverSearch(_ query: SearchQuery, folder: Folder? = nil) async throws -> [Int64] {
         guard !isDemo, !query.isEmpty else { return [] }
         guard let scope = folder ?? store.folder(account: account.id, role: .all) ?? store.folder(account: account.id, role: .inbox) else { return [] }
+        searchTask?.cancel()
         let known = Set(store.localUIDs(folderID: scope.id))
         let t0 = Date()
-        let (newest, headers) = try await fetchGate.run { () async throws -> ([UInt32], [ParsedHeader]) in
-            let c = try await client(.fetch)
-            try await c.ensureSelected(scope.path, readOnly: true)
-            let uids: [UInt32]
-            if await c.isGmail {
-                uids = try await c.uidSearch(prefix: "X-GM-RAW", text: query.gmailRaw)
-            } else {
-                uids = try await c.uidSearch(query.imapCriteria)
+        let task = Task { [weak self] () async throws -> [Int64] in
+            guard let self else { return [] }
+            return try await self.searchGate.run { () async throws -> [Int64] in
+                try Task.checkCancellation()
+                let c = try await self.client(.fetch)
+                try self.verifySelection(try await c.ensureSelected(scope.path, readOnly: true), folder: scope)
+                let uids: [UInt32]
+                if await c.isGmail {
+                    uids = try await c.uidSearch(prefix: "X-GM-RAW", text: query.gmailRaw)
+                } else {
+                    uids = try await c.uidSearch(query.imapCriteria)
+                }
+                let newest = Array(uids.sorted(by: >).prefix(200))
+                let missing = newest.filter { !known.contains($0) }
+                try Task.checkCancellation()
+                let headers = missing.isEmpty ? [] : try await c.fetchHeaders(imapUIDSet(missing))
+                self.store.insert(folderID: scope.id, headers)
+                Debug.log("server search '\(query.gmailRaw)' in \(scope.name): \(newest.count) hits, \(headers.count) new, \(Debug.ms(since: t0))")
+                return self.store.ids(folderID: scope.id, uids: newest)
             }
-            let newest = Array(uids.sorted(by: >).prefix(200))
-            let missing = newest.filter { !known.contains($0) }
-            return (newest, missing.isEmpty ? [] : try await c.fetchHeaders(imapUIDSet(missing)))
         }
-        store.insert(folderID: scope.id, headers)
-        Debug.log("server search '\(query.gmailRaw)' in \(scope.name): \(newest.count) hits, \(headers.count) new, \(Debug.ms(since: t0))")
-        return store.ids(folderID: scope.id, uids: newest)
+        searchTask = task
+        return try await task.value
     }
 
     // MARK: Actions (optimistic locally, queued for the server)
@@ -433,20 +502,46 @@ final class AccountEngine {
         let byFolder = Dictionary(grouping: rows, by: { $0.folderID })
         for (fid, list) in byFolder {
             guard let f = store.folder(fid) else { continue }
-            store.addOp(account: account.id, kind: kind, folderPath: f.path, uids: list.map { $0.uid }, arg: arg)
+            store.addOp(account: account.id, kind: kind, folderPath: f.path, uids: list.map { $0.uid }, arg: arg,
+                        folderID: f.id, uidvalidity: f.uidValidity)
         }
         Task { await flushOps() }
     }
 
+    /// Classified server refusals: LIMIT/INUSE/rate-limit style NOs are worth retrying;
+    /// anything else (message gone, folder missing, no permission) is final.
+    private static func isTemporaryRefusal(_ message: String) -> Bool {
+        let m = message.uppercased()
+        return ["LIMIT", "INUSE", "UNAVAILABLE", "SERVERBUG", "CONTACTSYSADMIN", "OVERQUOTA",
+                "RATE", "THROTTLE", "TEMPORAR", "TRYAGAIN"].contains { m.contains($0) }
+    }
+
+    /// Applies queued actions to the server. Loops over fresh snapshots until the queue is empty, so
+    /// actions queued mid-flush are picked up instead of lost. Temporary refusals retry with backoff;
+    /// a final refusal of a move/delete re-fetches the source headers so the messages reappear locally.
     func flushOps() async {
-        guard !isDemo, !flushing else { return }
+        guard !isDemo else { return }
+        guard !flushing else { flushPending = true; return }
         flushing = true
         defer { flushing = false }
-        for op in store.ops(account: account.id) {
+        var attempts: [Int64: Int] = [:]
+        while true {
+            flushPending = false
+            guard let op = store.ops(account: account.id).first else {
+                if flushPending { continue } else { break }
+            }
+            guard let f = store.folder(account: account.id, path: op.folderPath), f.selectable else {
+                store.removeOp(op.id) // Folder is gone; its ops were already reset with it.
+                continue
+            }
+            if op.uidvalidity != 0, f.uidValidity != 0, op.uidvalidity != f.uidValidity {
+                store.removeOp(op.id) // Stale UIDs would land on the wrong messages.
+                continue
+            }
             do {
                 try await syncGate.run {
                     let c = try await client(.sync)
-                    try await c.ensureSelected(op.folderPath, readOnly: false)
+                    try self.verifySelection(try await c.ensureSelected(op.folderPath, readOnly: false), folder: f)
                     switch op.kind {
                     case "flag+": try await c.store(op.uids, "+FLAGS.SILENT (\(op.arg))")
                     case "flag-": try await c.store(op.uids, "-FLAGS.SILENT (\(op.arg))")
@@ -456,18 +551,46 @@ final class AccountEngine {
                     }
                 }
                 store.removeOp(op.id)
+                attempts[op.id] = nil
             } catch let e as NetError {
-                if case .server = e {
-                    store.removeOp(op.id) // The server refused it (message gone, folder missing); don't retry forever.
+                if case .server(let m) = e, !Self.isTemporaryRefusal(m) {
+                    // The server refused it for good; don't retry forever.
+                    store.removeOp(op.id)
                     report(e)
+                    if op.kind == "move" || op.kind == "expunge" { await refetchHeaders(folder: f, uids: op.uids) }
                     continue
                 }
                 report(e)
-                return
+                let n = (attempts[op.id] ?? 0) + 1
+                if n >= 3 {
+                    // Temporary refusal that won't clear: give up and undo the optimistic local delete.
+                    store.removeOp(op.id)
+                    if op.kind == "move" || op.kind == "expunge" { await refetchHeaders(folder: f, uids: op.uids) }
+                } else {
+                    attempts[op.id] = n
+                    try? await Task.sleep(nanoseconds: UInt64(2_000_000_000 << (n - 1)))
+                }
             } catch {
                 report(error)
-                return
+                return // Connection is gone; the next flush trigger retries.
             }
+        }
+    }
+
+    /// A move/delete was refused after the local rows were already removed: re-fetch the headers so the
+    /// messages reappear instead of vanishing until the next full resync.
+    private func refetchHeaders(folder: Folder, uids: [UInt32]) async {
+        guard !uids.isEmpty else { return }
+        do {
+            let headers = try await syncGate.run { () async throws -> [ParsedHeader] in
+                let c = try await client(.sync)
+                try self.verifySelection(try await c.ensureSelected(folder.path, readOnly: true), folder: folder)
+                return try await c.fetchHeaders(imapUIDSet(uids))
+            }
+            store.insert(folderID: folder.id, headers)
+            NotificationCenter.default.post(name: .mailDataChanged, object: folder.id)
+        } catch {
+            report(error)
         }
     }
 
@@ -490,12 +613,21 @@ final class AccountEngine {
         try await SMTPClient.send(host: account.smtpHost, port: account.smtpPort, username: account.username,
                                   password: password, from: account.email, recipients: message.allRecipients, message: data)
         if !isGmail, let sent = store.folder(account: account.id, role: .sent) {
-            try? await syncGate.run {
-                let c = try await client(.sync)
-                try await c.append(sent.path, flags: "\\Seen", message: data)
+            do {
+                try await syncGate.run {
+                    let c = try await client(.sync)
+                    try await c.append(sent.path, flags: "\\Seen", message: data)
+                }
+            } catch {
+                // The message went out; failing to file the copy must not read as a failed send.
+                report(NetError.server("The message was sent, but filing it in \"\(sent.name)\" failed: "
+                                       + ((error as? LocalizedError)?.errorDescription ?? error.localizedDescription)))
             }
         }
-        if let sent = store.folder(account: account.id, role: .sent) { Task { await sync(folderID: sent.id) } }
+        // Gmail (and other servers) need a moment to file the sent copy before the Sent sync runs.
+        if let sent = store.folder(account: account.id, role: .sent) {
+            Task { try? await Task.sleep(nanoseconds: 3_000_000_000); await self.sync(folderID: sent.id) }
+        }
     }
 }
 

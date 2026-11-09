@@ -91,16 +91,17 @@ enum DemoData {
     <table width="100%" cellpadding="0" cellspacing="0" style="background:#f3f5f9"><tr><td align="center" style="padding:24px 12px">
     <table width="600" cellpadding="0" cellspacing="0" style="background:#ffffff;border-radius:14px;overflow:hidden;font-family:-apple-system,Helvetica,sans-serif">
     <tr><td style="background:linear-gradient(135deg,#1e3c72,#2a5298);padding:28px 32px;color:#fff">
-      <div style="font-size:12px;letter-spacing:2px;opacity:.8">NORTHWIND WEEKLY · ISSUE 112</div>
-      <div style="font-size:28px;font-weight:700;margin-top:6px">The alpine issue</div>
-    </td></tr>
-    <tr><td><img src="https://images.unsplash.com/photo-1506905925346-21bda4d32df4?w=1200&amp;q=80" width="600" alt="Mountain ridge" style="display:block;width:100%"></td></tr>
+          <div style="font-size:12px;letter-spacing:2px;opacity:.8">NORTHWIND WEEKLY · ISSUE 112</div>
+          <div style="font-size:28px;font-weight:700;margin-top:6px">The alpine issue</div>
+        </td></tr>
+    <tr><td style="height:220px;background:linear-gradient(160deg,#3d6cb4,#79a7d9 60%,#c8d9ec)" align="center">
+          <div style="font-size:64px;padding-top:70px">🏔</div></td></tr>
     <tr><td style="padding:24px 32px;color:#2b2f36;font-size:15px;line-height:1.55">
       <h3 style="margin:0 0 8px">Five trails worth the early start</h3>
       <p style="margin:0 0 16px">From high ridges to quiet lakes below, this week's picks reward an alarm clock.</p>
       <a href="https://example.com" style="display:inline-block;background:#2a5298;color:#fff;padding:10px 18px;border-radius:8px;text-decoration:none">Read the guide</a>
     </td></tr>
-    <tr><td style="padding:0 32px 24px"><img src="https://images.unsplash.com/photo-1506905925346-21bda4d32df4?w=5000&amp;q=95" width="536" alt="Full-resolution panorama"></td></tr>
+    <tr><td style="padding:0 32px 24px"><div style="height:160px;background:linear-gradient(180deg,#0b3d91,#3d6cb4);border-radius:10px" align="center"><div style="font-size:40px;padding-top:52px">⛰️</div></div></td></tr>
     <tr><td style="padding:16px 32px;background:#f7f8fb;color:#8a8f98;font-size:12px">You're receiving this because you subscribed. <img src="https://northwind.example/open.gif" width="1" height="1"></td></tr>
     </table></td></tr></table>
     """
