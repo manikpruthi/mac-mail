@@ -21,7 +21,6 @@ final class AccountEngine {
     private let fetchGate = AsyncGate()
     private let downloadGate = AsyncGate()
     private let prefetchGate = AsyncGate()
-    private let searchGate = AsyncGate()
     private var searchTask: Task<[Int64], Error>?
     private var idleTask: Task<Void, Never>?
     private var startupTasks: [Task<Void, Never>] = []
@@ -89,7 +88,13 @@ final class AccountEngine {
     // MARK: Connections
 
     func client(_ lane: Lane) async throws -> IMAPClient {
-        if let c = clients[lane], await c.isConnected { return c }
+        if let c = clients[lane] {
+            if await c.isConnected { return c }
+            // The old connection died (sleep/wake, server restart): close it before opening a new one,
+            // instead of leaving its socket to the garbage collector.
+            clients[lane] = nil
+            Task { await c.disconnect() }
+        }
         if let pending = connecting[lane] { return try await pending.value }
         // Publish the connecting task before anything can suspend, so a second caller shares this
         // connection instead of opening a second one.
@@ -136,12 +141,18 @@ final class AccountEngine {
             passwordTask = t
             return t
         }()
-        guard let p = try await task.value else {
+        do {
+            guard let p = try await task.value else {
+                passwordTask = nil
+                throw NetError.auth("no App Password saved for \(account.email). Open Settings → Accounts.")
+            }
+            cachedPassword = p
+            return p
+        } catch {
+            // Never cache a failed read: a transient Keychain error must be retryable, not permanent.
             passwordTask = nil
-            throw NetError.auth("no App Password saved for \(account.email). Open Settings → Accounts.")
+            throw error
         }
-        cachedPassword = p
-        return p
     }
 
     func shutdown() {
@@ -159,6 +170,8 @@ final class AccountEngine {
     }
 
     private func report(_ error: Error?) {
+        // A cancelled task (engine shut down, search superseded) is not a failure worth showing the user.
+        if error is CancellationError { return }
         let message = error.map { ($0 as? LocalizedError)?.errorDescription ?? $0.localizedDescription }
         lastErrorKind = Self.classify(error)
         if message != lastError {
@@ -312,9 +325,6 @@ final class AccountEngine {
             var rowsChanged = false
             var flagChangedUIDs: [UInt32] = []
             let isInitial = state.uidNext == 0 || store.messageCount(folderID: folderID) == 0
-            // The folder state advances right after headers land, so a later failure can't cause
-            // the same range to be re-fetched (and new mail re-notified) on every sync.
-            let finalUIDNext = info.uidNext > 0 ? info.uidNext : (store.maxUID(folderID: folderID) ?? 0) + 1
 
             if isInitial {
                 var uids = Set<UInt32>()
@@ -328,24 +338,34 @@ final class AccountEngine {
                 // Newest first, so the top of the list fills in within the first round trip.
                 for chunk in uids.sorted(by: >).chunked(200) {
                     let headers = try await c.fetchHeaders(imapUIDSet(chunk))
-                    store.insert(folderID: folderID, headers)
+                    // A write that fails throws out of here: UIDNEXT must not move past the missing rows (C-10).
+                    try store.insertChecked(folderID: folderID, headers)
                     NotificationCenter.default.postMailDataChanged(.folder(folderID))
                 }
-                store.updateFolderState(folderID, uidValidity: info.uidValidity, uidNext: finalUIDNext, modseq: info.highestModseq)
+                try store.updateFolderStateChecked(folderID, uidValidity: info.uidValidity,
+                                                   uidNext: info.uidNext > 0 ? info.uidNext : (store.maxUID(folderID: folderID) ?? 0) + 1,
+                                                   modseq: info.highestModseq)
                 rowsChanged = true
             } else {
                 let next = state.uidNext > 0 ? state.uidNext : (store.maxUID(folderID: folderID).map { $0 + 1 } ?? 1)
                 if info.uidNext == 0 || info.uidNext > next {
                     let headers = try await c.fetchHeaders("\(next):*").filter { $0.uid >= next }
-                    store.insert(folderID: folderID, headers)
+                    try store.insertChecked(folderID: folderID, headers)
                     newHeaders = headers
                     if !headers.isEmpty { rowsChanged = true }
-                    store.updateFolderState(folderID, uidValidity: info.uidValidity, uidNext: finalUIDNext, modseq: state.modseq)
+                    // A server that omits UIDNEXT gets the highest cached UID *after* these headers landed.
+                    try store.updateFolderStateChecked(folderID, uidValidity: info.uidValidity,
+                                                       uidNext: info.uidNext > 0 ? info.uidNext : (store.maxUID(folderID: folderID) ?? 0) + 1,
+                                                       modseq: state.modseq)
                 }
                 // Don't let server flag writes clobber what the user just changed: UIDs with a queued
-                // flag op keep their local (and soon server) state.
+                // flag op keep their local (and soon server) state. Ops queued by older builds carry no
+                // folder id, so fall back to the path they recorded.
                 let pendingFlagUIDs = Set(store.ops(account: account.id)
-                    .filter { PendingOpKind($0)?.isFlagChange == true && $0.folderPath == folder.path }
+                    .filter { op in
+                        guard PendingOpKind(op)?.isFlagChange == true else { return false }
+                        return op.folderID == folderID || (op.folderID == 0 && op.folderPath == folder.path)
+                    }
                     .flatMap { $0.uids })
                 var flagsOK = true
                 if let minUID = store.minUID(folderID: folderID) {
@@ -354,7 +374,7 @@ final class AccountEngine {
                         if await c.hasCondstore, state.modseq > 0 {
                             if info.highestModseq != state.modseq {
                                 let changed = try await c.fetch("1:*", items: "(UID FLAGS)", changedSince: state.modseq)
-                                flagChangedUIDs += store.updateFlags(folderID: folderID, changed.compactMap { r in
+                                flagChangedUIDs += try store.updateFlagsChecked(folderID: folderID, changed.compactMap { r in
                                     guard let uid = r.uid, !pendingFlagUIDs.contains(uid) else { return nil }
                                     return (uid, MessageFlags.from(imapFlags: r.items["FLAGS"]?.list?.compactMap { $0.text } ?? []))
                                 })
@@ -370,7 +390,7 @@ final class AccountEngine {
                                 from = max(minUID, recent.last ?? minUID)
                             }
                             let all = try await c.fetch("\(from):*", items: "(UID FLAGS)")
-                            flagChangedUIDs += store.updateFlags(folderID: folderID, all.compactMap { r in
+                            flagChangedUIDs += try store.updateFlagsChecked(folderID: folderID, all.compactMap { r in
                                 guard let uid = r.uid, !pendingFlagUIDs.contains(uid) else { return nil }
                                 return (uid, MessageFlags.from(imapFlags: r.items["FLAGS"]?.list?.compactMap { $0.text } ?? []))
                             })
@@ -394,8 +414,9 @@ final class AccountEngine {
                     } catch { report(error) }
                 }
                 // MODSEQ only advances when the flag stage succeeded, so missed flag changes re-fetch.
-                store.updateFolderState(folderID, uidValidity: info.uidValidity, uidNext: finalUIDNext,
-                                        modseq: flagsOK ? info.highestModseq : state.modseq)
+                try store.updateFolderStateChecked(folderID, uidValidity: info.uidValidity,
+                                                   uidNext: info.uidNext > 0 ? info.uidNext : (store.maxUID(folderID: folderID) ?? 0) + 1,
+                                                   modseq: flagsOK ? info.highestModseq : state.modseq)
                 // Server unread count (one small command on the sync connection), so the sidebar and badge
                 // count mail older than the offline window too.
                 if let unseen = try? await c.unseenCount(folder.path) {
@@ -518,7 +539,7 @@ final class AccountEngine {
                 guard !older.isEmpty else { return [] }
                 return try await c.fetchHeaders(imapUIDSet(older))
             }
-            store.insert(folderID: folderID, headers)
+            try store.insertChecked(folderID: folderID, headers)
             NotificationCenter.default.postMailDataChanged(.folder(folderID))
             return headers.count
         } catch {
@@ -745,8 +766,8 @@ final class AccountEngine {
 
     /// Server-side search (Gmail search syntax via X-GM-RAW on Gmail, IMAP SEARCH elsewhere) in one folder,
     /// or across the whole mailbox (All Mail). Fetches headers for hits that aren't cached and returns their ids.
-    /// Runs on its own gate and cancels the previous search, so typing can't queue full searches
-    /// ahead of a message you clicked.
+    /// Cancels the previous search and shares the click connection's gate, so it can never interleave its
+    /// SELECT with the SELECT of a message being opened on the same lane.
     func serverSearch(_ query: SearchQuery, folder: Folder? = nil) async throws -> [Int64] {
         guard !isDemo, !query.isEmpty else { return [] }
         guard let scope = folder ?? store.folder(account: account.id, role: .all) ?? store.folder(account: account.id, role: .inbox) else { return [] }
@@ -755,7 +776,7 @@ final class AccountEngine {
         let t0 = Date()
         let task = Task { [weak self] () async throws -> [Int64] in
             guard let self else { return [] }
-            return try await self.searchGate.run { () async throws -> [Int64] in
+            return try await self.fetchGate.run { () async throws -> [Int64] in
                 try Task.checkCancellation()
                 let c = try await self.client(.fetch)
                 try self.verifySelection(try await c.ensureSelected(scope.path, readOnly: true), folder: scope)
@@ -772,7 +793,7 @@ final class AccountEngine {
                 let missing = newest.filter { !known.contains($0) }
                 try Task.checkCancellation()
                 let headers = missing.isEmpty ? [] : try await c.fetchHeaders(imapUIDSet(missing))
-                self.store.insert(folderID: scope.id, headers)
+                try self.store.insertChecked(folderID: scope.id, headers)
                 Debug.log("server search '\(query.gmailRaw)' in \(scope.name): \(newest.count) hits, \(headers.count) new, \(Debug.ms(since: t0))")
                 return self.store.ids(folderID: scope.id, uids: newest)
             }
@@ -790,8 +811,10 @@ final class AccountEngine {
         let byFolder = Dictionary(grouping: rows, by: { $0.folderID })
         for (fid, list) in byFolder {
             guard let f = store.folder(fid) else { continue }
-            store.addOp(account: account.id, kind: kind, folderPath: f.path, uids: list.map { $0.uid }, arg: arg,
-                        folderID: f.id, uidvalidity: f.uidValidity)
+            let queued = store.addOp(account: account.id, kind: kind, folderPath: f.path, uids: list.map { $0.uid }, arg: arg,
+                                     folderID: f.id, uidvalidity: f.uidValidity)
+            // The local change already happened; say so instead of letting the server action vanish (C-10).
+            if !queued { report(NetError.server("A queued action couldn't be saved to disk and won't reach the server.")) }
         }
         Task { await flushOps() }
     }
@@ -818,7 +841,10 @@ final class AccountEngine {
             guard let op = store.ops(account: account.id).first else {
                 if flushPending { continue } else { break }
             }
-            guard let f = store.folder(account: account.id, path: op.folderPath), f.selectable else {
+            // Resolve by folder id first: a queued action must follow its folder across a rename (C-28).
+            // Ops queued by older builds have no id and still rely on the path they recorded.
+            let byID = op.folderID != 0 ? store.folder(op.folderID) : nil
+            guard let f = byID ?? store.folder(account: account.id, path: op.folderPath), f.selectable else {
                 store.removeOp(op.id) // Folder is gone; its ops were already reset with it.
                 continue
             }
@@ -833,7 +859,7 @@ final class AccountEngine {
             do {
                 try await syncGate.run {
                     let c = try await client(.sync)
-                    try self.verifySelection(try await c.ensureSelected(op.folderPath, readOnly: false), folder: f)
+                    try self.verifySelection(try await c.ensureSelected(f.path, readOnly: false), folder: f)
                     switch opKind {
                     case .flag(let set, let flag): try await c.store(op.uids, "\(set ? "+" : "-")FLAGS.SILENT (\(flag))")
                     case .move(let dest): try await c.move(op.uids, to: dest)
@@ -877,7 +903,7 @@ final class AccountEngine {
                 try self.verifySelection(try await c.ensureSelected(folder.path, readOnly: true), folder: folder)
                 return try await c.fetchHeaders(imapUIDSet(uids))
             }
-            store.insert(folderID: folder.id, headers)
+            try store.insertChecked(folderID: folder.id, headers)
             NotificationCenter.default.postMailDataChanged(.folder(folder.id))
         } catch {
             report(error)

@@ -19,6 +19,12 @@ enum DBError: Error, LocalizedError {
 final class SQLiteDB {
     private var handle: OpaquePointer?
     private var cache: [String: Statement] = [:]
+    /// Set when a statement fails while a transaction is open, so the batch rolls back instead of committing
+    /// half of itself (C-10).
+    private var failedWrite = false
+    /// Statements currently being stepped. The cache must never evict one of these: finalizing a statement
+    /// that is mid-iteration is a use-after-free.
+    private var activeStatements = 0
 
     init(path: String) throws {
         let flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_NOMUTEX
@@ -43,6 +49,7 @@ final class SQLiteDB {
         if sqlite3_exec(handle, sql, nil, nil, &err) != SQLITE_OK {
             let message = err.map { String(cString: $0) } ?? "unknown"
             sqlite3_free(err)
+            failedWrite = true
             throw DBError.sql(message)
         }
     }
@@ -58,41 +65,69 @@ final class SQLiteDB {
         }
         let s = Statement(stmt!)
         // Distinct IN-list lengths each used to live here forever; cap the cache so they can't accumulate.
-        if cache.count >= 128 { cache.removeAll() }
+        // Never while a statement is being stepped: evicting one mid-iteration would free it under its user.
+        if cache.count >= 128 && activeStatements == 0 { cache.removeAll() }
         cache[sql] = s
         return s
     }
 
     private func logError(_ sql: String, _ message: String) {
-        NSLog("Mac Mail cache error: " + message + " — " + sql.prefix(160).replacingOccurrences(of: "%", with: "%%"))
+        // NSLog treats its first argument as a format string; escape both parts so a "%" can't corrupt it.
+        let text = (message + " — " + sql.prefix(160)).replacingOccurrences(of: "%", with: "%%")
+        NSLog("Mac Mail cache error: " + text)
+    }
+
+    /// Runs a write statement, throwing instead of returning false so callers can stop before advancing
+    /// sync state on a write that never landed (C-10).
+    func runChecked(_ sql: String, _ args: [Any?] = []) throws {
+        let s: Statement
+        do { s = try statement(sql) } catch {
+            failedWrite = true
+            logError(sql, error.localizedDescription)
+            throw error
+        }
+        s.bind(args)
+        activeStatements += 1
+        let rc = s.stepRaw()
+        activeStatements -= 1
+        let ok = rc == SQLITE_DONE || rc == SQLITE_ROW
+        let message = ok ? "" : String(cString: sqlite3_errmsg(handle))
+        s.reset()
+        guard ok else {
+            failedWrite = true
+            logError(sql, message)
+            throw DBError.sql(message + " — " + String(sql.prefix(120)))
+        }
     }
 
     /// Runs a write statement. Failures are logged and reported as false, never swallowed silently.
     @discardableResult
     func run(_ sql: String, _ args: [Any?] = []) -> Bool {
-        let s: Statement
-        do { s = try statement(sql) } catch { logError(sql, error.localizedDescription); return false }
-        s.bind(args)
-        let rc = s.stepRaw()
-        let ok = rc == SQLITE_DONE || rc == SQLITE_ROW
-        if !ok { logError(sql, String(cString: sqlite3_errmsg(handle))) }
-        s.reset()
-        return ok
+        do { try runChecked(sql, args); return true } catch { return false }
     }
 
     /// Iterates result rows. Failures are logged, never swallowed silently.
     func query(_ sql: String, _ args: [Any?] = [], _ row: (Statement) -> Void) {
         let s: Statement
-        do { s = try statement(sql) } catch { logError(sql, error.localizedDescription); return }
+        do { s = try statement(sql) } catch {
+            failedWrite = true
+            logError(sql, error.localizedDescription)
+            return
+        }
         s.bind(args)
+        activeStatements += 1
         while true {
             let rc = s.stepRaw()
             if rc == SQLITE_ROW { row(s) }
             else {
-                if rc != SQLITE_DONE { logError(sql, String(cString: sqlite3_errmsg(handle))) }
+                if rc != SQLITE_DONE {
+                    failedWrite = true
+                    logError(sql, String(cString: sqlite3_errmsg(handle)))
+                }
                 break
             }
         }
+        activeStatements -= 1
         s.reset()
     }
 
@@ -102,10 +137,36 @@ final class SQLiteDB {
         return out
     }
 
+    /// Runs `body` as one transaction. If any statement inside it failed, the whole batch is rolled back:
+    /// a half-applied write is worse than none at all (C-10).
     func transaction(_ body: () -> Void) {
         do { try exec("BEGIN IMMEDIATE") } catch { logError("BEGIN", error.localizedDescription) }
+        failedWrite = false
         body()
-        do { try exec("COMMIT") } catch { logError("COMMIT", error.localizedDescription) }
+        if failedWrite {
+            failedWrite = false
+            do { try exec("ROLLBACK") } catch { logError("ROLLBACK", error.localizedDescription) }
+        } else {
+            do { try exec("COMMIT") } catch { logError("COMMIT", error.localizedDescription) }
+        }
+    }
+
+    /// Like `transaction(_:)`, but a failure rolls the batch back and is rethrown, so sync can tell that
+    /// nothing was written (C-10).
+    func transactionChecked(_ body: () throws -> Void) throws {
+        do { try exec("BEGIN IMMEDIATE") } catch {
+            failedWrite = true
+            throw error
+        }
+        failedWrite = false
+        do {
+            try body()
+            try exec("COMMIT")
+        } catch {
+            failedWrite = false
+            do { try exec("ROLLBACK") } catch { logError("ROLLBACK", error.localizedDescription) }
+            throw error
+        }
     }
 
     var userVersion: Int {
