@@ -227,7 +227,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             for pair in parts[1].split(separator: "&") {
                 let kv = pair.split(separator: "=", maxSplits: 1)
                 let key = kv.first.map { String($0).lowercased() } ?? ""
-                let value = kv.count > 1 ? MailSafety.stripControls(kv[1].replacingOccurrences(of: "+", with: "%20").removingPercentEncoding ?? "") : ""
+                // RFC 6068: unlike HTML forms, a "+" in a mailto URI is a literal plus, never a space —
+                // decoding it as one would mangle plus-addressed cc/bcc (user+tag@example.com).
+                let value = kv.count > 1 ? MailSafety.stripControls(kv[1].removingPercentEncoding ?? "") : ""
                 switch key {
                 case "subject": subject = MailSafety.stripControls(value)
                 case "body": body = value

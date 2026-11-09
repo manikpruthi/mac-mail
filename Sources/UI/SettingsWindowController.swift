@@ -502,7 +502,10 @@ final class SettingsWindowController: NSWindowController, NSTableViewDataSource,
         panel.nameFieldStringValue = "Mac Mail diagnostics.log"
         panel.beginSheetModal(for: w) { r in
             guard r == .OK, let url = panel.url else { return }
-            try? DiagnosticsLog.export(to: url)
+            // Reading the log and writing the copy are file I/O; they never run on the main thread.
+            DispatchQueue.global(qos: .utility).async {
+                try? DiagnosticsLog.export(to: url)
+            }
         }
     }
 
