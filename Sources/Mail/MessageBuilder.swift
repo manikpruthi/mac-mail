@@ -58,15 +58,25 @@ enum MessageBuilder {
         let alt = "alt-" + UUID().uuidString
         var body = Data()
         func appendS(_ s: String) { body.append(Data(s.utf8)) }
-        let inline = m.attachments.filter { $0.contentID != nil }
-        let files = m.attachments.filter { $0.contentID == nil }
+        // One part per Content-ID: the same image can be referenced from several places in the body, and a
+        // duplicate multipart/related part makes clients show the wrong picture (C-08). A part whose
+        // Content-ID is unusable is sent as an ordinary file instead.
+        var inline: [OutgoingAttachment] = []
+        var files: [OutgoingAttachment] = []
+        var contentIDs = Set<String>()
+        for a in m.attachments {
+            guard let raw = a.contentID else { files.append(a); continue }
+            let cid = cleanContentID(raw)
+            guard !cid.isEmpty else { files.append(a); continue }
+            if contentIDs.insert(cid).inserted { inline.append(a) }
+        }
 
         func appendFile(_ a: OutgoingAttachment, boundary: String) throws {
             let data = try Data(contentsOf: a.url, options: .mappedIfSafe)
             let name = MailSafety.stripControls(a.filename)
             appendS("--\(boundary)\r\n")
             appendS("Content-Type: \(MailSafety.stripControls(a.mimeType)); name=\"\(asciiFallback(name))\"\r\n")
-            if let cid = a.contentID.map(cleanContentID) {
+            if let cid = a.contentID.map(cleanContentID), !cid.isEmpty {
                 appendS("Content-Disposition: inline; filename=\"\(asciiFallback(name))\"\r\n")
                 appendS("Content-ID: <\(cid)>\r\n")
             } else {

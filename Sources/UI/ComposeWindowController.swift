@@ -61,6 +61,14 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
     private var autosaveWork: DispatchWorkItem?
     /// Attachment sizes, read once when added (O-24).
     private var attachmentSizes: [URL: Int] = [:]
+    /// Attachments the autosave listed but that no longer exist on disk; Send asks before dropping them (C-21).
+    private var missingAttachments: [String] = []
+    /// The account a reply/draft was started from when it has since been removed. Send waits for the user to
+    /// pick a From account instead of quietly using another one (C-27).
+    private var missingAccountID: String?
+    /// Autosave encoding and file I/O run here, never on the main thread. Serial, so a later save can never be
+    /// overtaken by an earlier one and a discard can't be undone by a write that was still in flight.
+    private let autosaveQueue = DispatchQueue(label: "MacMail.compose.autosave", qos: .utility)
 
     init(kind: Kind) {
         self.kind = kind
@@ -84,9 +92,17 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
 
     /// Re-opens composers whose autosave survived a crash or forced quit. Called once at launch.
     static func restoreAutosaved() {
-        for record in ComposerAutosave.all() {
-            guard MailService.shared.account(record.accountID) != nil || !MailService.shared.accounts.isEmpty else { continue }
-            open(.restored(record))
+        // Decoding autosaves can mean reading megabytes of inline images; keep it off the main thread and
+        // re-open the windows on it once the records are known.
+        DispatchQueue.global(qos: .utility).async {
+            let records = ComposerAutosave.all()
+            DispatchQueue.main.async {
+                for record in records {
+                    // Only into the account it was written for: a fallback would send from the wrong address (C-27).
+                    guard MailService.shared.account(record.accountID) != nil else { continue }
+                    open(.restored(record))
+                }
+            }
         }
     }
 
@@ -99,25 +115,33 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
     }
 
     private func autosaveNow() {
-        guard dirty, !sentOrDiscarded, let account else { return }
+        // While a draft's body or images are still loading the editor holds placeholder text, so saving then
+        // would record a body that can never get its images back; pipelineEnded schedules the save instead.
+        guard dirty, !sentOrDiscarded, pipelineTasks == 0, !waitingForDraftBody, let account else { return }
         commitEditing()
         let attr = textView.attributedString()
-        // RTFD keeps inline images; old autosaves are plain RTF and still load.
+        // RTFD keeps inline images; old autosaves are plain RTF and still load. A body that can't be encoded
+        // would replace a good autosave with an empty one, so keep the previous file (C-21).
         let rtf = InlineImage.rtfd(attr)
+        if attr.length > 0, rtf == nil { return }
         let record = ComposerAutosave(
-            id: autosaveID, accountID: account.id,
+            // While the original account is gone, record it rather than the fallback the From popup shows:
+            // restoring into another account would silently send from the wrong address (C-27).
+            id: autosaveID, accountID: missingAccountID ?? account.id,
             to: (toField.objectValue as? [String]) ?? [], cc: (ccField.objectValue as? [String]) ?? [],
             bcc: (bccField.objectValue as? [String]) ?? [], subject: subjectField.stringValue,
             bodyRTF: rtf, attachments: attachments.map { $0.url.path }, inReplyTo: inReplyTo, references: references,
             quotedHTML: quotedHTML, quotedText: quotedText, includeOriginal: includeOriginal.state == .on,
             draftRowID: draftRow?.id, replyRowID: replyRow?.id, saved: Date(),
             imageWidths: InlineImage.widths(attr).map { Double($0) })
-        record.write()
+        autosaveQueue.async { record.write() }
     }
 
     private func discardAutosave() {
         autosaveWork?.cancel()
-        ComposerAutosave.remove(autosaveID)
+        let id = autosaveID
+        // Same serial queue as the writes, so a discard always lands after any autosave still being written.
+        autosaveQueue.async { ComposerAutosave.remove(id) }
     }
 
     required init?(coder: NSCoder) { fatalError() }
@@ -373,6 +397,9 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
             references = d.references.isEmpty ? nil : d.references
             draftRow = MailService.shared.store.rows(ids: [d.id]).first
             loadDraftBody(d, body)
+            // The saved body already ends with this account's signature; track it so changing From replaces
+            // it instead of appending a second one (B-20).
+            currentSignature = MailService.shared.account(d.accountID)?.signature
             // A saved draft's attachments come back too; Send/Save wait until they're downloaded, and the
             // old draft is only replaced once the new one (with them) is on the server (B-01).
             fetchMessageAttachments(d)
@@ -394,8 +421,11 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
                     InlineImage.normalize(storage, maxWidth: 640, widths: r.imageWidths?.map { CGFloat($0) })
                 }
             }
-            let urls = r.attachments.map { URL(fileURLWithPath: $0) }.filter { FileManager.default.fileExists(atPath: $0.path) }
-            addAttachments(urls)
+            // The recovered body already ends with this account's signature (see the draft case above).
+            currentSignature = MailService.shared.account(r.accountID)?.signature
+            let urls = r.attachments.map { URL(fileURLWithPath: $0) }
+            missingAttachments = urls.filter { !FileManager.default.fileExists(atPath: $0.path) }.map { $0.lastPathComponent }
+            addAttachments(urls.filter { FileManager.default.fileExists(atPath: $0.path) })
             if !r.quotedHTML.isEmpty {
                 quotedHTML = r.quotedHTML
                 quotedText = r.quotedText
@@ -404,14 +434,23 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
             }
             draftRow = r.draftRowID.flatMap { MailService.shared.store.rows(ids: [$0]).first }
             replyRow = r.replyRowID.flatMap { MailService.shared.store.rows(ids: [$0]).first }
-            status.stringValue = "Recovered unsent message from \(Self.quoteDate(r.saved))"
+            status.stringValue = missingAttachments.isEmpty
+                ? "Recovered unsent message from \(Self.quoteDate(r.saved))"
+                : "Recovered from \(Self.quoteDate(r.saved)) — \(missingAttachments.count) attachment\(missingAttachments.count == 1 ? "" : "s") missing"
+            if !missingAttachments.isEmpty { status.textColor = .systemRed }
             window?.title = r.subject.isEmpty ? "Recovered Message" : r.subject
             window?.makeFirstResponder(textView)
         }
     }
 
     private func selectAccount(_ id: String) {
-        if let idx = fromPopup.itemArray.firstIndex(where: { ($0.representedObject as? String) == id }) { fromPopup.selectItem(at: idx) }
+        if let idx = fromPopup.itemArray.firstIndex(where: { ($0.representedObject as? String) == id }) {
+            fromPopup.selectItem(at: idx)
+            missingAccountID = nil
+        } else {
+            // Never fall back to the default account for a message that belongs to another one (C-27).
+            missingAccountID = id
+        }
     }
 
     private static func prefixed(_ p: String, _ subject: String) -> String {
@@ -452,15 +491,26 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
         if let old = currentSignature, !old.isEmpty {
             let r = text.range(of: "\n\n" + old, options: .backwards)
             if r.location != NSNotFound {
-                storage?.replaceCharacters(in: r, with: newSig.isEmpty ? "" : "\n\n" + newSig)
-                replaced = true
+                let replacement = newSig.isEmpty ? "" : "\n\n" + newSig
+                // The body changes like typed text, so Undo has to cover it too.
+                if textView.shouldChangeText(in: r, replacementString: replacement) {
+                    storage?.replaceCharacters(in: r, with: replacement)
+                    textView.didChangeText()
+                    replaced = true
+                }
             }
         }
         if !replaced, !newSig.isEmpty {
             let len = (textView.string as NSString).length
-            storage?.replaceCharacters(in: NSRange(location: len, length: 0), with: "\n\n" + newSig)
+            let replacement = "\n\n" + newSig
+            if textView.shouldChangeText(in: NSRange(location: len, length: 0), replacementString: replacement) {
+                storage?.replaceCharacters(in: NSRange(location: len, length: 0), with: replacement)
+                textView.didChangeText()
+                replaced = true
+            }
         }
-        currentSignature = newSig
+        // Keep the old signature recorded when the change couldn't be applied, so it's retried next time.
+        if replaced || newSig.isEmpty { currentSignature = newSig }
     }
 
     /// Alerts attach to the composer as a sheet; if the window is gone (an async error arriving late), they
@@ -515,43 +565,72 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
         } else {
             setBody(body?.text ?? "", signature: false)
         }
+        // Edits made while the body was loading weren't autosaved (the editor still held placeholders).
+        if dirty { scheduleAutosave() }
     }
 
-    /// Downloads a reopened draft's inline images and puts them back where their tokens are (Send waits).
+    /// Downloads a reopened draft's inline images, then swaps them for their placeholder tokens in one
+    /// undoable edit. An image that can't be fetched leaves a visible notice behind instead of vanishing.
     private func loadDraftInlineImages(_ d: MessageDetail, _ cids: [(cid: String, width: CGFloat?)]) {
-        guard let engine = MailService.shared.engine(d.accountID) else { removeInlineTokens(); return }
+        guard let engine = MailService.shared.engine(d.accountID) else {
+            replaceInlineTokens(cids, with: [:])
+            return
+        }
         let dir = AppPaths.tempDir("draft-inline")
         tempDirs.append(dir)
         pipelineBegan()
         let task = Task { [weak self] in
             defer { self?.pipelineEnded() }
+            var images: [Int: NSTextAttachment] = [:]
             for (n, item) in cids.enumerated() {
-                let cid = item.cid
                 guard !Task.isCancelled, let self else { return }
-                var att: NSTextAttachment?
-                if let part = d.structure?.part(withContentID: cid) {
+                if let part = d.structure?.part(withContentID: item.cid) {
                     let url = dir.appendingPathComponent("\(n)")
-                    if (try? await engine.download(messageID: d.id, part: part, to: url)) != nil {
-                        att = InlineImage.attachment(file: url, maxWidth: self.textView.inlineImageWidth, width: item.width)
+                    if (try? await engine.download(messageID: d.id, part: part, to: url)) != nil,
+                       let att = InlineImage.attachment(file: url, maxWidth: self.textView.inlineImageWidth, width: item.width) {
+                        images[n] = att
                     }
                 }
-                guard let storage = self.textView.textStorage else { return }
-                let r = (storage.string as NSString).range(of: InlineImage.token(n))
-                guard r.location != NSNotFound else { continue }
-                if let att { storage.replaceCharacters(in: r, with: NSAttributedString(attachment: att)) }
-                else { storage.deleteCharacters(in: r) }
             }
-            self?.removeInlineTokens()
+            guard !Task.isCancelled, let self, !self.sentOrDiscarded else { return }
+            self.replaceInlineTokens(cids, with: images)
         }
         zipTasks.append(task)
     }
 
-    private func removeInlineTokens() {
-        guard let storage = textView.textStorage,
-              let re = try? NSRegularExpression(pattern: "\u{2063}\\[inline-image-\\d+\\]\u{2063}") else { return }
-        for m in re.matches(in: storage.string, range: NSRange(location: 0, length: storage.length)).reversed() {
-            storage.deleteCharacters(in: m.range)
+    /// Replaces the draft image tokens with their images (or with a visible notice when one couldn't be
+    /// fetched) as a single undoable edit (C-22).
+    private func replaceInlineTokens(_ cids: [(cid: String, width: CGFloat?)], with images: [Int: NSTextAttachment]) {
+        guard let storage = textView.textStorage else { return }
+        let undo = textView.undoManager
+        undo?.beginUndoGrouping()
+        for n in cids.indices {
+            let r = (storage.string as NSString).range(of: InlineImage.token(n))
+            guard r.location != NSNotFound else { continue }
+            let attributes = storage.attributes(at: r.location, effectiveRange: nil)
+            let replacement = images[n].map { NSAttributedString(attachment: $0) }
+                ?? NSAttributedString(string: "[Image unavailable]", attributes: attributes)
+            guard textView.shouldChangeText(in: r, replacementString: replacement.string) else { continue }
+            storage.replaceCharacters(in: r, with: replacement)
+            textView.didChangeText()
         }
+        removeInlineTokens()
+        undo?.endUndoGrouping()
+    }
+
+    /// Removes any token still left over, undoably.
+    private func removeInlineTokens() {
+        guard let storage = textView.textStorage else { return }
+        let ranges = InlineImage.tokenRanges(in: storage.string)
+        guard !ranges.isEmpty else { return }
+        let undo = textView.undoManager
+        undo?.beginUndoGrouping()
+        for r in ranges.reversed() where NSMaxRange(r) <= storage.length {
+            guard textView.shouldChangeText(in: r, replacementString: "") else { continue }
+            storage.deleteCharacters(in: r)
+            textView.didChangeText()
+        }
+        undo?.endUndoGrouping()
     }
 
     // MARK: Original message pane
@@ -719,7 +798,11 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
 
     private func pipelineEnded() {
         pipelineTasks = max(0, pipelineTasks - 1)
-        if pipelineTasks == 0 { sendButton?.isEnabled = true }
+        if pipelineTasks == 0 {
+            sendButton?.isEnabled = true
+            // An autosave skipped while the pipeline was busy gets its chance now that the body is complete.
+            if dirty { scheduleAutosave() }
+        }
     }
 
     // MARK: Attachments
@@ -821,13 +904,28 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
     private func buildMessage() -> OutgoingMessage? {
         commitEditing()
         guard let account else { return nil }
-        let attr = textView.attributedString()
-        // Inline images (pasted or dropped into the body) go out as cid: parts in multipart/related.
+        // An autosave written while a draft's images were still downloading can leave tokens in the body; a
+        // literal "[inline-image-N]" must never be sent (C-22).
+        let attr = NSMutableAttributedString(attributedString: textView.attributedString())
+        for r in InlineImage.tokenRanges(in: attr.string).reversed() where NSMaxRange(r) <= attr.length {
+            attr.deleteCharacters(in: r)
+        }
+        // Inline images (pasted or dropped into the body) go out as cid: parts in multipart/related. A file
+        // pasted into the body as rich text is sent as an ordinary attachment, not dropped (C-03).
         var inline: [OutgoingAttachment] = []
+        var inlineIDs = Set<String>()
         var html = RichText.html(from: attr) { att in
-            guard let out = self.inlinePart(for: att) else { return nil }
-            inline.append(out)
-            return out.contentID
+            guard att is InlineImageAttachment, let part = self.inlinePart(for: att), let cid = part.contentID else { return nil }
+            if inlineIDs.insert(cid).inserted { inline.append(part) }
+            return cid
+        }
+        var bodyFiles: [OutgoingAttachment] = []
+        var seenBodyAttachments = Set<ObjectIdentifier>()
+        attr.enumerateAttribute(.attachment, in: NSRange(location: 0, length: attr.length)) { value, _, _ in
+            guard let att = value as? NSTextAttachment, !(att is InlineImageAttachment),
+                  seenBodyAttachments.insert(ObjectIdentifier(att)).inserted,
+                  let part = self.filePart(for: att) else { return }
+            bodyFiles.append(part)
         }
         var text = attr.string.replacingOccurrences(of: "\u{FFFC}", with: "")
         if includeOriginal.state == .on, !quotedHTML.isEmpty {
@@ -837,29 +935,44 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
         let doc = "<!doctype html><html><head><meta charset=\"utf-8\"></head><body style=\"font-family:-apple-system,Helvetica,Arial,sans-serif;font-size:14px\">\(html)</body></html>"
         return OutgoingMessage(from: account.fromHeader, to: addresses(toField), cc: addresses(ccField), bcc: addresses(bccField),
                                subject: subjectField.stringValue, textBody: text, htmlBody: doc,
-                               inReplyTo: inReplyTo, references: references, attachments: attachments + inline)
+                               inReplyTo: inReplyTo, references: references, attachments: attachments + bodyFiles + inline)
     }
 
-    /// Inline image files written for sending, one per attachment object (reused across draft saves).
-    private var inlineParts: [ObjectIdentifier: OutgoingAttachment] = [:]
+    /// Files written for sending. Inline images cache their part on the attachment (C-08); the counter keeps
+    /// names unique and writes are never repeated for the same image.
+    private var inlinePartCount = 0
     private var inlineDir: URL?
 
     private func inlinePart(for att: NSTextAttachment) -> OutgoingAttachment? {
-        if let p = inlineParts[ObjectIdentifier(att)] { return p }
+        if let a = att as? InlineImageAttachment, let p = a.outgoingPart { return p }
         guard let data = InlineImage.bytes(att) else { return nil }
+        let name = BodyPart.safeFilename(att.fileWrapper?.preferredFilename ?? "image.png") ?? "image.png"
+        guard let url = writeSendingFile(data, name: name) else { return nil }
+        let part = OutgoingAttachment(url: url, filename: name, mimeType: InlineImage.mimeType(data),
+                                      contentID: "\(UUID().uuidString.lowercased())@macmail")
+        (att as? InlineImageAttachment)?.outgoingPart = part
+        return part
+    }
+
+    /// A non-image attachment living in the body (rich-text paste, file promise): send its bytes as a file
+    /// attachment instead of letting normalize delete it or the HTML drop it (C-03).
+    private func filePart(for att: NSTextAttachment) -> OutgoingAttachment? {
+        guard let data = InlineImage.bytes(att) else { return nil }
+        let name = BodyPart.safeFilename(att.fileWrapper?.preferredFilename ?? "attachment") ?? "attachment"
+        guard let url = writeSendingFile(data, name: name) else { return nil }
+        return OutgoingAttachment(url: url, filename: name, mimeType: MessageBuilder.mimeType(for: url))
+    }
+
+    private func writeSendingFile(_ data: Data, name: String) -> URL? {
         let dir = inlineDir ?? {
             let d = AppPaths.tempDir("inline")
             tempDirs.append(d)
             inlineDir = d
             return d
         }()
-        let name = BodyPart.safeFilename(att.fileWrapper?.preferredFilename ?? "image.png") ?? "image.png"
-        let url = dir.appendingPathComponent("\(inlineParts.count)-" + name)
-        do { try data.write(to: url) } catch { return nil }
-        let part = OutgoingAttachment(url: url, filename: name, mimeType: InlineImage.mimeType(data),
-                                      contentID: "\(UUID().uuidString.lowercased())@macmail")
-        inlineParts[ObjectIdentifier(att)] = part
-        return part
+        let url = dir.appendingPathComponent("\(inlinePartCount)-" + name)
+        inlinePartCount += 1
+        do { try data.write(to: url); return url } catch { return nil }
     }
 
     /// Commits in-progress field editing so a half-typed recipient or subject reaches the message (BUG-18).
@@ -879,7 +992,32 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
             status.stringValue = "Attachments are still being prepared…"
             return
         }
-        guard let message = buildMessage(), let account else { return }
+        guard missingAttachments.isEmpty else {
+            let a = NSAlert()
+            a.messageText = "Some attachments couldn't be recovered"
+            a.informativeText = missingAttachments.joined(separator: "\n") + "\n\nSend the message without them?"
+            a.addButton(withTitle: "Send Without")
+            a.addButton(withTitle: "Cancel")
+            present(a) { [weak self] r in
+                guard let self, r == .alertFirstButtonReturn else { return }
+                self.missingAttachments = []
+                if self.status.textColor == .systemRed {
+                    self.status.stringValue = ""
+                    self.status.textColor = .secondaryLabelColor
+                }
+                self.send(nil)
+            }
+            return
+        }
+        guard missingAccountID == nil else {
+            alert("Choose a From account",
+                  info: "This message belongs to an account that has been removed. Pick a From account, then send again.")
+            return
+        }
+        guard let message = buildMessage(), let account else {
+            alert("Choose a From account before sending.")
+            return
+        }
         if message.allRecipients.isEmpty {
             alert("Add at least one recipient.")
             return
@@ -986,6 +1124,12 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
     /// Saves the draft (server APPEND), then runs `done` with whether it saved. Used by the close prompt
     /// and, at quit time, to keep the app alive until the save lands.
     private func saveDraft(_ done: @escaping (Bool) -> Void) {
+        guard missingAccountID == nil else {
+            alert("Choose a From account",
+                  info: "This message belongs to an account that has been removed. Pick the account to save the draft in.")
+            done(false)
+            return
+        }
         guard !waitingForDraftBody else {
             alert("The draft is still loading — try again in a moment.")
             done(false)
@@ -996,7 +1140,16 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
             done(false)
             return
         }
-        guard var message = buildMessage(), let account, let engine = MailService.shared.engine(account.id) else { done(false); return }
+        guard var message = buildMessage(), let account else {
+            alert("Choose a From account before saving.")
+            done(false)
+            return
+        }
+        guard let engine = MailService.shared.engine(account.id) else {
+            alert("\(account.email) isn't available", info: "Reconnect the account, then save the draft again.")
+            done(false)
+            return
+        }
         // A fresh Message-ID identifies the replacement draft on the server (B-09).
         let messageID = MessageBuilder.newMessageID(for: message.from)
         message.messageID = messageID
@@ -1231,6 +1384,7 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
     }
 
     @objc private func fromChanged() {
+        missingAccountID = nil
         dirty = true
         swapSignature()
         scheduleAutosave()
@@ -1637,13 +1791,49 @@ final class ComposeTextView: NSTextView {
     }
 }
 
-/// Minimal attributed-string → HTML for outgoing mail: bold, italic, underline, strike, links, colours and sizes.
+/// Minimal attributed-string → HTML for outgoing mail: bold, italic, underline, strike, links, colours, sizes,
+/// and paragraph formatting (alignment, indent, spacing, lists).
 enum RichText {
     /// `image` returns the content id for an inline image attachment (nil leaves it out).
     static func html(from attr: NSAttributedString, image: ((NSTextAttachment) -> String?)? = nil) -> String {
+        guard attr.length > 0 else { return "" }
+        let ns = attr.string as NSString
         var out = ""
-        let full = NSRange(location: 0, length: attr.length)
-        attr.enumerateAttributes(in: full) { attrs, range, _ in
+        var list = ""
+        var location = 0
+        func closeList() {
+            if !list.isEmpty { out += "</\(list)>"; list = "" }
+        }
+        while location < attr.length {
+            let paragraph = ns.paragraphRange(for: NSRange(location: location, length: 0))
+            var content = paragraph
+            if content.length > 0, ns.character(at: NSMaxRange(content) - 1) == 0x0A { content.length -= 1 }
+            if content.length > 0, ns.character(at: NSMaxRange(content) - 1) == 0x0D { content.length -= 1 }
+            let style = attr.attribute(.paragraphStyle, at: paragraph.location, effectiveRange: nil) as? NSParagraphStyle
+            let kind = listKind(style)
+            if kind != list {
+                closeList()
+                if !kind.isEmpty { out += "<\(kind)>"; list = kind }
+            }
+            let inner = inlineHTML(attr, content, image: image)
+            let css = blockCSS(style, inList: !list.isEmpty)
+            if list.isEmpty {
+                out += "<div\(styleAttribute(css))>\(inner.isEmpty ? "<br>" : inner)</div>"
+            } else {
+                out += "<li\(styleAttribute(css))>\(inner.isEmpty ? "<br>" : inner)</li>"
+            }
+            location = NSMaxRange(paragraph)
+        }
+        closeList()
+        return out
+    }
+
+    private static func inlineHTML(_ attr: NSAttributedString, _ range: NSRange,
+                                   image: ((NSTextAttachment) -> String?)?) -> String {
+        guard range.length > 0 else { return "" }
+        let ns = attr.string as NSString
+        var out = ""
+        attr.enumerateAttributes(in: range) { attrs, run, _ in
             if let att = attrs[.attachment] as? NSTextAttachment {
                 if let cid = image?(att) {
                     let w = Int(att.bounds.width.rounded()), h = Int(att.bounds.height.rounded())
@@ -1652,14 +1842,14 @@ enum RichText {
                 }
                 return
             }
-            var text = MIME.escapeHTML((attr.string as NSString).substring(with: range))
+            var text = MIME.escapeHTML(ns.substring(with: run))
             text = text.replacingOccurrences(of: "\n", with: "<br>")
             var styles: [String] = []
             if let font = attrs[.font] as? NSFont {
                 let traits = font.fontDescriptor.symbolicTraits
                 if traits.contains(.bold) { text = "<b>\(text)</b>" }
                 if traits.contains(.italic) { text = "<i>\(text)</i>" }
-                if abs(font.pointSize - 14) > 0.5 { styles.append("font-size:\(Int(font.pointSize))px") }
+                if abs(font.pointSize - 14) > 0.5 { styles.append("font-size:\(cssNumber(font.pointSize))px") }
                 if let family = font.familyName, !family.hasPrefix(".") && family != NSFont.systemFont(ofSize: 14).familyName {
                     // A generic fallback keeps the look close when the recipient lacks the font.
                     let generic = font.isFixedPitch ? "monospace"
@@ -1685,6 +1875,43 @@ enum RichText {
             out += text
         }
         return out
+    }
+
+    /// Paragraph-level formatting the composer doesn't offer but pasted rich text can carry.
+    private static func blockCSS(_ style: NSParagraphStyle?, inList: Bool) -> [String] {
+        guard let style else { return [] }
+        var css: [String] = []
+        switch style.alignment {
+        case .center: css.append("text-align:center")
+        case .right: css.append("text-align:right")
+        case .justified: css.append("text-align:justify")
+        default: break
+        }
+        if !inList, style.headIndent > 0.5 { css.append("margin-left:\(cssNumber(style.headIndent))px") }
+        if style.paragraphSpacingBefore > 0.5 { css.append("margin-top:\(cssNumber(style.paragraphSpacingBefore))px") }
+        if style.paragraphSpacing > 0.5 { css.append("margin-bottom:\(cssNumber(style.paragraphSpacing))px") }
+        return css
+    }
+
+    private static func styleAttribute(_ css: [String]) -> String {
+        css.isEmpty ? "" : " style=\"\(css.joined(separator: ";"))\""
+    }
+
+    /// "18" or "15.7": a fractional point size keeps one decimal instead of being truncated. Built by hand so
+    /// a decimal comma from the user's locale can't end up in the CSS.
+    private static func cssNumber(_ value: CGFloat) -> String {
+        let tenths = Int((value * 10).rounded())
+        return tenths % 10 == 0 ? "\(tenths / 10)" : "\(tenths / 10).\(abs(tenths % 10))"
+    }
+
+    /// `<ol>` for numbered markers, `<ul>` for every other list; "" for an ordinary paragraph.
+    private static func listKind(_ style: NSParagraphStyle?) -> String {
+        guard let marker = style?.textLists.last?.markerFormat.rawValue.lowercased(), !marker.isEmpty else { return "" }
+        if marker.contains("decimal") || marker.contains("alpha") || marker.contains("roman")
+            || marker.contains("latin") || marker.contains("hexadecimal") || marker.contains("octal") {
+            return "ol"
+        }
+        return "ul"
     }
 }
 
