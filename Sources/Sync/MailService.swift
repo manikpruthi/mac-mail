@@ -158,8 +158,11 @@ final class MailService {
         else { throw NetError.auth("enter the password for \(account.email).") }
         try await verify(account, password: pass)
         if let password, !password.isEmpty { try Keychain.set(password, for: account.id) }
+        // updateAccount() already resets the connections when the servers changed (W-16); a changed
+        // password needs one too, and doing both would tear down connections that just started.
+        let connectionChanged = accounts.first { $0.id == account.id }.map { account.connectionDiffers(from: $0) } ?? false
         updateAccount(account)
-        engines[account.id]?.resetConnections()
+        if !connectionChanged { engines[account.id]?.resetConnections() }
     }
 
     func removeAccount(_ id: String) {
@@ -415,8 +418,10 @@ final class MailService {
             var message = p.message
             if message.messageID == nil { message.messageID = MessageBuilder.newMessageID(for: message.from) }
             var safetyDraftID: Int64?
+            var mime: Data?
             do {
                 let data = try await Task.detached { try MessageBuilder.build(message) }.value
+                mime = data
                 safetyDraftID = try await engine.saveDraft(data, messageID: message.messageID)
             } catch {
                 // The safety copy failed; the send itself can still go out.
@@ -431,7 +436,8 @@ final class MailService {
                     // Network trouble, not a refusal: park it in the outbox instead of failing (F-07).
                     do {
                         try self.outbox.add(message, accountID: p.accountID, replyToID: p.replyTo?.id,
-                                            draftToDeleteID: p.draftToDelete?.id, safetyDraftID: safetyDraft?.id)
+                                            draftToDeleteID: p.draftToDelete?.id, safetyDraftID: safetyDraft?.id,
+                                            mime: mime)
                         onResult(.queued)
                     } catch {
                         onResult(.failed(error))
