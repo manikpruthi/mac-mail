@@ -340,8 +340,18 @@ actor IMAPClient {
     /// Marks every message in the selected mailbox deleted and expunges (Empty Trash / Empty Spam, F-10).
     func expungeAll() async throws {
         guard lastSelectInfo.exists > 0 else { return }
-        try await run("UID STORE 1:* +FLAGS.SILENT (\\Deleted)")
-        try await run("EXPUNGE", timeout: 300)
+        if capabilities.contains("UIDPLUS") {
+            try await run("UID STORE 1:* +FLAGS.SILENT (\\Deleted)")
+            try await run("UID EXPUNGE 1:*", timeout: 300)
+        } else {
+            // Without UIDPLUS a bare EXPUNGE would also purge messages another client flagged \Deleted;
+            // expunge only when the pending deletions are exactly the ones we just made.
+            let ours = Set(try await uidSearch("ALL"))
+            guard !ours.isEmpty else { return }
+            try await run("UID STORE 1:* +FLAGS.SILENT (\\Deleted)")
+            guard Set(try await uidSearch("DELETED")) == ours else { return }
+            try await run("EXPUNGE", timeout: 300)
+        }
     }
 
     /// Storage quota for the account's root (F-27): (used KB, limit KB), nil when the server has no QUOTA.
@@ -484,10 +494,11 @@ actor IMAPClient {
         if capabilities.contains("UIDPLUS") { try await run("UID EXPUNGE \(set)") } else { try await expungeExactly(uids) }
     }
 
-    /// Bare EXPUNGE gated on an exact UID SEARCH DELETED match, so other clients' deleted messages survive.
+    /// Bare EXPUNGE only when the pending deletions are exactly these UIDs, so other clients' deleted
+    /// messages survive (a subset check would still let EXPUNGE purge theirs).
     private func expungeExactly(_ uids: [UInt32]) async throws {
         let deleted = Set(try await uidSearch("DELETED"))
-        guard Set(uids).isSubset(of: deleted) else { return }
+        guard deleted == Set(uids) else { return }
         try await run("EXPUNGE")
     }
 

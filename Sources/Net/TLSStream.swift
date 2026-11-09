@@ -46,6 +46,8 @@ protocol ByteTransport: AnyObject, Sendable {
     func receive() async throws -> Data
     /// Switches the established plain connection to TLS (STARTTLS). Certificates are verified for the host.
     func startTLS() async throws
+    /// Throws away plaintext already received but not yet delivered (STARTTLS must discard pre-handshake bytes).
+    func discardBuffered()
     func close()
     /// Called once when the connection fails or is closed underneath us.
     func setClosedHandler(_ handler: @escaping @Sendable () -> Void)
@@ -114,6 +116,8 @@ final class NWTransport: ByteTransport, @unchecked Sendable {
     func startTLS() async throws {
         throw NetError.protocolError("this connection already uses TLS")
     }
+
+    func discardBuffered() {} // bytes are only delivered through receive(), nothing is buffered
 
     func close() { connection.cancel() }
 }
@@ -223,6 +227,9 @@ final class StartTLSTransport: NSObject, ByteTransport, StreamDelegate, @uncheck
     func startTLS() async throws {
         await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
             onThread { [self] in
+                // Pre-TLS plaintext buffered so far is discarded with the TLS switch, atomically on the
+                // run-loop thread so no event can buffer more plaintext in between (STARTTLS injection).
+                buffer.removeAll()
                 // Setting the security level on an open stream starts the TLS handshake on the next I/O,
                 // with the peer name (and so certificate check) taken from the host we connected to.
                 let level = StreamSocketSecurityLevel.negotiatedSSL
@@ -231,6 +238,10 @@ final class StartTLSTransport: NSObject, ByteTransport, StreamDelegate, @uncheck
                 c.resume()
             }
         }
+    }
+
+    func discardBuffered() {
+        onThread { [self] in buffer.removeAll() }
     }
 
     func close() {
@@ -350,6 +361,7 @@ actor TLSStream {
         guard security == .startTLS, !isEncrypted else { return }
         buffer.removeAll()
         start = 0
+        try await transport.discardBuffered()
         try await transport.startTLS()
         isEncrypted = true
     }

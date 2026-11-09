@@ -341,9 +341,11 @@ enum MailboxName {
 }
 
 extension String {
-    /// IMAP quoted string.
+    /// IMAP quoted string; CR/LF are illegal in one and would let the value inject extra commands,
+    /// so they are stripped rather than sent verbatim.
     var imapQuoted: String {
-        "\"" + replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"") + "\""
+        let escaped = replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
+        return "\"" + escaped.filter { $0 != "\r" && $0 != "\n" } + "\""
     }
 }
 
