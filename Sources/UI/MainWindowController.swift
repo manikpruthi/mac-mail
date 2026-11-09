@@ -114,10 +114,11 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSSearc
         // The folder a search was started from can be deleted while searching; never restore a dead source.
         var target = source
         if case .folder(let id) = source, MailService.shared.store.folder(id) == nil { target = .unified }
-        lastSource = target
         // Every source change selects the sidebar row, so ⌘1…9 and clearing the search keep the
-        // highlight and the list in sync (C-15).
-        sidebar.select(source: target)
+        // highlight and the list in sync (C-15). A row that vanished meanwhile (the last second account
+        // removed during a search, …) makes the sidebar fall back; the list follows the highlight.
+        if let actual = sidebar.select(source: target), actual != target { target = actual }
+        lastSource = target
         searchField?.stringValue = ""
         list.show(target)
         preview.showEmpty(text: "No message selected")
@@ -351,12 +352,26 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSSearc
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.6, execute: work)
     }
 
-    /// Same as typing in the search field (used by the demo hook).
-    func runSearch(_ text: String) {
+    /// Starts a search from a clean filter-bar context: selecting a saved search while another search is
+    /// open must not inherit its filters or its "This folder" scope (C-19). The list only resets and
+    /// reconfigures the bar when it was not already searching, so leave the search first.
+    private func beginSearch(_ text: String, from origin: MailSource) {
+        searchDebounce?.cancel()
+        var target = origin
+        if case .folder(let id) = origin, MailService.shared.store.folder(id) == nil { target = .unified }
+        if case .search = list.source { list.show(target) }
+        // The bar's "This folder" scope is resolved from lastSource, so a saved search's scope must become
+        // the origin too — otherwise re-saving it would store a different folder (C-19).
+        lastSource = target
         searchField?.stringValue = text
         sidebar.clearSelectionForSearch()
-        list.showSearch(text, from: lastSource)
+        list.showSearch(text, from: target)
         preview.showEmpty(text: "No message selected")
+    }
+
+    /// Same as typing in the search field (used by the demo hook).
+    func runSearch(_ text: String) {
+        beginSearch(text, from: lastSource)
         list.selectFirst(userInitiated: false)
         list.runServerSearch()
     }
@@ -371,13 +386,10 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSSearc
         } else if filters.scope == .folder {
             filters.scope = .all // the scoped folder is gone; search everywhere
         }
-        searchField?.stringValue = entry.query
-        sidebar.clearSelectionForSearch()
-        list.showSearch(entry.query, from: origin)
-        if filters != SearchFilters(), let bar = searchFilterBar {
-            bar.apply(filters) // re-runs the search with the restored filters
+        beginSearch(entry.query, from: origin)
+        if let bar = searchFilterBar {
+            bar.apply(filters) // updates the controls and re-runs the search with them
         } else {
-            preview.showEmpty(text: "No message selected")
             list.runServerSearch()
         }
         list.selectFirst(userInitiated: false)
@@ -636,16 +648,31 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSSearc
     @objc func emptySpam(_ sender: Any?) { emptyRole(.spam) }
 
     private func emptyRole(_ role: FolderRole) {
-        let store = MailService.shared.store
         if list.source.isUnified {
+            let store = MailService.shared.store
             let folders = MailService.shared.accounts.compactMap { store.folder(account: $0.id, role: role) }
             guard !folders.isEmpty else { NSSound.beep(); return }
             confirmEmptyAll(folders, in: window)
             return
         }
-        let account = sidebar.selectedFolder?.accountID ?? list.focusedRow?.accountID ?? MailService.shared.defaultAccount?.id
-        guard let account, let f = store.folder(account: account, role: role) else { NSSound.beep(); return }
+        guard let f = emptyTarget(role) else { NSSound.beep(); return }
         SidebarViewController.confirmEmpty(f, in: window)
+    }
+
+    /// The folder Empty Trash / Empty Spam acts on for the current view (W-16).
+    private func emptyTarget(_ role: FolderRole) -> Folder? {
+        let account = sidebar.selectedFolder?.accountID ?? list.focusedRow?.accountID ?? MailService.shared.defaultAccount?.id
+        guard let account else { return nil }
+        return MailService.shared.store.folder(account: account, role: role)
+    }
+
+    /// Whether there is anything for Empty Trash / Empty Spam to act on in the current view (W-16).
+    private func canEmpty(_ role: FolderRole) -> Bool {
+        if list.source.isUnified {
+            let store = MailService.shared.store
+            return MailService.shared.accounts.contains { store.folder(account: $0.id, role: role) != nil }
+        }
+        return emptyTarget(role) != nil
     }
 
     /// One confirmation for emptying a role across every account (unified views — C-04).
@@ -711,6 +738,15 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSSearc
             return !MailService.shared.accounts.isEmpty
         case #selector(saveMessageAs(_:)), #selector(printMessage(_:)):
             return list.focusedRow != nil
+        case #selector(saveAttachments(_:)):
+            // Nothing to save unless the open message actually has attachments (W-16).
+            return preview.currentDetail?.structure?.attachments().isEmpty == false
+        case #selector(emptyTrash(_:)):
+            return canEmpty(.trash)
+        case #selector(emptySpam(_:)):
+            return canEmpty(.spam)
+        case #selector(syncNow(_:)):
+            return !MailService.shared.accounts.isEmpty
         case #selector(saveCurrentSearch(_:)):
             if case .search = list.source { return true }
             return false

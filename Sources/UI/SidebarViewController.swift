@@ -177,11 +177,15 @@ final class SidebarViewController: NSViewController, NSOutlineViewDataSource, NS
             items.append(acct)
         }
         // Remember which roots were expanded so a reload doesn't pop collapsed accounts open (C-35).
+        // The first population opens every account/group; capturing the old roots only works once the
+        // outline has had items (loadView's first reload runs while `roots` is still empty).
         var expanded: [SidebarItem.Kind] = []
-        for r in roots where !r.children.isEmpty && (hasExpansionState ? outline.isItemExpanded(r) : true) {
-            expanded.append(r.kind)
+        if hasExpansionState {
+            for r in roots where !r.children.isEmpty && outline.isItemExpanded(r) { expanded.append(r.kind) }
+        } else {
+            expanded = items.filter { !$0.children.isEmpty }.map(\.kind)
+            hasExpansionState = !items.isEmpty
         }
-        hasExpansionState = true
         roots = items
         refreshCounts(reloadOutline: false)
         suppressSelection = true
@@ -191,10 +195,7 @@ final class SidebarViewController: NSViewController, NSOutlineViewDataSource, NS
         // back while suppressed, so report the fallback to the list once the suppression is lifted
         // — otherwise the highlight moves but list.source keeps pointing at the dead folder (B-37 / C-07).
         var fellBack = false
-        if let selected, !select(kind: selected) {
-            selectDefault()
-            fellBack = true
-        }
+        if let selected, !select(kind: selected) { fellBack = true }
         Debug.log("sidebar roots=\(roots.count) rows=\(outline.numberOfRows)")
         suppressSelection = false
         if fellBack, let source = selectedSource { onSelect?(source) }
@@ -225,6 +226,8 @@ final class SidebarViewController: NSViewController, NSOutlineViewDataSource, NS
                     c.unread = counts[id] ?? 0
                 case .unified:
                     c.unread = store.unifiedUnreadCount()
+                case .flagged:
+                    c.unread = store.flaggedUnreadCount()
                 case .unifiedRole(let role):
                     if roleUnread == nil {
                         var map: [FolderRole: Int] = [:]
@@ -302,29 +305,28 @@ final class SidebarViewController: NSViewController, NSOutlineViewDataSource, NS
     }
 
     /// Highlights the row for a source without re-triggering onSelect — for source changes that
-    /// didn't come from a sidebar click (⌘1…9, clearing the search — C-15).
-    func select(source: MailSource) {
+    /// didn't come from a sidebar click (⌘1…9, clearing the search — C-15). Returns the source that
+    /// actually ended up selected: when the row is gone (a deleted folder, the last second account
+    /// having been removed) the sidebar falls back to another source and the list must follow it.
+    @discardableResult
+    func select(source: MailSource) -> MailSource? {
         let kind: SidebarItem.Kind
         switch source {
         case .unified: kind = .unified
         case .unifiedRole(let role): kind = .unifiedRole(role)
         case .flagged: kind = .flagged
         case .folder(let id): kind = .folder(id)
-        case .search: return
+        case .search: return nil
         }
         suppressSelection = true
-        select(kind: kind)
+        let found = select(kind: kind)
         suppressSelection = false
+        return found ? source : selectedSource
     }
 
     @discardableResult
     func select(kind: SidebarItem.Kind) -> Bool {
-        for row in 0..<outline.numberOfRows {
-            if let item = outline.item(atRow: row) as? SidebarItem, item.kind == kind {
-                outline.selectRowIndexes([row], byExtendingSelection: false)
-                return true
-            }
-        }
+        if selectIfPresent(kind) { return true }
         // The folder vanished (deleted or renamed elsewhere): fall back instead of leaving a stale
         // list on screen with nothing highlighted (B-37).
         selectDefault()
@@ -334,16 +336,30 @@ final class SidebarViewController: NSViewController, NSOutlineViewDataSource, NS
     /// Picks All Inboxes, or the first account's Inbox.
     func selectDefault() {
         if roots.first?.kind == .group("smart") { selectIfPresent(.unified); return }
-        if let acct = roots.first(where: { $0.accountID != nil }), let first = acct.children.first { selectIfPresent(first.kind) }
+        if let acct = roots.first(where: { $0.accountID != nil }), let first = acct.children.first {
+            selectIfPresent(first.kind)
+        }
     }
 
-    private func selectIfPresent(_ kind: SidebarItem.Kind) {
-        for row in 0..<outline.numberOfRows {
-            if let item = outline.item(atRow: row) as? SidebarItem, item.kind == kind {
-                outline.selectRowIndexes([row], byExtendingSelection: false)
-                return
+    /// Finds a row in the model and reveals it: a folder inside a collapsed account (or a smart/saved
+    /// group) has no row until its parent is expanded (⌘1…9 must still land on it).
+    @discardableResult
+    private func selectIfPresent(_ kind: SidebarItem.Kind) -> Bool {
+        for root in roots {
+            if root.kind == kind { return selectRow(for: root) }
+            for child in root.children where child.kind == kind {
+                outline.expandItem(root)
+                return selectRow(for: child)
             }
         }
+        return false
+    }
+
+    private func selectRow(for item: SidebarItem) -> Bool {
+        let row = outline.row(forItem: item)
+        guard row >= 0 else { return false }
+        outline.selectRowIndexes([row], byExtendingSelection: false)
+        return true
     }
 
     /// The selected folder, for menu commands (Empty Trash, folder actions).
@@ -393,7 +409,11 @@ final class SidebarViewController: NSViewController, NSOutlineViewDataSource, NS
 
     @objc private func toggleNotifications(_ sender: NSMenuItem) {
         guard let id = sender.representedObject as? String else { return }
-        Prefs.setNotifications(!Prefs.notifications(for: id), for: id)
+        let on = !Prefs.notifications(for: id)
+        Prefs.setNotifications(on, for: id)
+        // Asking up front (as the Settings switch does) is the only way macOS shows the permission prompt;
+        // otherwise the preference reads On while delivery stays silently denied (C-32).
+        if on { MailService.shared.requestNotificationPermission() }
     }
 
     // MARK: Folder management (F-10, F-12)
