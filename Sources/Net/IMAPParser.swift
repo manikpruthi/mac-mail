@@ -70,7 +70,8 @@ enum IMAPParser {
     static let maxDepth = 100
 
     /// Length of a trailing literal marker "{123}" or "{123+}", if the line ends with one.
-    /// Oversized lengths are clamped to maxLiteralSize instead of trapping.
+    /// Returns the exact advertised length, saturating at Int.max for absurd values instead of
+    /// trapping (SEC-07); the caller must refuse anything over maxLiteralSize, not read only the cap.
     static func literalLength(_ line: [UInt8]) -> Int? {
         guard let last = line.last, last == UInt8(ascii: "}") else { return nil }
         var i = line.count - 2
@@ -78,20 +79,19 @@ enum IMAPParser {
         var digits = 0
         var value = 0
         var weight = 1
-        var clamped = false
+        var overflowed = false
         while i >= 0, line[i] >= 48, line[i] <= 57 {
             digits += 1
-            if digits > 9 { // more digits than any cap-sized literal: clamp, keep consuming
-                clamped = true
-            } else {
-                value += Int(line[i] - 48) * weight
-                if value > maxLiteralSize { clamped = true }
-                weight *= 10
+            if !overflowed {
+                let (w, wo) = weight.multipliedReportingOverflow(by: 10)
+                let (d, dof) = Int(line[i] - 48).multipliedReportingOverflow(by: weight)
+                let (t, to) = value.addingReportingOverflow(d)
+                if wo || dof || to { overflowed = true } else { value = t; weight = w }
             }
             i -= 1
         }
         guard digits > 0, i >= 0, line[i] == UInt8(ascii: "{") else { return nil }
-        return clamped ? maxLiteralSize : value
+        return overflowed ? Int.max : value
     }
 
     static func parse(_ parts: [ResponsePart]) -> IMAPResponse {

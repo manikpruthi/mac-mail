@@ -187,8 +187,12 @@ check("encoded words folded", built4.contains("=?UTF-8?B?") && subjectLines.cont
 let b64chunks = built4.components(separatedBy: "=?UTF-8?B?").dropFirst().map { String($0.prefix(while: { $0 != "?" })) }
 check("encoded words short", !b64chunks.isEmpty && b64chunks.allSatisfy { $0.count <= 63 })
 
-// DoS: 20-digit literal length must not trap (SEC-07)
-check("huge literal clamped", IMAPParser.literalLength(Array("x {99999999999999999999}".utf8)) == IMAPParser.maxLiteralSize)
+// DoS: 20-digit literal length must not trap (SEC-07); F-18: the exact size is reported so the
+// reader can refuse it instead of reading only the cap and parsing the payload as protocol lines.
+let huge = IMAPParser.literalLength(Array("x {99999999999999999999}".utf8))
+check("huge literal saturates", huge == Int.max)
+check("just-over-limit literal reported", IMAPParser.literalLength(Array("x {\(IMAPParser.maxLiteralSize + 1)}".utf8)) == IMAPParser.maxLiteralSize + 1)
+check("just-under-limit literal intact", IMAPParser.literalLength(Array("x {\(IMAPParser.maxLiteralSize - 1)}".utf8)) == IMAPParser.maxLiteralSize - 1)
 check("normal literal intact", IMAPParser.literalLength(Array("BODY[] {42}".utf8)) == 42)
 
 // DoS: 20000 nested parens must not crash the parser or BodyStructure (V2-17)

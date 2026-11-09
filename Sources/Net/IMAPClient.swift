@@ -199,6 +199,11 @@ actor IMAPClient {
                 guard parts.count <= Limits.maxResponseDepth else {
                     throw NetError.protocolError("response has too many literals")
                 }
+                // Over the cap the literal is refused outright: reading only the cap would leave the
+                // rest of the payload to be parsed as protocol lines and desynchronise the connection.
+                guard n <= Limits.maxResponseBytes else {
+                    throw NetError.protocolError("literal of \(n) bytes exceeds the response limit")
+                }
                 totalBytes += n
                 guard totalBytes <= Limits.maxResponseBytes else {
                     throw NetError.protocolError("response too large")
@@ -349,7 +354,12 @@ actor IMAPClient {
             let ours = Set(try await uidSearch("ALL"))
             guard !ours.isEmpty else { return }
             try await run("UID STORE 1:* +FLAGS.SILENT (\\Deleted)")
-            guard Set(try await uidSearch("DELETED")) == ours else {
+            let deleted = Set(try await uidSearch("DELETED"))
+            guard deleted == ours else {
+                // Undo the flag on UIDs that arrived after the ALL snapshot; ours stay marked so a
+                // retry only has to empty them.
+                let extra = deleted.subtracting(ours)
+                if !extra.isEmpty { try? await run("UID STORE \(imapUIDSet(extra)) -FLAGS.SILENT (\\Deleted)") }
                 // Not expunged: reporting success here would tell the user the folder is empty when it isn't.
                 throw NetError.server("The folder changed while it was being emptied. Try again.")
             }
@@ -501,7 +511,14 @@ actor IMAPClient {
     /// messages survive (a subset check would still let EXPUNGE purge theirs).
     private func expungeExactly(_ uids: [UInt32]) async throws {
         let deleted = Set(try await uidSearch("DELETED"))
-        guard deleted == Set(uids) else { return }
+        guard deleted == Set(uids) else {
+            // Un-flag what we marked: a bare EXPUNGE now would also purge another client's pending
+            // deletions, and returning would drop the op as success while the message survives here.
+            try await run("UID STORE \(imapUIDSet(uids)) -FLAGS.SILENT (\\Deleted)")
+            // Not temporary-refusal wording on purpose: AccountEngine drops the op and reports it
+            // instead of retrying against the other client's deletion forever.
+            throw NetError.server("The server has pending deletions from another mail client, so the message wasn't removed.")
+        }
         try await run("EXPUNGE")
     }
 
@@ -659,26 +676,28 @@ actor IMAPClient {
             while true {
                 let results = try await fetch("\(uid)", items: "(UID BODY.PEEK[\(part.partID)]<\(offset).\(chunk)>)")
                 guard let r = results.first(where: { $0.uid == uid }), let raw = r.items["BODY[\(part.partID)]"]?.data else { break }
+                // A server that keeps sending past the advertised size (with a small margin) is cut
+                // off before the excess reaches the disk.
+                guard offset + raw.count <= maxBytes else {
+                    throw NetError.protocolError("attachment sent more data than advertised")
+                }
                 switch enc {
-                case "base64": handle.write(b64.feed(raw))
+                case "base64": try handle.write(contentsOf: b64.feed(raw))
                 case "quoted-printable":
                     // Decode complete lines only, so a soft break or =XX never spans two chunks in RAM.
                     qpBuffer.append(raw)
                     if let r = qpBuffer.range(of: newline, options: [.backwards]) {
                         let complete = qpBuffer.subdata(in: qpBuffer.startIndex..<r.upperBound)
                         qpBuffer.removeSubrange(qpBuffer.startIndex..<r.upperBound)
-                        if !complete.isEmpty { handle.write(MIME.decodeQuotedPrintable(complete)) }
+                        if !complete.isEmpty { try handle.write(contentsOf: MIME.decodeQuotedPrintable(complete)) }
                     }
-                default: handle.write(raw)
+                default: try handle.write(contentsOf: raw)
                 }
                 offset += raw.count
-                guard offset <= maxBytes else {
-                    throw NetError.protocolError("attachment sent more data than advertised")
-                }
                 if raw.count < chunk { break }
             }
-            if enc == "base64" { handle.write(b64.finish()) }
-            if enc == "quoted-printable" { handle.write(MIME.decodeQuotedPrintable(qpBuffer)) }
+            if enc == "base64" { try handle.write(contentsOf: b64.finish()) }
+            if enc == "quoted-printable" { try handle.write(contentsOf: MIME.decodeQuotedPrintable(qpBuffer)) }
             // Verify the bytes received against BODYSTRUCTURE: its size is the transfer-encoded octet
             // count, which is exactly what BODY[part] returns, so a short total means truncation.
             if part.size > 0 && offset != part.size {
