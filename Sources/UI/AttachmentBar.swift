@@ -17,13 +17,22 @@ final class AttachmentBar: NSView, NSFilePromiseProviderDelegate {
     private let saveAll = NSButton(title: "Save All…", target: nil, action: nil)
     private let status = NSTextField(labelWithString: "")
     private let progress = NSProgressIndicator()
+    private let separator = NSBox()
     private var parts: [BodyPart] = []
+    private lazy var heightConstraint = heightAnchor.constraint(equalToConstant: 58)
+    /// The bar's vertical layout; relaxed while collapsed so a zero height is satisfiable.
+    private var bodyConstraints: [NSLayoutConstraint] = []
+    private(set) var isCollapsed = false
 
     var isEmpty: Bool { parts.isEmpty }
 
     override init(frame: NSRect) {
         super.init(frame: frame)
         translatesAutoresizingMaskIntoConstraints = false
+        // Below required so a container (the .eml viewer) can collapse the bar to zero height without
+        // an Auto Layout conflict.
+        heightConstraint.priority = NSLayoutConstraint.Priority(999)
+        heightConstraint.isActive = true
         chips.orientation = .horizontal
         chips.spacing = 8
         chips.edgeInsets = NSEdgeInsets(top: 0, left: 20, bottom: 0, right: 8)
@@ -53,36 +62,51 @@ final class AttachmentBar: NSView, NSFilePromiseProviderDelegate {
         progress.controlSize = .small
         progress.isDisplayedWhenStopped = false
 
-        let separator = NSBox()
+        let separator = self.separator
         separator.boxType = .separator
         for v in [scroll, saveAll, status, progress, separator] as [NSView] {
             v.translatesAutoresizingMaskIntoConstraints = false
             addSubview(v)
         }
-        NSLayoutConstraint.activate([
-            heightAnchor.constraint(equalToConstant: 58),
-            scroll.leadingAnchor.constraint(equalTo: leadingAnchor),
+        let vertical: [NSLayoutConstraint] = [
             scroll.topAnchor.constraint(equalTo: topAnchor, constant: 6),
             scroll.bottomAnchor.constraint(equalTo: separator.topAnchor, constant: -6),
+            doc.heightAnchor.constraint(equalTo: scroll.contentView.heightAnchor),
+            progress.centerYAnchor.constraint(equalTo: scroll.centerYAnchor),
+            saveAll.centerYAnchor.constraint(equalTo: scroll.centerYAnchor),
+            status.bottomAnchor.constraint(equalTo: separator.topAnchor, constant: -1),
+            separator.bottomAnchor.constraint(equalTo: bottomAnchor),
+        ]
+        bodyConstraints = vertical
+        NSLayoutConstraint.activate([heightConstraint] + vertical + [
+            scroll.leadingAnchor.constraint(equalTo: leadingAnchor),
             scroll.trailingAnchor.constraint(equalTo: progress.leadingAnchor, constant: -8),
             chips.leadingAnchor.constraint(equalTo: doc.leadingAnchor),
             chips.topAnchor.constraint(equalTo: doc.topAnchor),
             chips.bottomAnchor.constraint(equalTo: doc.bottomAnchor),
             doc.trailingAnchor.constraint(equalTo: chips.trailingAnchor),
-            doc.heightAnchor.constraint(equalTo: scroll.contentView.heightAnchor),
-            progress.centerYAnchor.constraint(equalTo: scroll.centerYAnchor),
             progress.trailingAnchor.constraint(equalTo: saveAll.leadingAnchor, constant: -8),
             saveAll.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -16),
-            saveAll.centerYAnchor.constraint(equalTo: scroll.centerYAnchor),
             status.trailingAnchor.constraint(equalTo: saveAll.trailingAnchor),
-            status.bottomAnchor.constraint(equalTo: separator.topAnchor, constant: -1),
             separator.leadingAnchor.constraint(equalTo: leadingAnchor),
             separator.trailingAnchor.constraint(equalTo: trailingAnchor),
-            separator.bottomAnchor.constraint(equalTo: bottomAnchor),
         ])
     }
 
     required init?(coder: NSCoder) { fatalError() }
+
+    /// Collapses the bar to zero height where it isn't inside a stack view (the .eml viewer).
+    func setCollapsed(_ collapsed: Bool) {
+        guard isCollapsed != collapsed else { return }
+        isCollapsed = collapsed
+        heightConstraint.constant = collapsed ? 0 : 58
+        if collapsed {
+            NSLayoutConstraint.deactivate(bodyConstraints)
+        } else {
+            NSLayoutConstraint.activate(bodyConstraints)
+        }
+        for v in [scroll, saveAll, status, progress, separator] as [NSView] { v.isHidden = collapsed }
+    }
 
     func set(_ parts: [BodyPart]) {
         self.parts = parts
@@ -191,21 +215,27 @@ final class AttachmentChip: NSButton, NSDraggingSource {
 
     override func mouseDown(with event: NSEvent) {
         mouseDownPoint = event.locationInWindow
-        // Track the drag ourselves: a press that moves becomes a file drag, a press that doesn't is a click.
+        // Track the drag ourselves: a press that moves becomes a file drag, a press that doesn't and ends
+        // inside the chip is a click. The wait is capped, and a mouse-up outside the chip is not a click,
+        // so a missed mouse-up can never wedge the event loop or swallow the next click (C-23).
         guard let window else { super.mouseDown(with: event); return }
-        while let next = window.nextEvent(matching: [.leftMouseUp, .leftMouseDragged]) {
+        let deadline = Date().addingTimeInterval(10)
+        while let next = window.nextEvent(matching: [.leftMouseUp, .leftMouseDragged], until: deadline, inMode: .eventTracking, dequeue: true) {
             if next.type == .leftMouseUp {
-                if isEnabled { performClick(nil) }
+                mouseDownPoint = nil
+                if isEnabled, bounds.contains(convert(next.locationInWindow, from: nil)) { performClick(nil) }
                 return
             }
             if let start = mouseDownPoint, hypot(next.locationInWindow.x - start.x, next.locationInWindow.y - start.y) > 4,
                isEnabled, let provider = dragProvider?() {
+                mouseDownPoint = nil
                 let item = NSDraggingItem(pasteboardWriter: provider)
                 item.setDraggingFrame(bounds, contents: image)
                 beginDraggingSession(with: [item], event: event, source: self)
                 return
             }
         }
+        mouseDownPoint = nil
     }
 
     func draggingSession(_ session: NSDraggingSession, sourceOperationMaskFor context: NSDraggingContext) -> NSDragOperation {
@@ -247,6 +277,7 @@ final class FlippedView: NSView {
 final class QuickLookController: NSObject, QLPreviewPanelDataSource {
     static let shared = QuickLookController()
     private var url: URL?
+    private var closeObserver: NSObjectProtocol?
 
     func show(_ url: URL) {
         self.url = url
@@ -254,11 +285,33 @@ final class QuickLookController: NSObject, QLPreviewPanelDataSource {
         panel.dataSource = self
         panel.reloadData()
         panel.makeKeyAndOrderFront(nil)
+        if closeObserver == nil {
+            // Clear dataSource/url when the panel closes, so it never previews a deleted file (C-25).
+            closeObserver = NotificationCenter.default.addObserver(
+                forName: NSWindow.willCloseNotification, object: panel, queue: nil) { [weak self] _ in
+                Task { @MainActor in self?.panelClosed() }
+            }
+        }
     }
 
-    nonisolated func numberOfPreviewItems(in panel: QLPreviewPanel!) -> Int { 1 }
+    /// Closes the panel if it is showing one of our temp files (teardown deletes them right after).
+    func close() {
+        if let panel = QLPreviewPanel.shared(), panel.dataSource === self { panel.orderOut(nil) }
+        panelClosed()
+    }
+
+    private func panelClosed() {
+        url = nil
+        if let panel = QLPreviewPanel.shared(), panel.dataSource === self { panel.dataSource = nil }
+    }
+
+    nonisolated func numberOfPreviewItems(in panel: QLPreviewPanel!) -> Int {
+        guard Thread.isMainThread else { return 0 }
+        return MainActor.assumeIsolated { url == nil ? 0 : 1 }
+    }
 
     nonisolated func previewPanel(_ panel: QLPreviewPanel!, previewItemAt index: Int) -> QLPreviewItem! {
-        MainActor.assumeIsolated { url as NSURL? }
+        guard Thread.isMainThread else { return nil }
+        return MainActor.assumeIsolated { url as NSURL? }
     }
 }

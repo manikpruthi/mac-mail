@@ -623,6 +623,13 @@ final class PreviewViewController: NSViewController, WKNavigationDelegate, WKUID
     /// From here on no pending render or body fetch may create a new web view until the pane is shown again.
     func releaseWebView() {
         tornDown = true
+        // Close Quick Look and drop its temp file now, not on the next Quick Look (C-25).
+        if quickLookURL != nil || quickLookDir != nil {
+            QuickLookController.shared.close()
+            if let d = quickLookDir { try? FileManager.default.removeItem(at: d) }
+            quickLookDir = nil
+            quickLookURL = nil
+        }
         guard let w = webView else { return }
         loader.cancelAll()
         w.stopLoading()
