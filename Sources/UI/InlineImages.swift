@@ -76,8 +76,10 @@ enum InlineImage {
         let limit = max(120, maxWidth)
         if let width, width > 0 {
             let wanted = min(max(minWidth, width), limit)
-            size = CGSize(width: wanted.rounded(), height: (size.height * wanted / size.width).rounded())
-        } else if size.width > limit { size = CGSize(width: limit, height: (size.height * limit / size.width).rounded()) }
+            size = CGSize(width: wanted.rounded(), height: max(1, (size.height * wanted / size.width).rounded()))
+        } else if size.width > limit {
+            size = CGSize(width: limit, height: max(1, (size.height * limit / size.width).rounded()))
+        }
         let backing = NSScreen.main?.backingScaleFactor ?? 2
         let opts: [CFString: Any] = [kCGImageSourceCreateThumbnailFromImageAlways: true,
                                      kCGImageSourceCreateThumbnailWithTransform: true,
@@ -117,16 +119,17 @@ enum InlineImage {
         let b = att.bounds.size
         guard b.width > 0 else { return }
         let w = min(max(minWidth, width), max(120, maxWidth)).rounded()
-        let size = CGSize(width: w, height: (b.height * w / b.width).rounded())
+        let size = CGSize(width: w, height: max(1, (b.height * w / b.width).rounded()))
         att.bounds = CGRect(origin: .zero, size: size)
         (att.attachmentCell as? NSTextAttachmentCell)?.image?.size = size
     }
 
     /// Gives every attachment in `storage` that isn't displayed yet (just pasted as rich text, restored from an
-    /// autosave) its inline display; attachments that aren't images are removed (files belong in the list).
+    /// autosave) its inline display. Anything that isn't a decodable image is left untouched: AppKit inserts
+    /// file promises and other files into rich text, and deleting them would lose what the user pasted (C-03).
     /// `widths` gives restored images (in document order) the sizes they had; RTFD doesn't keep them.
     static func normalize(_ storage: NSTextStorage, maxWidth: CGFloat, widths: [CGFloat]? = nil) {
-        var changes: [(NSRange, NSTextAttachment?)] = []
+        var changes: [(NSRange, NSTextAttachment)] = []
         var n = 0
         storage.enumerateAttribute(.attachment, in: NSRange(location: 0, length: storage.length)) { value, range, _ in
             guard let att = value as? NSTextAttachment, !(att is InlineImageAttachment) else { return }
@@ -141,15 +144,11 @@ enum InlineImage {
             if let data, let new = attachment(data: data, name: name, maxWidth: maxWidth) {
                 if let width { applyDisplay(new, maxWidth: maxWidth, width: width) }
                 changes.append((range, new))
-            } else {
-                changes.append((range, nil))
             }
         }
         guard !changes.isEmpty else { return }
         storage.beginEditing()
-        for (r, att) in changes.reversed() {
-            if let att { storage.addAttribute(.attachment, value: att, range: r) } else { storage.deleteCharacters(in: r) }
-        }
+        for (r, att) in changes.reversed() { storage.addAttribute(.attachment, value: att, range: r) }
         storage.endEditing()
     }
 
@@ -187,6 +186,12 @@ enum InlineImage {
     /// downloaded and swapped in afterwards.
     nonisolated static func token(_ n: Int) -> String { "\u{2063}[inline-image-\(n)]\u{2063}" }
 
+    /// Ranges of any draft image token left in `s`, in document order.
+    nonisolated static func tokenRanges(in s: String) -> [NSRange] {
+        guard let re = try? NSRegularExpression(pattern: "\u{2063}\\[inline-image-\\d+\\]\u{2063}") else { return [] }
+        return re.matches(in: s, range: NSRange(location: 0, length: (s as NSString).length)).map(\.range)
+    }
+
     /// Replaces every `<img src="cid:…">` with a token; returns the new HTML and, in token order, each content id
     /// with the width the image was given (so a resized image keeps its size when a draft is reopened).
     nonisolated static func tokenizeCIDImages(_ html: String) -> (String, [(cid: String, width: CGFloat?)]) {
@@ -217,6 +222,9 @@ enum InlineImage {
 /// `payload` holds the bytes that are sent: AppKit may rewrite the file wrapper once a display image is set.
 final class InlineImageAttachment: NSTextAttachment {
     var payload = Data()
+    /// The part built for sending, kept on the attachment itself. Caching it by `ObjectIdentifier` in the
+    /// composer could return another image's part once an object address is reused (C-08).
+    var outgoingPart: OutgoingAttachment?
 }
 
 final class InlineImageCell: NSTextAttachmentCell {}

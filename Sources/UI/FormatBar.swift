@@ -135,6 +135,9 @@ final class FormatBar: NSStackView {
         }
         let size = "\(Int(font.pointSize.rounded()))"
         if let item = sizePopup.item(withTitle: size) { sizePopup.select(item) } else { sizePopup.setTitle(size) }
+        // setTitle adds an item for a size that isn't in the list; keep only the current one so the menu
+        // doesn't grow for the app's lifetime (C-20).
+        while sizePopup.numberOfItems > Self.sizes.count + 1 { sizePopup.removeItem(at: Self.sizes.count) }
         // Descriptor traits, not NSFontManager: creating the shared font manager costs ~2 MB, so it's
         // only touched when the user actually changes the formatting.
         let traits = font.fontDescriptor.symbolicTraits
@@ -156,24 +159,53 @@ final class FormatBar: NSStackView {
     /// Applies `change` to every selected range (one undo step), or to the typing attributes at a bare caret.
     private func edit(_ change: (inout [NSAttributedString.Key: Any]) -> Void) {
         guard let tv = textView, let storage = tv.textStorage else { return }
-        let ranges = tv.selectedRanges.map(\.rangeValue).filter { $0.length > 0 }
+        let ranges = tv.selectedRanges.map(\.rangeValue).filter { $0.length > 0 && NSMaxRange($0) <= storage.length }
         if ranges.isEmpty {
             var t = tv.typingAttributes
             change(&t)
             tv.typingAttributes = t
         } else if tv.shouldChangeText(inRanges: ranges as [NSValue], replacementStrings: nil) {
-            storage.beginEditing()
+            // Snapshot every run before changing anything: mutating the storage invalidates the enumeration,
+            // and the old attributes are what Undo needs to restore (C-20).
+            var runs: [(NSRange, [NSAttributedString.Key: Any])] = []
             for r in ranges {
-                storage.enumerateAttributes(in: r) { attrs, sub, _ in
-                    var a = attrs
-                    change(&a)
-                    storage.setAttributes(a, range: sub)
-                }
+                storage.enumerateAttributes(in: r) { attrs, sub, _ in runs.append((sub, attrs)) }
             }
+            let updated = runs.map { run -> (NSRange, [NSAttributedString.Key: Any]) in
+                var a = run.1
+                change(&a)
+                return (run.0, a)
+            }
+            let undo = tv.undoManager
+            undo?.beginUndoGrouping()
+            undo?.registerUndo(withTarget: self) { bar in bar.restore(runs) }
+            undo?.setActionName("Formatting")
+            storage.beginEditing()
+            for (r, a) in updated { storage.setAttributes(a, range: r) }
             storage.endEditing()
             tv.didChangeText()
+            undo?.endUndoGrouping()
         }
         tv.window?.makeFirstResponder(tv)
+        refresh()
+    }
+
+    /// Undo/redo of a formatting change: puts each run's attributes back.
+    private func restore(_ runs: [(NSRange, [NSAttributedString.Key: Any])]) {
+        guard let tv = textView, let storage = tv.textStorage else { return }
+        let valid = runs.filter { NSMaxRange($0.0) <= storage.length }
+        guard !valid.isEmpty,
+              tv.shouldChangeText(inRanges: valid.map { NSValue(range: $0.0) }, replacementStrings: nil) else { return }
+        let current = valid.map { ($0.0, storage.attributes(at: $0.0.location, effectiveRange: nil)) }
+        let undo = tv.undoManager
+        undo?.beginUndoGrouping()
+        undo?.registerUndo(withTarget: self) { bar in bar.restore(current) }
+        undo?.setActionName("Formatting")
+        storage.beginEditing()
+        for (r, a) in valid { storage.setAttributes(a, range: r) }
+        storage.endEditing()
+        tv.didChangeText()
+        undo?.endUndoGrouping()
         refresh()
     }
 
