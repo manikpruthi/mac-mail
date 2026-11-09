@@ -42,8 +42,10 @@ extension Store {
             db.run("UPDATE messages SET snippet=''")
         }
         // VACUUM must run outside a transaction; it rewrites the file so the space goes back to macOS.
-        db.run("VACUUM")
-        db.run("PRAGMA optimize")
+        // run() logs the underlying error; this records that the deletes landed but compaction did not.
+        if !db.run("VACUUM") || !db.run("PRAGMA optimize") {
+            NSLog("Mac Mail cache: text cleared, compaction skipped")
+        }
         return db.scalarInt("SELECT COUNT(*) FROM bodies") == 0
     }
 }
