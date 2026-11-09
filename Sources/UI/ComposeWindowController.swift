@@ -119,22 +119,28 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
         // would record a body that can never get its images back; pipelineEnded schedules the save instead.
         guard dirty, !sentOrDiscarded, pipelineTasks == 0, !waitingForDraftBody, let account else { return }
         commitEditing()
+        // The text storage is main-actor bound: only snapshot the string (and field values) here; encoding
+        // the RTFD — every inline image — and measuring widths run on the autosave queue.
         let attr = textView.attributedString()
-        // RTFD keeps inline images; old autosaves are plain RTF and still load. A body that can't be encoded
-        // would replace a good autosave with an empty one, so keep the previous file (C-21).
-        let rtf = InlineImage.rtfd(attr)
-        if attr.length > 0, rtf == nil { return }
-        let record = ComposerAutosave(
+        let base = ComposerAutosave(
             // While the original account is gone, record it rather than the fallback the From popup shows:
             // restoring into another account would silently send from the wrong address (C-27).
             id: autosaveID, accountID: missingAccountID ?? account.id,
             to: (toField.objectValue as? [String]) ?? [], cc: (ccField.objectValue as? [String]) ?? [],
             bcc: (bccField.objectValue as? [String]) ?? [], subject: subjectField.stringValue,
-            bodyRTF: rtf, attachments: attachments.map { $0.url.path }, inReplyTo: inReplyTo, references: references,
+            bodyRTF: nil, attachments: attachments.map { $0.url.path }, inReplyTo: inReplyTo, references: references,
             quotedHTML: quotedHTML, quotedText: quotedText, includeOriginal: includeOriginal.state == .on,
-            draftRowID: draftRow?.id, replyRowID: replyRow?.id, saved: Date(),
-            imageWidths: InlineImage.widths(attr).map { Double($0) })
-        autosaveQueue.async { record.write() }
+            draftRowID: draftRow?.id, replyRowID: replyRow?.id, saved: Date())
+        autosaveQueue.async {
+            // RTFD keeps inline images; old autosaves are plain RTF and still load. A body that can't be
+            // encoded would replace a good autosave with an empty one, so keep the previous file (C-21).
+            let rtf = InlineImage.rtfd(attr)
+            if attr.length > 0, rtf == nil { return }
+            var record = base
+            record.bodyRTF = rtf
+            record.imageWidths = InlineImage.widths(attr).map { Double($0) }
+            record.write()
+        }
     }
 
     private func discardAutosave() {
@@ -818,10 +824,23 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
             attachments.append(OutgoingAttachment(url: url, filename: url.lastPathComponent, mimeType: MessageBuilder.mimeType(for: url)))
             attachmentSizes[url] = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
         }
+        if !missingAttachments.isEmpty {
+            // Reattaching a file the restore flagged as missing clears its warning.
+            let names = Set(urls.map { $0.standardizedFileURL.lastPathComponent })
+            missingAttachments.removeAll { names.contains($0) }
+            refreshMissingStatus()
+        }
         refreshAttachments()
         Debug.log("compose attachments: \(attachments.map { $0.filename })")
         dirty = true
         scheduleAutosave()
+    }
+
+    /// Clears the red "attachments missing" status line once no missing attachment remains.
+    private func refreshMissingStatus() {
+        guard missingAttachments.isEmpty, status.textColor == .systemRed else { return }
+        status.stringValue = ""
+        status.textColor = .secondaryLabelColor
     }
 
     /// Folders are zipped (with the system's ditto) and attached as one .zip.
@@ -1002,10 +1021,7 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
             present(a) { [weak self] r in
                 guard let self, r == .alertFirstButtonReturn else { return }
                 self.missingAttachments = []
-                if self.status.textColor == .systemRed {
-                    self.status.stringValue = ""
-                    self.status.textColor = .secondaryLabelColor
-                }
+                self.refreshMissingStatus()
                 self.send(nil)
             }
             return
@@ -1192,6 +1208,9 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
     /// may proceed. windowShouldClose doesn't run during termination (V2-01).
     func confirmBeforeQuit(_ done: @escaping (Bool) -> Void) {
         guard dirty, !sentOrDiscarded, let window else { done(true); return }
+        // A sheet on a miniaturized or hidden window is invisible and would stall quit; surface it first.
+        window.deminiaturize(nil)
+        window.makeKeyAndOrderFront(nil)
         let a = NSAlert()
         a.messageText = "Save this message as a draft?"
         a.informativeText = "Drafts are saved to the account's Drafts folder."
