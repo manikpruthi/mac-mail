@@ -15,9 +15,13 @@ MIN_MACOS="14.0"
 
 if [ "$MODE" = "release" ] || [ "$MODE" = "--release" ]; then
     OPTIMIZATION=(-O -whole-module-optimization)
-    ARCHS=(arm64 x86_64)
 else
     OPTIMIZATION=(-Onone -g)
+fi
+
+# Run the offline selftest before compiling (skip for fast local iteration).
+if [ -z "${MAC_MAIL_SKIP_SELFTEST:-}" ]; then
+    tools/selftest.sh
 fi
 
 SOURCES=()
@@ -56,8 +60,9 @@ cp Resources/Info.plist "$APP/Contents/Info.plist"
 printf 'APPL????' > "$APP/Contents/PkgInfo"
 
 # Pin the signature requirement to the bundle id so Keychain and notification grants survive rebuilds.
+# Hardened runtime is enabled without App Sandbox (sandboxing would move the cache and Keychain items).
 BUNDLE_ID="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' Resources/Info.plist)"
-codesign --force --sign - --requirements "=designated => identifier \"$BUNDLE_ID\"" "$APP"
+codesign --force --options runtime --sign - --requirements "=designated => identifier \"$BUNDLE_ID\"" "$APP"
 
 touch "$BUILD_DIR/.metadata_never_index"
 echo "Built $APP"

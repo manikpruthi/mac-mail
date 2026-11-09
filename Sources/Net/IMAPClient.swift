@@ -61,6 +61,16 @@ actor IMAPClient {
     private var commandBusy = false
     private var commandWaiters: [CheckedContinuation<Void, Never>] = []
 
+    /// Hard caps so a malicious or broken server can't balloon memory or hang the connection.
+    private enum Limits {
+        static let maxUntagged = 10_000
+        static let maxResponseBytes = 64 * 1024 * 1024
+        static let maxResponseDepth = 100
+        static let greetingTimeout: TimeInterval = 60
+        /// Extra time after IDLE's own limit for the server to answer DONE before the stream is cut.
+        static let idleGrace: TimeInterval = 30
+    }
+
     private func lockCommands() async {
         if commandBusy { await withCheckedContinuation { commandWaiters.append($0) } } else { commandBusy = true }
     }
@@ -76,7 +86,13 @@ actor IMAPClient {
         self.password = password
     }
 
-    var isConnected: Bool { stream != nil }
+    /// True only while the stream is actually open (a dropped connection shows up as isClosed).
+    var isConnected: Bool {
+        get async {
+            guard let s = stream else { return false }
+            return await !s.isClosed
+        }
+    }
     var isGmail: Bool { capabilities.contains("X-GM-EXT-1") }
     var hasCondstore: Bool { capabilities.contains("CONDSTORE") }
     var hasMove: Bool { capabilities.contains("MOVE") }
@@ -91,7 +107,7 @@ actor IMAPClient {
         try await s.open()
         stream = s
         do {
-            let greeting = try await readResponse()
+            let greeting = try await withReadTimeout(Limits.greetingTimeout) { try await self.readResponse() }
             guard greeting.status == "OK" || greeting.status == "PREAUTH" else {
                 throw NetError.protocolError(greeting.text)
             }
@@ -135,6 +151,18 @@ actor IMAPClient {
         lastSelectInfo = SelectInfo()
     }
 
+    /// Bounds a read with a watchdog that force-closes the stream, so a silent server can't hang
+    /// a command forever (the pending read fails with NetError.closed once the stream is closed).
+    private func withReadTimeout<T>(_ seconds: TimeInterval, _ body: @escaping () async throws -> T) async throws -> T {
+        let s = stream
+        let watchdog = Task {
+            try await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+            await s?.close()
+        }
+        defer { watchdog.cancel() }
+        return try await body()
+    }
+
     // MARK: Low-level
 
     private func nextTag() -> String {
@@ -145,10 +173,20 @@ actor IMAPClient {
     private func readResponse() async throws -> IMAPResponse {
         guard let s = stream else { throw NetError.closed }
         var parts: [ResponsePart] = []
+        var totalBytes = 0
         while true {
             let line = try await s.readLine()
             parts.append(.text(line))
             if let n = IMAPParser.literalLength(line) {
+                // A single response can't nest literals forever or carry unlimited bytes,
+                // however the line itself advertises the sizes.
+                guard parts.count <= Limits.maxResponseDepth else {
+                    throw NetError.protocolError("response has too many literals")
+                }
+                totalBytes += n
+                guard totalBytes <= Limits.maxResponseBytes else {
+                    throw NetError.protocolError("response too large")
+                }
                 parts.append(.literal(try await s.readBytes(n)))
             } else {
                 break
@@ -178,6 +216,9 @@ actor IMAPClient {
                 try await s.send("\(tag) \(command)\r\n")
                 for (i, lit) in literals.enumerated() {
                     while true {
+                        guard untagged.count <= Limits.maxUntagged else {
+                            throw NetError.protocolError("too many untagged responses")
+                        }
                         let r = try await readResponse()
                         if r.isContinuation { break }
                         if r.tag == tag { throw NetError.server(r.text) }
@@ -190,6 +231,9 @@ actor IMAPClient {
                 }
             }
             while true {
+                guard untagged.count <= Limits.maxUntagged else {
+                    throw NetError.protocolError("too many untagged responses")
+                }
                 let r = try await readResponse()
                 if r.tag == tag {
                     lastTaggedCode = r.code
@@ -363,10 +407,21 @@ actor IMAPClient {
             try await Task.sleep(nanoseconds: UInt64(maxSeconds * 1_000_000_000))
             await self?.endIdle()
         }
-        defer { timer.cancel(); idleTag = nil }
+        // The server must answer DONE within the grace window; a silent one gets the stream cut
+        // instead of a read that hangs forever.
+        let watchdog = Task {
+            try await Task.sleep(nanoseconds: UInt64((maxSeconds + Limits.idleGrace) * 1_000_000_000))
+            await s.close()
+        }
+        defer { timer.cancel(); watchdog.cancel(); idleTag = nil }
         var changed = false
+        var turns = 0
         do {
             while true {
+                turns += 1
+                guard turns <= Limits.maxUntagged else {
+                    throw NetError.protocolError("too many untagged responses")
+                }
                 let r = try await readResponse()
                 if r.tag == tag { return changed }
                 if r.isUntagged, r.values.count >= 2, let word = r.values[1].text?.uppercased(),
@@ -462,6 +517,8 @@ actor IMAPClient {
         defer { try? handle.close() }
         do {
             let chunk = 2 * 1024 * 1024
+            // A server that keeps sending past the advertised size (with a small margin) is cut off here.
+            let maxBytes = max(part.size, part.decodedSize) + 1024 * 1024
             var offset = 0
             var b64 = StreamingBase64Decoder()
             let enc = part.encoding.lowercased()
@@ -483,6 +540,9 @@ actor IMAPClient {
                 default: handle.write(raw)
                 }
                 offset += raw.count
+                guard offset <= maxBytes else {
+                    throw NetError.protocolError("attachment sent more data than advertised")
+                }
                 if raw.count < chunk { break }
             }
             if enc == "base64" { handle.write(b64.finish()) }
