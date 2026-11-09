@@ -40,6 +40,7 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
     private let bccField = NSTokenField()
     private let subjectField = NSTextField()
     private let textView = ComposeTextView()
+    private let formatBar = FormatBar()
     private let attachmentStack = NSStackView()
     private let attachmentScroll = NSScrollView()
     private let includeOriginal = NSButton(checkboxWithTitle: "Include original message", target: nil, action: nil)
@@ -231,6 +232,7 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
         attach.toolTip = "Attach files (⇧⌘A)"
 
         let sep1 = NSBox(); sep1.boxType = .separator
+        formatBar.textView = textView
         let sep2 = NSBox(); sep2.boxType = .separator
         // Header rows keep their natural height; the editor/original split takes the rest of the window.
         for f in [toField, ccField, bccField, subjectField] as [NSView] {
@@ -249,7 +251,7 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
         quotePane.isHidden = true
         includeOriginal.target = self
         includeOriginal.action = #selector(includeOriginalChanged)
-        for v in [grid, sep1, split, attachmentScroll, sep2, includeOriginal, status, attach, send] as [NSView] {
+        for v in [grid, sep1, formatBar, split, attachmentScroll, sep2, includeOriginal, status, attach, send] as [NSView] {
             v.translatesAutoresizingMaskIntoConstraints = false
             content.addSubview(v)
         }
@@ -260,7 +262,10 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
             sep1.topAnchor.constraint(equalTo: grid.bottomAnchor, constant: 10),
             sep1.leadingAnchor.constraint(equalTo: content.leadingAnchor),
             sep1.trailingAnchor.constraint(equalTo: content.trailingAnchor),
-            split.topAnchor.constraint(equalTo: sep1.bottomAnchor),
+            formatBar.topAnchor.constraint(equalTo: sep1.bottomAnchor, constant: 5),
+            formatBar.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 12),
+            formatBar.trailingAnchor.constraint(lessThanOrEqualTo: content.trailingAnchor, constant: -12),
+            split.topAnchor.constraint(equalTo: formatBar.bottomAnchor, constant: 5),
             split.leadingAnchor.constraint(equalTo: content.leadingAnchor),
             split.trailingAnchor.constraint(equalTo: content.trailingAnchor),
             split.bottomAnchor.constraint(equalTo: attachmentScroll.topAnchor),
@@ -1072,9 +1077,30 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
                        + " drag To→Cc moves the address (to=\(to) cc=\(cc))")
             out.append((window?.title == "Lunch plans" ? "PASS" : "FAIL") + " window title follows subject (\(window?.title ?? "nil"))")
             out.append((Self.composersNeedingSave.contains(self) ? "PASS" : "FAIL") + " dirty composer is asked on quit")
+            out += formatSelfTest()
             out += inlineImageSelfTest()
             done(out)
         }
+    }
+
+    /// Selects a word, sets Georgia 18 bold from the format bar, and checks the bar and the sent HTML follow.
+    private func formatSelfTest() -> [String] {
+        let storage = textView.textStorage!
+        let start = storage.length
+        textView.setSelectedRange(NSRange(location: start, length: 0))
+        textView.insertText("Styled", replacementRange: textView.selectedRange())
+        textView.setSelectedRange(NSRange(location: start, length: 6))
+        textView.breakUndoCoalescing()
+        textView.undoManager?.beginUndoGrouping()
+        formatBar.selfTestApply(family: "Georgia", size: 18, boldSegment: true)
+        textView.undoManager?.endUndoGrouping()
+        let state = formatBar.selfTestState
+        let html = buildMessage()?.htmlBody ?? ""
+        let ok = state == "Georgia/18/b=true" && html.contains("<b>Styled</b>") && html.contains("font-size:18px")
+            && html.contains("font-family:'Georgia',serif")
+        textView.undoManager?.undoNestedGroup()
+        let undone = storage.length > start && (storage.attribute(.font, at: start, effectiveRange: nil) as? NSFont)?.pointSize != 18
+        return [(ok && undone ? "PASS" : "FAIL") + " format bar sets font/size/bold, sent HTML follows, undo works (state=\(state))"]
     }
 
     /// Pastes a copied image file and a text file the way Finder / Mac Explorer put them on the pasteboard
@@ -1213,6 +1239,18 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
     func textDidChange(_ notification: Notification) {
         dirty = true
         scheduleAutosave()
+        formatBar.refresh()
+    }
+
+    func textViewDidChangeSelection(_ notification: Notification) {
+        formatBar.refresh()
+    }
+
+    func textView(_ textView: NSTextView, shouldChangeTypingAttributes old: [String: Any],
+                  toAttributes new: [NSAttributedString.Key: Any]) -> [NSAttributedString.Key: Any] {
+        // ⌘B/⌘I/⌘U with nothing selected only change typing attributes; keep the bar in step.
+        DispatchQueue.main.async { [weak self] in self?.formatBar.refresh() }
+        return new
     }
 
     // MARK: Address completion
@@ -1623,7 +1661,10 @@ enum RichText {
                 if traits.contains(.italic) { text = "<i>\(text)</i>" }
                 if abs(font.pointSize - 14) > 0.5 { styles.append("font-size:\(Int(font.pointSize))px") }
                 if let family = font.familyName, !family.hasPrefix(".") && family != NSFont.systemFont(ofSize: 14).familyName {
-                    styles.append("font-family:'\(family)'")
+                    // A generic fallback keeps the look close when the recipient lacks the font.
+                    let generic = font.isFixedPitch ? "monospace"
+                        : ["Georgia", "Times New Roman", "Times"].contains(family) ? "serif" : "sans-serif"
+                    styles.append("font-family:'\(family.replacingOccurrences(of: "'", with: ""))',\(generic)")
                 }
             }
             if let u = attrs[.underlineStyle] as? Int, u != 0 { text = "<u>\(text)</u>" }

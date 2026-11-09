@@ -66,7 +66,7 @@ Graphic emails look the way the sender designed them. Small images load automati
   - Replies and forwards show the original email under what you type, rendered the way it looked; drag the divider to resize it. That's what's quoted when you send. Untick "Include original message" to leave it out.
   - Drag an address between To, Cc and Bcc to move it. Copy and paste still copies.
   - Replies clean up addresses that some senders write as links (`<mailto:help@bank.in.>`), which Gmail would otherwise reject with "553-5.1.3 not a valid RFC 5321 address".
-  - Rich text with bold, italic, underline, colours and links.
+  - **Formatting bar**, Outlook-style but minimal: font (System, Arial, Helvetica, Verdana, Georgia, Times New Roman, Courier New, or More Fonts… for the font panel), size (10–32 pt), **B** / *I* / U / S toggles that light up for the text under the cursor, text colour (Automatic follows light/dark mode, six preset colours, More Colours…) and clear formatting. ⌘B, ⌘I and ⌘U work too, everything undoes with ⌘Z, and links are kept. Formatting goes out as plain inline HTML (`<b>`, `<i>`, `font-size`, `font-family` with a serif/sans-serif/monospace fallback), so it looks the same in Outlook, Gmail and Apple Mail; unformatted mail is sent exactly as before.
   - Per-account signatures.
   - Address autocomplete from your mail.
   - Drafts saved to the server, with Bcc, attachments and reply threading restored when you reopen one. Reopened attachments are downloaded before Save or Send is allowed, and the old draft is removed only after its replacement is confirmed on the server (found by its Message-ID, never by subject).
@@ -257,7 +257,7 @@ mac-mail/
 │   ├── Mail/                MIME decoding, BODYSTRUCTURE, .eml reader, message builder, address/header safety, search parser
 │   ├── Sync/                AccountEngine (sync, IDLE, actions, folders), MailService (undo, send states), Outbox, demo data
 │   └── UI/                  main window, sidebar, message list, search filter bar, preview, message window, .eml viewer,
-│                            shared message actions, image loader, attachments, compose (autosave), settings
+│                            shared message actions, image loader, attachments, compose (autosave, formatting bar), settings
 ├── Tests/SelfTest.swift     offline checks: protocol, MIME, .eml, cache, sanitiser, outbox (tools/selftest.sh)
 ├── tools/
 │   ├── selftest.sh
