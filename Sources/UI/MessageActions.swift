@@ -51,7 +51,8 @@ enum MessageActions {
                 do {
                     guard let engine = MailService.shared.engine(row.accountID) else { throw NetError.server("Account not found") }
                     let data = try await engine.rawMessage(messageID: row.id)
-                    try data.write(to: url, options: .atomic)
+                    // Write off the main thread: a large message must not stall the UI.
+                    try await Task.detached { try data.write(to: url, options: .atomic) }.value
                     toast("Saved \(url.lastPathComponent)")
                 } catch {
                     let a = NSAlert(error: error)
