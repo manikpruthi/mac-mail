@@ -391,6 +391,16 @@ final class MailService {
         case failed(Error)
     }
 
+    /// Shown when the final "." went out but no reply confirmed it: the server may have delivered the
+    /// message, so it must not be queued or retried automatically (F-01).
+    nonisolated static let deliveryUncertain =
+        "Delivery uncertain: the server didn't confirm the message, so it may already have been sent. Check Sent before trying again."
+
+    /// A send whose outcome the server never confirmed (F-01).
+    struct DeliveryUncertainError: Error, LocalizedError {
+        var errorDescription: String? { MailService.deliveryUncertain }
+    }
+
     private var pendingSends: [UUID: Task<Void, Never>] = [:]
     private var sendStates: [UUID: SendState] = [:]
     private var undoHandlers: [UUID: () -> Void] = [:]
@@ -427,12 +437,17 @@ final class MailService {
                 // The safety copy failed; the send itself can still go out.
             }
             let safetyDraft = safetyDraftID.flatMap { self.store.rows(ids: [$0]).first }
+            var finishing = false
             do {
-                try await engine.send(message)
+                try await engine.send(message, progress: { if case .finishing = $0 { finishing = true } })
                 self.afterSent(engine: engine, safetyDraft: safetyDraft, replyTo: p.replyTo, draftToDelete: p.draftToDelete)
                 onResult(.sent)
             } catch {
-                if Self.isOffline(error) {
+                if finishing, Self.isOffline(error) {
+                    // The final "." went out but the reply never came: queueing the same MIME could deliver
+                    // it twice (F-01). Keep the safety draft and tell the user to check Sent.
+                    onResult(.failed(DeliveryUncertainError()))
+                } else if Self.isOffline(error) {
                     // Network trouble, not a refusal: park it in the outbox instead of failing (F-07).
                     do {
                         try self.outbox.add(message, accountID: p.accountID, replyToID: p.replyTo?.id,
@@ -508,12 +523,19 @@ final class MailService {
         Task {
             defer { flushingOutbox = false }
             var sent = 0
-            for item in outbox.items where item.lastError == nil || item.attempts < 5 {
-                guard let engine = engines[item.accountID], let account = account(item.accountID) else { continue }
+            for item in outbox.items where item.lastError == nil || item.attempts < Outbox.maxAttempts {
+                guard let engine = engines[item.accountID], let account = account(item.accountID) else {
+                    // The account is gone, so the message can never go out on its own: show it as failed
+                    // instead of skipping it forever (F-23).
+                    outbox.markNeedsDecision(item.id, reason: "The account this message belongs to was removed.")
+                    continue
+                }
+                var finishing = false
                 do {
                     let data = try outbox.data(item)
                     let endpoint = try await engine.smtpEndpoint
-                    try await SMTPClient.send(endpoint, from: account.email, recipients: item.recipients, message: data)
+                    try await SMTPClient.send(endpoint, from: account.email, recipients: item.recipients, message: data,
+                                              progress: { if case .finishing = $0 { finishing = true } })
                     if !engine.isGmail, let sentFolder = store.folder(account: account.id, role: .sent) {
                         Task { try? await engine.appendCopy(data, to: sentFolder) }
                     }
@@ -524,6 +546,12 @@ final class MailService {
                     outbox.remove(item.id)
                     sent += 1
                 } catch {
+                    if finishing, Self.isOffline(error) {
+                        // The server may already have accepted this message: a retry could deliver it twice
+                        // (F-01). Keep it for Retry/Delete, and stop on what is probably a dead connection.
+                        outbox.markNeedsDecision(item.id, reason: Self.deliveryUncertain)
+                        break
+                    }
                     outbox.recordFailure(item.id, error: Self.isOffline(error) ? nil : error)
                     if Self.isOffline(error) { break }
                 }

@@ -676,5 +676,70 @@ do {
     try? FileManager.default.removeItem(at: pngFile)
 }
 
+// F-05 / F-19: an undeletable folder stays queued (not forgotten and sent again); a record staged before
+// the MIME finishes a commit a crash interrupted.
+MainActor.assumeIsolated {
+    let stagedDir = scratchDir("outbox-staged-\(UUID().uuidString)")
+    let id = UUID().uuidString
+    let folder = stagedDir.appendingPathComponent(id, isDirectory: true)
+    try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+    let staged = #"{"id":"\#(id)","accountID":"acc","recipients":["z@example.com"],"subject":"staged","created":6500000000,"attempts":0}"#
+    try? Data(staged.utf8).write(to: folder.appendingPathComponent("item.json.tmp"))
+    try? Data("From: m@example.com\r\nSubject: staged\r\n\r\nbody\r\n".utf8)
+        .write(to: folder.appendingPathComponent("message.eml"))
+    let recovered = Outbox(directory: stagedDir)
+    check("staged record recovered", recovered.items.count == 1 && recovered.items.first?.id == id
+          && recovered.items.first?.recipients == ["z@example.com"]
+          && FileManager.default.fileExists(atPath: folder.appendingPathComponent("item.json").path)
+          && !FileManager.default.fileExists(atPath: folder.appendingPathComponent("item.json.tmp").path))
+    check("recovered item reloads", Outbox(directory: stagedDir).items.count == 1)
+
+    // Without a MIME there is nothing sendable, so the folder stays quarantined.
+    let noMimeDir = scratchDir("outbox-staged-nomime-\(UUID().uuidString)")
+    let orphan = noMimeDir.appendingPathComponent(UUID().uuidString, isDirectory: true)
+    try? FileManager.default.createDirectory(at: orphan, withIntermediateDirectories: true)
+    try? Data(#"{"id":"\#(orphan.lastPathComponent)","accountID":"acc","recipients":[],"subject":"s","created":6500000000,"attempts":0}"#.utf8)
+        .write(to: orphan.appendingPathComponent("item.json.tmp"))
+    check("staged record without mime isn't loaded", Outbox(directory: noMimeDir).items.isEmpty
+          && waitFor { !FileManager.default.fileExists(atPath: orphan.path)
+                       && FileManager.default.fileExists(atPath: noMimeDir.path + " Corrupt") })
+
+    // The rest stores records with Foundation's atomic write, which this sandbox may deny (see the probe).
+    guard atomicWritesWork else {
+        check("outbox delete failure and decision marker (skipped: sandbox denies atomic writes)", true)
+        return
+    }
+    let dir = scratchDir("outbox-remove-\(UUID().uuidString)")
+    let box = Outbox(directory: dir)
+    do { try box.add(msg, accountID: "acc", replyToID: nil, draftToDeleteID: nil, safetyDraftID: nil) }
+    catch { check("outbox add for remove test", false) }
+    guard let item = box.items.first else { check("outbox add for remove test", false); return }
+
+    // A locked folder can't be removed; unlike a read-only parent this leaves its files intact.
+    let itemFolder = dir.appendingPathComponent(item.id, isDirectory: true)
+    try? FileManager.default.setAttributes([.immutable: true], ofItemAtPath: itemFolder.path)
+    box.remove(item.id)
+    try? FileManager.default.setAttributes([.immutable: false], ofItemAtPath: itemFolder.path)
+    check("failed delete keeps the item", box.items.count == 1
+          && (box.items.first?.lastError?.contains("Couldn't delete") ?? false))
+    check("failed delete survives relaunch", Outbox(directory: dir).items.count == 1)
+    box.remove(item.id)
+    check("delete works once the folder can go", box.items.isEmpty && Outbox(directory: dir).items.isEmpty)
+
+    // F-01 / F-23: a terminal failure blocks automatic retries until the user retries or deletes.
+    let retryDir = scratchDir("outbox-decision-\(UUID().uuidString)")
+    let rbox = Outbox(directory: retryDir)
+    do { try rbox.add(msg, accountID: "acc", replyToID: nil, draftToDeleteID: nil, safetyDraftID: nil) }
+    catch { check("outbox add for decision test", false) }
+    if let r = rbox.items.first {
+        rbox.markNeedsDecision(r.id, reason: "delivery uncertain")
+        check("decision blocks auto retry", rbox.items.first?.lastError == "delivery uncertain"
+              && rbox.items.first?.attempts == Outbox.maxAttempts)
+        check("decision persists", Outbox(directory: retryDir).items.first?.lastError == "delivery uncertain")
+        rbox.resetFailure(r.id)
+        check("retry clears the decision", rbox.items.first?.lastError == nil && rbox.items.first?.attempts == 0)
+    }
+}
+
 print(failures == 0 ? "ALL PASS" : "\(failures) FAILED")
 exit(failures == 0 ? 0 : 1)
