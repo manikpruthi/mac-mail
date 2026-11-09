@@ -39,6 +39,8 @@ final class MessageListViewController: NSViewController, NSOutlineViewDataSource
     private var searchFolderID: Int64?
     private var searchToken = 0
     private var reloadScheduled = false
+    /// Guards "Load older" button updates from a folder the user has since left (W-17).
+    private var loadToken = 0
     /// Rows loaded per folder/unified view (O-05); "Show more" grows it before asking the server for older mail.
     private static let pageSize = 1000
     private var fetchLimit = MessageListViewController.pageSize
@@ -156,8 +158,12 @@ final class MessageListViewController: NSViewController, NSOutlineViewDataSource
         if case .search = source {} else { searchRows = [] }
         grouped = Prefs.groupByConversation(folderKey: folderKey)
         groupToggle.state = grouped ? .on : .off
+        // A "Load older" still in flight belongs to the folder being left (W-17).
+        loadToken += 1
+        olderSpinner.stopAnimation(nil)
         reload(keepSelection: false)
-        outline.scrollRowToVisible(0)
+        // An empty folder has no row 0 to scroll to (W-17).
+        if outline.numberOfRows > 0 { outline.scrollRowToVisible(0) }
     }
 
     private var folderKey: String {
@@ -171,24 +177,27 @@ final class MessageListViewController: NSViewController, NSOutlineViewDataSource
     }
 
     @objc private func dataChanged(_ note: Notification) {
-        // Read/flag changes: patch the affected rows in place instead of re-querying the whole folder.
         let change = note.mailDataChange
+        // An explicit reload may already cover this `.all` change (B-24 / O-18). Consume the marker before
+        // the early returns below, so a change handled here can't swallow a later, unrelated one (C-12).
+        let coveredByExplicitReload = skipNextFullReload
+        skipNextFullReload = false
+        // Read/flag changes: patch the affected rows in place, unless the view filters on those flags (C-11).
         if case .flags(let ids) = change {
-            updateFlagsInPlace(Set(ids))
+            if updateFlagsInPlace(Set(ids)) { return }
+            refreshSearchRows()
+            reload(keepSelection: true)
             return
         }
         if case .search = source {
             // Moves/deletes/new mail must be reflected in the live results: refresh the local search
             // (cheap FTS query), keeping selection and expansion via reload(keepSelection:).
-            searchRows = Self.dedupe(MailService.shared.store.search(currentQuery, folderID: scopeFolderID))
+            refreshSearchRows()
             reload(keepSelection: true)
             return
         }
         if case .folder(let fid) = change, case .folder(let current) = source, fid != current { return }
-        if case .all = change, skipNextFullReload {
-            skipNextFullReload = false
-            return
-        }
+        if case .all = change, coveredByExplicitReload { return }
         // Coalesce bursts (initial sync posts once per chunk).
         guard !reloadScheduled else { return }
         reloadScheduled = true
@@ -199,17 +208,69 @@ final class MessageListViewController: NSViewController, NSOutlineViewDataSource
         }
     }
 
-    private func updateFlagsInPlace(_ ids: Set<Int64>) {
+    /// Re-runs the local search for the live results. Search rows come from here, not from reload(),
+    /// because a finished server search replaces them with its merged result.
+    private func refreshSearchRows() {
+        guard case .search = source else { return }
+        searchRows = Self.dedupe(MailService.shared.store.search(currentQuery, folderID: scopeFolderID))
+    }
+
+    /// Whether the current view's membership depends on read/flag state (All Flagged, is:unread, is:starred).
+    private var viewDependsOnFlags: Bool {
+        switch source {
+        case .flagged:
+            return true
+        case .search:
+            let q = currentQuery
+            return q.unread || q.flagged
+        default:
+            return false
+        }
+    }
+
+    private func flagsMatchSource(_ flags: MessageFlags) -> Bool {
+        switch source {
+        case .flagged:
+            return flags.contains(.flagged)
+        case .search:
+            let q = currentQuery
+            if q.unread && flags.contains(.seen) { return false }
+            if q.flagged && !flags.contains(.flagged) { return false }
+            return true
+        default:
+            return true
+        }
+    }
+
+    /// Patches read/flag changes into the displayed rows. Returns false without touching anything when the
+    /// view filters on flags and the change adds or removes a row, so the caller reloads instead (C-11).
+    @discardableResult
+    private func updateFlagsInPlace(_ ids: Set<Int64>) -> Bool {
         let t0 = Date()
         let fresh = MailService.shared.store.flags(ids: Array(ids))
+        if viewDependsOnFlags {
+            for id in ids {
+                guard let f = fresh[id] else { continue }
+                // Displayed (nodeIndex) and still matching, or hidden and still not matching: no reload.
+                if flagsMatchSource(f) == (nodeIndex[id] != nil) { continue }
+                return false
+            }
+        }
         var changedRows = IndexSet()
         // Only the touched messages, their thread header and (if expanded) their own child row (O-12).
         for id in ids {
-            guard let node = nodeIndex[id] else { continue }
-            for row in node.allRows where row.id == id { if let f = fresh[id] { row.flags = f } }
+            guard let node = nodeIndex[id], let f = fresh[id] else { continue }
+            let child = node.children?.first { $0.row.id == id }
+            if node.row.id == id {
+                node.row.flags = f
+            } else if let child {
+                child.row.flags = f
+            } else {
+                continue
+            }
             let r = outline.row(forItem: node)
             if r >= 0 { changedRows.insert(r) }
-            if let child = node.children?.first(where: { $0.row.id == id }) {
+            if let child {
                 let cr = outline.row(forItem: child)
                 if cr >= 0 { changedRows.insert(cr) }
             }
@@ -217,14 +278,21 @@ final class MessageListViewController: NSViewController, NSOutlineViewDataSource
         if !changedRows.isEmpty { outline.reloadData(forRowIndexes: changedRows, columnIndexes: [0]) }
         updateSubtitle()
         Debug.log("flags patched in place (\(changedRows.count) rows): \(Debug.ms(since: t0))")
+        return true
     }
 
-    private var allRows: [MessageRow] { nodes.flatMap { $0.allRows } }
-
     private func updateSubtitle() {
-        let rows = allRows
-        let unread = rows.filter { !$0.flags.contains(.seen) }.count
-        var sub = "\(rows.count) message\(rows.count == 1 ? "" : "s")"
+        var total = 0, unread = 0
+        for n in nodes {
+            if let children = n.children {
+                total += children.count
+                unread += children.reduce(0) { $0 + ($1.row.flags.contains(.seen) ? 0 : 1) }
+            } else {
+                total += 1
+                if !n.row.flags.contains(.seen) { unread += 1 }
+            }
+        }
+        var sub = "\(total) message\(total == 1 ? "" : "s")"
         if unread > 0 { sub += " · \(unread) unread" }
         if case .search = source {
             if serverSearching { sub += " · searching the server…" }
@@ -233,25 +301,76 @@ final class MessageListViewController: NSViewController, NSOutlineViewDataSource
         subtitle.stringValue = sub
     }
 
+    /// The order to ask SQL for: nil for sender/subject, whose localized comparison happens in memory.
+    private var sqlAscending: Bool? {
+        switch Prefs.sortOrder {
+        case .dateAsc: return true
+        case .dateDesc: return false
+        case .sender, .subject: return nil
+        }
+    }
+
+    /// Upper bound for the widening below, so a duplicate-heavy unified view can't keep growing the probe.
+    private static let maxProbeRows = 20_000
+
+    /// The visible page plus whether the cache holds more. One extra row is fetched; duplicates are removed
+    /// before counting (C-36), and the window grows when duplicate Gmail copies swallowed the probe row.
+    private func page(_ fetch: (Int) -> [MessageRow]) -> (rows: [MessageRow], more: Bool) {
+        var window = fetchLimit + 1
+        while true {
+            let raw = fetch(window)
+            let unique = source.isUnified ? Self.dedupe(raw) : raw
+            if unique.count > fetchLimit { return (Array(unique.prefix(fetchLimit)), true) }
+            if raw.count < window || window >= Self.maxProbeRows { return (unique, false) }
+            window = min(Self.maxProbeRows, window + raw.count - unique.count + 1)
+        }
+    }
+
     func reload(keepSelection: Bool) {
         let t0 = Date()
         defer { Debug.log("list reload (\(nodes.count) rows): \(Debug.ms(since: t0))") }
         let store = MailService.shared.store
-        // Rebuilding the nodes changes item identity, so remember which threads were expanded and
-        // which messages were selected (including thread children) and restore them by id.
-        var expandedIDs = Set<Int64>()
-        var selectedIDs = Set<Int64>()
+        // Rebuilding the nodes changes item identity, so remember which threads were expanded and which
+        // rows were selected, then restore them by id.
+        var expandedThreads = Set<String>()
+        var selectedThreads = Set<Int64>()
+        var selectedMessages = Set<Int64>()
+        var previousFocus: Int64?
+        var previousCount = 0
         if keepSelection {
+            previousFocus = focusedRow?.id
+            previousCount = selectedRows.count
             for r in 0..<outline.numberOfRows {
                 guard let n = outline.item(atRow: r) as? ListNode else { continue }
-                if n.isThread && outline.isItemExpanded(n) { expandedIDs.insert(n.row.id) }
+                // Keyed by conversation, not by the header message, which changes when newer mail arrives.
+                if n.children != nil && outline.isItemExpanded(n) { expandedThreads.insert(Self.threadKey(n.row)) }
+                if outline.parent(forItem: n) != nil { selectedMessages.insert(n.row.id) }
+                else { selectedThreads.insert(n.row.id) }
             }
-            selectedIDs = Set(outline.selectedRowIndexes.compactMap { outline.item(atRow: $0) as? ListNode }
-                .flatMap { $0.allRows.map { $0.id } })
         }
         var rows: [MessageRow]
-        // One past the window tells whether more cached rows exist than are shown (O-05).
-        let window = fetchLimit + 1
+        var more = false
+        let ascending = sqlAscending ?? false
+        switch source {
+        case .unified:
+            (rows, more) = page { store.listUnifiedRows(role: .inbox, limit: $0, ascending: ascending) }
+            titleLabel.stringValue = "All Inboxes"
+        case .unifiedRole(let role):
+            (rows, more) = page { store.listUnifiedRows(role: role, limit: $0, ascending: ascending) }
+            titleLabel.stringValue = "All " + Self.roleTitle(role)
+        case .flagged:
+            (rows, more) = page { store.listFlaggedRows(limit: $0, ascending: ascending) }
+            titleLabel.stringValue = "All Flagged"
+        case .folder(let id):
+            (rows, more) = page { store.listRows(folderID: id, limit: $0, ascending: ascending) }
+            titleLabel.stringValue = store.folder(id)?.name ?? "Folder"
+        case .search(let q):
+            titleLabel.stringValue = "Search: \(q)"
+            // Search rows are already in memory (newest first): order them here, then page locally (C-36).
+            let ordered = Prefs.sortOrder == .dateAsc ? Array(searchRows.reversed()) : searchRows
+            (rows, more) = page { _ in ordered }
+        }
+        moreLocalRows = more
         func caughtUp(_ hiddenWhenNotCaughtUp: Bool) {
             if allCaughtUp {
                 olderButton.isHidden = false
@@ -268,30 +387,9 @@ final class MessageListViewController: NSViewController, NSOutlineViewDataSource
             }
         }
         switch source {
-        case .unified:
-            rows = store.unifiedInboxRows(limit: window)
-            titleLabel.stringValue = "All Inboxes"
-        case .unifiedRole(let role):
-            rows = store.unifiedRows(role: role, limit: window)
-            titleLabel.stringValue = "All " + Self.roleTitle(role)
-        case .flagged:
-            rows = store.flaggedRows(limit: window)
-            titleLabel.stringValue = "All Flagged"
-        case .folder(let id):
-            rows = store.rows(folderID: id, limit: window)
-            titleLabel.stringValue = store.folder(id)?.name ?? "Folder"
-        case .search(let q):
-            rows = searchRows
-            titleLabel.stringValue = "Search: \(q)"
-        }
-        moreLocalRows = rows.count > fetchLimit
-        if moreLocalRows { rows.removeLast(rows.count - fetchLimit) }
-        switch source {
         case .folder: caughtUp(rows.count < 50)
-        case .search: olderButton.isHidden = true
         default: caughtUp(true)
         }
-        if source.isUnified { rows = Self.dedupe(rows) }
         var fresh = grouped ? Self.group(rows) : rows.map { ListNode(row: $0) }
         fresh = Self.sorted(fresh, by: Prefs.sortOrder)
         // Same messages in the same order (most syncs and prefetches): patch the changed rows in place.
@@ -303,51 +401,120 @@ final class MessageListViewController: NSViewController, NSOutlineViewDataSource
         }
         nodes = fresh
         nodeIndex = [:]
-        for n in nodes { for r in n.allRows { nodeIndex[r.id] = n } }
+        for n in nodes {
+            if let children = n.children {
+                for c in children { nodeIndex[c.row.id] = n }
+            } else {
+                nodeIndex[n.row.id] = n
+            }
+        }
         updateSubtitle()
         updateEmptyLabel(rows: rows)
+        // A folder/query switch must not keep a stale selection: reloadData can preserve row indexes, and
+        // the caller then selects explicitly.
+        if !keepSelection {
+            suppressSelection = true
+            outline.deselectAll(nil)
+            suppressSelection = false
+        }
         outline.reloadData()
-        // Expand by item identity from the model, not a row range captured before rows were inserted (B-17).
-        for n in nodes where n.isThread && expandedIDs.contains(n.row.id) {
+        // Expand by conversation from the model, not a row range captured before rows were inserted (B-17).
+        for n in nodes where n.children != nil && expandedThreads.contains(Self.threadKey(n.row)) {
             outline.expandItem(n)
         }
-        if keepSelection && !selectedIDs.isEmpty {
-            var idx = IndexSet()
-            for r in 0..<outline.numberOfRows {
-                if let n = outline.item(atRow: r) as? ListNode, n.allRows.contains(where: { selectedIDs.contains($0.id) }) { idx.insert(r) }
-            }
-            suppressSelection = true
-            outline.selectRowIndexes(idx, byExtendingSelection: false)
-            suppressSelection = false
-            // Everything that was selected is gone (moved or deleted elsewhere): the preview must not keep
-            // showing it with no selection in the list (B-07).
-            if idx.isEmpty { onSelectionChange?([], false) }
+        if keepSelection {
+            restoreSelection(threads: selectedThreads, messages: selectedMessages,
+                             previousFocus: previousFocus, previousCount: previousCount)
         }
     }
 
-    /// If `fresh` lists exactly the messages already shown (same ids, same thread shape, same order),
+    /// Restores the selection after a rebuild. A thread's child row wins over its header and the header is
+    /// selected instead only when that child isn't visible, so one message is never selected twice (C-05).
+    private func restoreSelection(threads: Set<Int64>, messages: Set<Int64>,
+                                  previousFocus: Int64?, previousCount: Int) {
+        guard !threads.isEmpty || !messages.isEmpty else { return }
+        var idx = IndexSet()
+        var covered = Set<Int64>() // top-level nodes that already show a selected row
+        var matched = Set<Int64>() // selected message ids whose own row is visible
+        let headerIDs = Set(nodes.map { $0.row.id })
+        for r in 0..<outline.numberOfRows {
+            guard let n = outline.item(atRow: r) as? ListNode else { continue }
+            if outline.parent(forItem: n) != nil {
+                // A selected header whose thread got a newer message is now that thread's child row.
+                guard messages.contains(n.row.id) || (threads.contains(n.row.id) && !headerIDs.contains(n.row.id)) else { continue }
+                idx.insert(r)
+                matched.insert(n.row.id)
+                if let top = nodeIndex[n.row.id] { covered.insert(top.row.id) }
+            } else if threads.contains(n.row.id) {
+                idx.insert(r)
+                matched.insert(n.row.id)
+                covered.insert(n.row.id)
+            }
+        }
+        // A selected message whose own row isn't visible (collapsed thread) selects its thread header.
+        for id in messages.union(threads) where !matched.contains(id) {
+            guard let n = nodeIndex[id], !covered.contains(n.row.id) else { continue }
+            let r = outline.row(forItem: n)
+            if r >= 0 {
+                idx.insert(r)
+                covered.insert(n.row.id)
+            }
+        }
+        suppressSelection = true
+        outline.selectRowIndexes(idx, byExtendingSelection: false)
+        suppressSelection = false
+        // Everything that was selected is gone (moved or deleted elsewhere): the preview must not keep
+        // showing it with no selection in the list (B-07).
+        if idx.isEmpty {
+            onSelectionChange?([], false)
+        } else if focusedRow?.id != previousFocus || selectedRows.count != previousCount {
+            // The selection survived but changed shape (a message left it, or a multi-selection narrowed):
+            // the pane must not keep describing the old one.
+            onSelectionChange?(selectedRows, false)
+        }
+    }
+
+    /// Fields that can't be patched into an existing row: a change means the row must be re-created (B-35).
+    private static func sameHeader(_ a: MessageRow, _ b: MessageRow) -> Bool {
+        a.id == b.id && a.folderID == b.folderID && a.date == b.date && a.subject == b.subject
+            && a.fromName == b.fromName && a.fromAddr == b.fromAddr && a.toList == b.toList
+            && a.hasAttachments == b.hasAttachments && a.folderRole == b.folderRole
+    }
+
+    /// If `fresh` lists exactly the messages already shown (same headers, same thread shape, same order),
     /// copies the changed flags/snippets into the existing row objects and redraws only those rows.
     /// Returns false when the structure changed and a full reload is needed.
     private func patchInPlace(with fresh: [ListNode]) -> Bool {
         guard fresh.count == nodes.count, !nodes.isEmpty else { return false }
         var changed = IndexSet()
         for (old, new) in zip(nodes, fresh) {
-            let oldRows = old.allRows, newRows = new.allRows
-            guard old.row.id == new.row.id, old.isThread == new.isThread, oldRows.count == newRows.count else { return false }
-            if zip(oldRows, newRows).contains(where: { $0.id != $1.id }) { return false }
-            var touched = false
-            for (o, n) in zip(oldRows, newRows) where o.flags != n.flags || o.snippet != n.snippet {
-                o.flags = n.flags
-                o.snippet = n.snippet
-                touched = true
-                if let child = old.children?.first(where: { $0.row.id == o.id }) {
-                    let cr = outline.row(forItem: child)
+            guard old.isThread == new.isThread, Self.sameHeader(old.row, new.row) else { return false }
+            switch (old.children, new.children) {
+            case (nil, nil):
+                if old.row.flags != new.row.flags || old.row.snippet != new.row.snippet {
+                    old.row.flags = new.row.flags
+                    old.row.snippet = new.row.snippet
+                    let r = outline.row(forItem: old)
+                    if r >= 0 { changed.insert(r) }
+                }
+            case let (oldChildren?, newChildren?):
+                guard oldChildren.count == newChildren.count,
+                      !zip(oldChildren, newChildren).contains(where: { !Self.sameHeader($0.row, $1.row) })
+                else { return false }
+                var touched = false
+                for (o, n) in zip(oldChildren, newChildren) where o.row.flags != n.row.flags || o.row.snippet != n.row.snippet {
+                    o.row.flags = n.row.flags
+                    o.row.snippet = n.row.snippet
+                    touched = true
+                    let cr = outline.row(forItem: o)
                     if cr >= 0 { changed.insert(cr) }
                 }
-            }
-            if touched {
-                let r = outline.row(forItem: old)
-                if r >= 0 { changed.insert(r) }
+                if touched {
+                    let r = outline.row(forItem: old)
+                    if r >= 0 { changed.insert(r) }
+                }
+            default:
+                return false
             }
         }
         if !changed.isEmpty { outline.reloadData(forRowIndexes: changed, columnIndexes: [0]) }
@@ -366,11 +533,11 @@ final class MessageListViewController: NSViewController, NSOutlineViewDataSource
         }
     }
 
-    /// Applies the View ▸ Sort By order (F-24). Threads sort by their newest message.
+    /// Applies the View ▸ Sort By order (F-24). The date orders are already applied by the query and keep
+    /// each thread's children in the same direction, so only the localized sorts happen here (C-13).
     static func sorted(_ nodes: [ListNode], by order: Prefs.SortOrder) -> [ListNode] {
         switch order {
-        case .dateDesc: return nodes
-        case .dateAsc: return nodes.reversed()
+        case .dateDesc, .dateAsc: return nodes
         case .sender:
             return nodes.sorted {
                 let a = $0.row.senderDisplay.localizedLowercase, b = $1.row.senderDisplay.localizedLowercase
@@ -410,7 +577,7 @@ final class MessageListViewController: NSViewController, NSOutlineViewDataSource
         var order: [String] = []
         var buckets: [String: [MessageRow]] = [:]
         for r in rows {
-            let key = "\(r.accountID):\(r.threadID)"
+            let key = threadKey(r)
             if buckets[key] == nil { order.append(key); buckets[key] = [] }
             buckets[key]!.append(r)
         }
@@ -420,6 +587,9 @@ final class MessageListViewController: NSViewController, NSOutlineViewDataSource
             return ListNode(row: list[0], children: list.map { ListNode(row: $0) })
         }
     }
+
+    /// A conversation's identity, independent of which message currently heads it.
+    static func threadKey(_ row: MessageRow) -> String { "\(row.accountID):\(row.threadID)" }
 
     // MARK: Search
 
@@ -453,20 +623,36 @@ final class MessageListViewController: NSViewController, NSOutlineViewDataSource
         serverSearchError = nil
         // The superseded server search returns early without resetting this (B-18).
         serverSearching = false
+        allCaughtUp = false
+        // A "Load older" still in flight belongs to the folder being left (W-17).
+        loadToken += 1
+        olderSpinner.stopAnimation(nil)
+        // A new query starts a new page window.
+        fetchLimit = Self.pageSize
         // Any query change invalidates an in-flight server search for the older query.
         searchToken += 1
         searchRows = Self.dedupe(MailService.shared.store.search(currentQuery, folderID: scopeFolderID))
         grouped = Prefs.groupByConversation(folderKey: "search")
         groupToggle.state = grouped ? .on : .off
+        let hadSelection = !outline.selectedRowIndexes.isEmpty
         reload(keepSelection: false)
+        // Nothing is open until the user picks a result: the preview must not keep showing a message the
+        // new results no longer list (C-14).
+        if hadSelection { onSelectionChange?([], false) }
     }
 
     private var filterWork: DispatchWorkItem?
 
     private func filtersChanged() {
         guard case .search = source else { return }
+        // A filter change invalidates an in-flight server search for the old filters (B-18).
+        searchToken += 1
+        serverSearching = false
+        fetchLimit = Self.pageSize
         searchRows = Self.dedupe(MailService.shared.store.search(currentQuery, folderID: scopeFolderID))
+        let hadSelection = !outline.selectedRowIndexes.isEmpty
         reload(keepSelection: false)
+        if hadSelection { onSelectionChange?([], false) }
         filterWork?.cancel()
         let work = DispatchWorkItem { [weak self] in self?.runServerSearch() }
         filterWork = work
@@ -598,17 +784,21 @@ final class MessageListViewController: NSViewController, NSOutlineViewDataSource
 
     @objc private func loadOlder() {
         if moreLocalRows {
-            // More is already cached: page it in before going to the server (O-05).
+            // More is already cached: page it in before going to the server (O-05). Works for search too (C-36).
             fetchLimit += Self.pageSize
             reload(keepSelection: true)
             return
         }
         guard case .folder(let id) = source, let f = MailService.shared.store.folder(id),
               let engine = MailService.shared.engine(f.accountID) else { return }
+        loadToken += 1
+        let token = loadToken
         olderButton.isHidden = true
         olderSpinner.startAnimation(nil)
         Task {
             let n = await engine.loadOlder(folderID: id)
+            // The user may have switched folders meanwhile: that folder's button state is not ours to set (W-17).
+            guard token == loadToken, case .folder(let current) = source, current == id else { return }
             olderSpinner.stopAnimation(nil)
             olderButton.isHidden = false
             if n == 0 {
@@ -685,7 +875,9 @@ final class MessageListViewController: NSViewController, NSOutlineViewDataSource
 
     func tableView(_ tableView: NSTableView, rowActionsForRow row: Int, edge: NSTableView.RowActionEdge) -> [NSTableViewRowAction] {
         guard let node = outline.item(atRow: row) as? ListNode else { return [] }
-        let rows = node.allRows
+        // Same rule as the context menu: a collapsed thread acts on all its messages, an expanded header
+        // only on the message the row shows.
+        let rows = node.isThread && !outline.isItemExpanded(node) ? node.allRows : [node.row]
         let app = NSApp.delegate as? AppDelegate
         func action(_ title: String, _ color: NSColor, _ symbol: String, _ handler: @escaping () -> Void) -> NSTableViewRowAction {
             let a = NSTableViewRowAction(style: .regular, title: title) { _, _ in handler() }
@@ -778,9 +970,19 @@ final class MessageOutlineView: NSOutlineView {
         super.keyDown(with: event)
     }
     override func mouseDown(with event: NSEvent) {
-        let row = row(at: convert(event.locationInWindow, from: nil))
+        let point = convert(event.locationInWindow, from: nil)
+        let row = row(at: point)
+        let before = selectedRowIndexes
+        // A click on the disclosure triangle expands or collapses a thread; it is not an open.
+        let disclosure = row >= 0 ? frameOfOutlineCell(atRow: row) : .zero
         super.mouseDown(with: event)
-        if row >= 0 && row == selectedRow { onRedundantClick?() }
+        // Only a plain click that leaves an already-selected row selected is an explicit open: anything that
+        // changes the selection is already reported by its notification, and a modified click must not mark
+        // a message read just because it adjusted the selection.
+        guard row >= 0, before.contains(row), selectedRowIndexes == before,
+              event.modifierFlags.intersection([.command, .control, .option, .shift]).isEmpty,
+              disclosure.isEmpty || !disclosure.contains(point) else { return }
+        onRedundantClick?()
     }
 }
 
@@ -939,12 +1141,13 @@ final class MessageCell: NSTableCellView {
         if selected {
             for f in [sender, subject, snippet, date, count] { f.textColor = .alternateSelectedControlTextColor }
             dot.layer?.backgroundColor = NSColor.alternateSelectedControlTextColor.cgColor
+            answered.contentTintColor = .alternateSelectedControlTextColor
         } else {
             sender.textColor = .labelColor
             date.textColor = isUnread ? .controlAccentColor : .secondaryLabelColor
             snippet.textColor = .secondaryLabelColor
             count.textColor = .secondaryLabelColor
-            answered.contentTintColor = selected ? .alternateSelectedControlTextColor : .secondaryLabelColor
+            answered.contentTintColor = .secondaryLabelColor
             subject.textColor = isChildRow ? .secondaryLabelColor : (isUnread ? .controlAccentColor : .labelColor)
         }
     }
