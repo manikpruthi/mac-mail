@@ -88,12 +88,12 @@ enum HTMLPrep {
         var nextID = 0
         s = replace(imgTag, in: s) { tag, _ in
             var t = tag
-            let tns = t as NSString
-            let tlen = tns.length
             // Dimensions from attributes and inline CSS (width/height in px) — for tracking-pixel detection.
             let known = Array(pixelDims(t).values)
-            t = srcsetAttr.stringByReplacingMatches(in: t, range: NSRange(location: 0, length: tlen), withTemplate: "")
-            t = posterAttr.stringByReplacingMatches(in: t, range: NSRange(location: 0, length: tlen), withTemplate: "")
+            // Recompute the length for each pass: the first replacement can shorten the tag, and an
+            // NSRange past the end makes NSRegularExpression raise NSRangeException.
+            t = srcsetAttr.stringByReplacingMatches(in: t, range: NSRange(location: 0, length: (t as NSString).length), withTemplate: "")
+            t = posterAttr.stringByReplacingMatches(in: t, range: NSRange(location: 0, length: (t as NSString).length), withTemplate: "")
             let tn = t as NSString
             let nlen = tn.length
             func attrMatch(_ re: NSRegularExpression) -> (String, NSRange)? {

@@ -132,7 +132,7 @@ struct EMLDocument {
                 part.truncated = true
                 return part
             }
-            let sections = split(body, boundary: boundary)
+            let (sections, splitTruncated) = split(body, boundary: boundary)
             var children: [BodyPart] = []
             for (i, section) in sections.enumerated() where count < maxParts {
                 let (h, b) = splitHeader(section)
@@ -140,9 +140,14 @@ struct EMLDocument {
                 children.append(parseEntity(headers: MIME.parseHeaders(Data(h)), body: b, partID: childID, depth: depth + 1,
                                             isRoot: false, parts: &parts, count: &count))
             }
-            if children.count < sections.count { part.truncated = true }
+            if splitTruncated || children.count < sections.count { part.truncated = true }
             part.partID = isRoot ? "TEXT" : partID
             part.children = children
+            return part
+        }
+        if type == "multipart" {
+            // No usable boundary: the body cannot be split into parts, so it is not a savable leaf either.
+            part.truncated = true
             return part
         }
         // Only the leaf's own bytes are materialised (one copy, in total bounded by the file size).
@@ -151,8 +156,11 @@ struct EMLDocument {
     }
 
     /// Body sections between "--boundary" lines, up to "--boundary--". Each section excludes the CRLF that
-    /// belongs to the following delimiter. Works on a slice of the byte array; no copies.
-    static func split(_ body: ArraySlice<UInt8>, boundary: String) -> [ArraySlice<UInt8>] {
+    /// belongs to the following delimiter. Works on a slice of the byte array; no copies. At most `limit`
+    /// sections are collected, so a body made of millions of boundary lines cannot allocate millions of slices
+    /// before the part cap applies; `truncated` then reports that more sections exist.
+    static func split(_ body: ArraySlice<UInt8>, boundary: String, limit: Int = maxParts)
+        -> (sections: [ArraySlice<UInt8>], truncated: Bool) {
         let bytes = body
         let delim = Array(("--" + boundary).utf8)
         func matches(_ at: ArraySlice<UInt8>.Index) -> Bool {
@@ -161,9 +169,20 @@ struct EMLDocument {
                 guard k < bytes.endIndex, bytes[k] == d else { return false }
                 k = bytes.index(after: k)
             }
-            return true
+            // RFC 2046: the delimiter must be followed by end of line, transport padding, or "--"
+            // (close). A longer line that merely starts with the boundary is body text.
+            guard k < bytes.endIndex else { return true }
+            switch bytes[k] {
+            case 10, 13, 32, 9: return true
+            case 45:
+                let k1 = bytes.index(after: k)
+                return k1 < bytes.endIndex && bytes[k1] == 45
+            default: return false
+            }
         }
         var starts: [(lineStart: Int, contentStart: Int, closing: Bool)] = []
+        var found = 0
+        var more = false
         var i = bytes.startIndex
         while i < bytes.endIndex {
             let atLineStart = i == bytes.startIndex || bytes[bytes.index(before: i)] == 10
@@ -174,6 +193,15 @@ struct EMLDocument {
                 let closing = j < bytes.endIndex && bytes[j] == 45 && j1 < bytes.endIndex && bytes[j1] == 45
                 while j < bytes.endIndex && bytes[j] != 10 { j = bytes.index(after: j) }
                 let contentStart = j < bytes.endIndex ? bytes.index(after: j) : j
+                if !closing {
+                    if found == limit {
+                        // More sections than the cap: use this line only to bound the last kept section.
+                        more = true
+                        starts.append((i, contentStart, true))
+                        break
+                    }
+                    found += 1
+                }
                 starts.append((i, contentStart, closing))
                 if closing { break }
                 guard j < bytes.endIndex else { break }
@@ -191,7 +219,7 @@ struct EMLDocument {
             if end > s.contentStart, bytes[bytes.index(before: end)] == 13 { end = bytes.index(before: end) }
             out.append(end > s.contentStart ? bytes[s.contentStart..<end] : bytes[bytes.endIndex...])
         }
-        return out
+        return (out, more)
     }
 
     private static let dateFormats = ["EEE, d MMM yyyy HH:mm:ss Z", "EEE, d MMM yyyy HH:mm:ss zzz",

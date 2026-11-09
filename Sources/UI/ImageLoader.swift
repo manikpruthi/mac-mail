@@ -332,7 +332,9 @@ final class ImageLoader: NSObject, WKURLSchemeHandler {
             let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any] ?? [:]
             let w = props[kCGImagePropertyPixelWidth] as? Int ?? 0
             let h = props[kCGImagePropertyPixelHeight] as? Int ?? 0
-            if w > 0, h > 0, w * h <= 4 { return (transparentGIF, "image/gif") }
+            // Hostile headers can report huge dimensions: multiply with overflow reporting rather than trapping.
+            let (pixels, overflowed) = w.multipliedReportingOverflow(by: h)
+            if w > 0, h > 0, !overflowed, pixels <= 4 { return (transparentGIF, "image/gif") }
             // Within the pixel budget everything passes through, animated images included. Anything larger —
             // animated or not — is downsampled from frame 0 so a huge GIF never decodes at full size.
             if max(w, h) <= Prefs.imageMaxPixels { return (data, mime) }
@@ -417,7 +419,7 @@ actor ImageDiskCache {
     func load(_ url: URL) -> (Data, String)? {
         let file = AppPaths.imageCache.appendingPathComponent(Self.key(url))
         guard let data = try? Data(contentsOf: file), data.count > 1,
-              let mimeLen = data.first, data.count > Int(mimeLen) + 1 else { return nil }
+              let mimeLen = data.first, mimeLen > 0, data.count > Int(mimeLen) + 1 else { return nil }
         let mime = String(decoding: data[1...Int(mimeLen)], as: UTF8.self)
         try? FileManager.default.setAttributes([.modificationDate: Date()], ofItemAtPath: file.path)
         return (data.subdata(in: (Int(mimeLen) + 1)..<data.count), mime)

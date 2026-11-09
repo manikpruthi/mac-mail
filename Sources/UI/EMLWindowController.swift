@@ -35,6 +35,8 @@ final class EMLWindowController: NSWindowController, NSWindowDelegate, WKNavigat
     private var loadImages = false
     private var generation = 0
     private var renderAttempt = 0
+    private var ruleListAttached = false
+    private var closed = false
     /// Required zero height while the banner is hidden, so no space is reserved for it.
     private var bannerCollapse: NSLayoutConstraint?
 
@@ -103,8 +105,12 @@ final class EMLWindowController: NSWindowController, NSWindowDelegate, WKNavigat
         attachmentBar.onSaveAll = { [weak self] in self?.saveAll() }
         attachmentBar.onQuickLook = { [weak self] p in self?.quickLook(p) }
         attachmentBar.provideFile = { [weak self] p, dest in
-            guard let data = self?.doc.data(for: p) else { throw NetError.server("The attachment is empty.") }
-            try data.write(to: dest, options: .atomic)
+            guard let doc = self?.doc else { throw NetError.server("The attachment is empty.") }
+            // Decode and write off the main thread: a drag promise may be tens of MB.
+            try await Task.detached(priority: .userInitiated) {
+                guard let data = doc.data(for: p) else { throw NetError.server("The attachment is empty.") }
+                try data.write(to: dest, options: .atomic)
+            }.value
         }
 
         let config = WKWebViewConfiguration()
@@ -114,7 +120,6 @@ final class EMLWindowController: NSWindowController, NSWindowDelegate, WKNavigat
         config.preferences.javaScriptCanOpenWindowsAutomatically = false
         config.userContentController.addUserScript(WKUserScript(source: DarkReader.script, injectionTime: .atDocumentEnd,
                                                                 forMainFrameOnly: true, in: .defaultClient))
-        if let list = PreviewViewController.ruleList { config.userContentController.add(list) }
         let web = WKWebView(frame: .zero, configuration: config)
         web.navigationDelegate = self
         web.uiDelegate = self
@@ -180,6 +185,12 @@ final class EMLWindowController: NSWindowController, NSWindowDelegate, WKNavigat
             return
         }
         renderAttempt = 0
+        // The rule list is usually compiled after this window's web view was created, so attach it here,
+        // after the wait above, rather than only from the configuration in build() (C-24).
+        if !ruleListAttached, let list = PreviewViewController.ruleList {
+            web.configuration.userContentController.add(list)
+            ruleListAttached = true
+        }
         generation += 1
         let (html, text) = doc.bodies()
         let prepared = HTMLPrep.prepare(html: html, text: text, clip: false, page: generation)
@@ -290,12 +301,14 @@ final class EMLWindowController: NSWindowController, NSWindowDelegate, WKNavigat
                     guard let data = doc.data(for: part) else { throw NetError.server("The attachment is empty.") }
                     try data.write(to: file, options: .atomic)
                 }.value
+                // The window may have closed while the file was being written; nobody would then delete it.
+                guard !self.closed else { try? FileManager.default.removeItem(at: dir); return }
                 if let old = quickLookDir { try? FileManager.default.removeItem(at: old) }
                 quickLookDir = dir
                 QuickLookController.shared.show(file)
             } catch {
                 try? FileManager.default.removeItem(at: dir)
-                NSSound.beep()
+                if !self.closed { NSSound.beep() }
             }
         }
     }
@@ -320,6 +333,7 @@ final class EMLWindowController: NSWindowController, NSWindowDelegate, WKNavigat
     }
 
     func windowWillClose(_ notification: Notification) {
+        closed = true
         loader.cancelAll()
         loader.page = nil
         if let web {

@@ -14,8 +14,9 @@ struct BodyPart: Codable, Equatable {
     var dispositionParams: [String: String] = [:]
     var children: [BodyPart] = []
     /// Set when parsing hit the depth/part cap (.eml): the part was not fully parsed and its raw body is
-    /// unavailable, so it must never be offered as a savable attachment.
-    var truncated: Bool = false
+    /// unavailable, so it must never be offered as a savable attachment. Optional so body structures cached
+    /// by older versions (whose JSON has no such key) still decode; nil and false both mean "complete".
+    var truncated: Bool?
 
     var mimeType: String { "\(type)/\(subtype)" }
     var isMultipart: Bool { type == "multipart" }
@@ -116,7 +117,7 @@ struct BodyPart: Codable, Equatable {
     func attachments() -> [BodyPart] {
         let display = displayParts()
         return leaves.filter { p in
-            if p.truncated { return false }
+            if p.truncated == true { return false }
             if p.partID == display.html?.partID || p.partID == display.text?.partID { return false }
             if p.isAttachmentDisposition { return true }
             if p.type == "image", p.contentID != nil, p.disposition != "attachment" { return false }
@@ -167,7 +168,9 @@ struct BodyPart: Codable, Equatable {
         case "text/plain": ext = "txt"
         default: ext = subtype.isEmpty ? "bin" : subtype
         }
-        return "attachment-\(partID).\(ext)"
+        // The MIME subtype is sender-controlled and may contain path separators ("application/a/../../x");
+        // the same sanitiser as real filenames keeps the generated name inside its target folder.
+        return Self.safeFilename("attachment-\(partID).\(ext)") ?? "attachment.bin"
     }
 
     func json() -> String? {
