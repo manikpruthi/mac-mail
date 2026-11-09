@@ -61,7 +61,13 @@ final class ImageLoader: NSObject, WKURLSchemeHandler {
         }
         let kind = url.host ?? ""
         Debug.log("image request \(url.absoluteString)")
-        let id = Int(url.pathComponents.dropFirst().first ?? "") ?? -1
+        // lm://<kind>/<page>/<id>: a request from an earlier render (stale cache or late load) gets nothing.
+        let parts = Array(url.pathComponents.dropFirst())
+        let id = parts.count == 2 ? Int(parts[1]) ?? -1 : -1
+        guard parts.count == 2, Int(parts[0]) == page.generation else {
+            finish(task, key: key, data: Self.transparentGIF, mime: "image/gif")
+            return
+        }
         let t = Task { [weak self] in
             guard let self else { return }
             let result: (Data, String)

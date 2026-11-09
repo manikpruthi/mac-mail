@@ -24,6 +24,7 @@ final class MailService {
 
     func start() {
         if AppPaths.isDemo { DemoData.seed(store: store) }
+        store.repairEmptyBodies()
         accounts = AppPaths.isDemo ? [DemoData.account] : Prefs.accounts
         for a in accounts { makeEngine(a) }
         let days = Prefs.offlineDays

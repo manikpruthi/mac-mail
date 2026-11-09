@@ -286,7 +286,10 @@ final class AccountEngine {
                     if let t = item.text, let r = parts[t.partID] {
                         text = MIME.string(from: MIME.decode(r, encoding: t.encoding), charset: t.charset)
                     }
-                    store.saveBody(item.id, html: html, text: text ?? (html == nil ? "" : nil))
+                    // Nothing came back for this message: leave it uncached so opening it fetches again,
+                    // instead of caching an empty body forever.
+                    guard html != nil || text != nil else { continue }
+                    store.saveBody(item.id, html: html, text: text)
                 }
             }
         }
@@ -365,7 +368,11 @@ final class AccountEngine {
         if let h, let raw = data[h.partID] { html = MIME.string(from: raw, charset: h.charset) }
         if let t, let raw = data[t.partID] { text = MIME.string(from: raw, charset: t.charset) }
         if let raw = data["TEXT"] { text = MIME.string(from: raw, charset: nil) }
-        if html == nil && text == nil { text = "" }
+        if html == nil && text == nil {
+            // The server returned no text part (rare, usually a transient hiccup). Don't cache it; try again on next open.
+            if (h == nil && t == nil) || d.size < 2_000 { return StoredBody(html: nil, text: "") }
+            throw NetError.server("The message text didn't arrive from the server. Select the message again to retry.")
+        }
         store.saveBody(messageID, html: html, text: text)
         return StoredBody(html: html, text: text)
     }
@@ -395,25 +402,28 @@ final class AccountEngine {
 
     // MARK: Search
 
-    /// Server-side search across the whole mailbox (Gmail search syntax on Gmail). Returns cached message ids.
-    func serverSearch(_ query: String) async throws -> [Int64] {
-        guard !isDemo else { return [] }
-        guard let scope = store.folder(account: account.id, role: .all) ?? store.folder(account: account.id, role: .inbox) else { return [] }
+    /// Server-side search (Gmail search syntax via X-GM-RAW on Gmail, IMAP SEARCH elsewhere) in one folder,
+    /// or across the whole mailbox (All Mail). Fetches headers for hits that aren't cached and returns their ids.
+    func serverSearch(_ query: SearchQuery, folder: Folder? = nil) async throws -> [Int64] {
+        guard !isDemo, !query.isEmpty else { return [] }
+        guard let scope = folder ?? store.folder(account: account.id, role: .all) ?? store.folder(account: account.id, role: .inbox) else { return [] }
         let known = Set(store.localUIDs(folderID: scope.id))
+        let t0 = Date()
         let (newest, headers) = try await fetchGate.run { () async throws -> ([UInt32], [ParsedHeader]) in
             let c = try await client(.fetch)
             try await c.ensureSelected(scope.path, readOnly: true)
             let uids: [UInt32]
             if await c.isGmail {
-                uids = try await c.uidSearch(prefix: "X-GM-RAW", text: query)
+                uids = try await c.uidSearch(prefix: "X-GM-RAW", text: query.gmailRaw)
             } else {
-                uids = try await c.uidSearch(prefix: "TEXT", text: query)
+                uids = try await c.uidSearch(query.imapCriteria)
             }
-            let newest = Array(uids.sorted(by: >).prefix(150))
+            let newest = Array(uids.sorted(by: >).prefix(200))
             let missing = newest.filter { !known.contains($0) }
             return (newest, missing.isEmpty ? [] : try await c.fetchHeaders(imapUIDSet(missing)))
         }
         store.insert(folderID: scope.id, headers)
+        Debug.log("server search '\(query.gmailRaw)' in \(scope.name): \(newest.count) hits, \(headers.count) new, \(Debug.ms(since: t0))")
         return store.ids(folderID: scope.id, uids: newest)
     }
 

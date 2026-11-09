@@ -17,3 +17,9 @@ GEMINI.md
 # /brag launch video output
 brag-output/
 brag-output-*/
+
+# Delegate worker state
+.delegate/
+
+# Release DMGs are build output (see package.sh)
+release/

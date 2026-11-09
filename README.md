@@ -20,10 +20,19 @@ Graphic emails look the way the sender designed them. Small images load automati
 - **Offline window.** Headers for the last 30 days (adjustable from 7 to 90) plus at least the newest 200 messages per folder are kept offline. Message text for the newest messages is prefetched so they open instantly. "Load older messages" fetches older mail on demand.
 - **Search:**
   - Local results as you type (SQLite FTS5).
-  - Gmail's own server search across the whole mailbox runs as soon as you pause, and its results merge in.
-  - Gmail search syntax works (`from:`, `has:attachment`, `older_than:`…).
+  - Gmail's own server search runs as soon as you pause, and its results merge in. If it fails, the list header says why.
+  - **Search syntax** works locally too: `from:`, `to:`, `subject:`, `has:attachment`, `is:unread`, `is:starred`, `newer_than:7d`, quoted values (`from:"divya k"`), and a space after the colon (`from: divya`). Other Gmail operators (`in:`, `label:`, `older_than:`…) are passed to Gmail.
+  - **Filter bar** (shown while searching), like Outlook:
+    - Scope: All folders, or the folder you were in.
+    - Date: past week, month, 6 months or year.
+    - Toggles: Unread, Flagged, Attachments.
+    - **More**: From, To and Subject fields.
 - **Conversations on or off per folder.** Like Outlook, each folder can either group messages by conversation (threads expand in place) or show every message separately (⌥⌘C).
 - **Preview pane**, with a three-pane layout: folders, list and message.
+- **Open in a separate window**, like Outlook:
+  - Double-click a message (or press Return) to open it in its own window.
+  - The window has Reply, Reply All, Forward, Archive, Delete, Spam, Read/Unread and Flag, and the usual shortcuts work there.
+  - The window closes when you archive or delete the message. Drafts open in the editor instead.
 - **Theme.** The app follows macOS light/dark by default, switching live. You can also pin Light or Dark in Settings → General or View → Appearance.
 - **Dark reading pane:**
   - The reading pane uses the app's background.
@@ -46,6 +55,9 @@ Graphic emails look the way the sender designed them. Small images load automati
   - Attachments aren't opened inside the app.
 - **Writing mail:**
   - New message, Reply, Reply All and Forward. Forward includes the original attachments.
+  - Replies and forwards show the original email under what you type, rendered the way it looked; drag the divider to resize it. That's what's quoted when you send. Untick "Include original message" to leave it out.
+  - Drag an address between To, Cc and Bcc to move it. Copy and paste still copies.
+  - Replies clean up addresses that some senders write as links (`<mailto:help@bank.in.>`), which Gmail would otherwise reject with "553-5.1.3 not a valid RFC 5321 address".
   - Rich text with bold, italic, underline, colours and links.
   - Per-account signatures.
   - Address autocomplete from your mail.
@@ -120,6 +132,7 @@ tools/selftest.sh
 - **⇧⌘U / ⇧⌘L:** mark read/unread, flag.
 - **J / K:** next / previous message.
 - **⌥⌘C:** turn conversation grouping on or off for this folder.
+- **Double-click / Return:** open the message in its own window.
 - **⌥⌘L:** show the open message with a light background (dark mode only).
 - **Right-click a message:** Reply, Mark as Read/Unread, Flag, Archive, Delete, Spam or Move, on that message only. The selection doesn't change.
 - **⌥⌘F:** search all mail.
@@ -139,10 +152,11 @@ tools/selftest.sh
 
   A per-connection async gate keeps each "select folder → act" step together. Sign-in is TLS plus a single LOGIN (capabilities come back in the LOGIN reply).
 - **Prefetch.** After each sync the newest messages' text is cached in batches. When you open a message, the next three (and the one above) are fetched too, so arrowing down the list is instant.
+- **Never caches an empty message.** If Gmail sends no text for a message, it isn't saved, so opening it fetches again. Empty bodies left by older versions are cleared on launch.
 - **Small updates.** Read/flag changes patch only the affected rows, with no full list reload. The App Password is read from the Keychain once, off the main thread, and kept in memory.
 - **Structure first.** Each message's MIME tree (`BODYSTRUCTURE`) is cached, so reading a message downloads only its text part. Inline images and attachments are fetched only when you look at them or save them.
 - **Storage.** Mail is kept in SQLite (system `libsqlite3`, WAL, 2 MB page cache) with an FTS5 index. The message list loads small row objects and creates only the visible cells. The cache prunes itself to the offline window.
-- **Reading pane.** One reused `WKWebView` with email scripts disabled. Dark mode recolouring runs as an app-injected script in WebKit's separate client script world (`DarkReader` in `HTMLPrep.swift`), so it works even though the email's own scripts are off. Every remote image URL is rewritten to `lm://`, served by the app's own loader, which enforces the size limits and shrinks images with ImageIO. A content-blocking rule stops WebKit from loading anything else over the network. Links open in your default browser.
+- **Reading pane.** One reused `WKWebView` with email scripts disabled. Dark mode recolouring runs as an app-injected script in WebKit's separate client script world (`DarkReader` in `HTMLPrep.swift`), so it works even though the email's own scripts are off. Every remote image URL is rewritten to `lm://img/<render>/<n>`, served by the app's own loader. The render number makes the URLs unique to each message: WebKit caches by URL, and without it one email could show another email's pictures. The loader enforces the size limits and shrinks images with ImageIO. A content-blocking rule stops WebKit from loading anything else over the network. Links open in your default browser.
 - **Sending.** MIME is built by hand (multipart/alternative plus base64 attachments) and sent via SMTP AUTH PLAIN. Gmail files the copy in Sent itself.
 
 ### Performance (measured, Apple silicon, real Gmail account)
@@ -177,9 +191,9 @@ mac-mail/
 │   ├── App/                 main.swift, AppDelegate (menus, file/mailto handling), Snapshot (demo captures)
 │   ├── Core/                SQLite wrapper, Store (cache + FTS + action queue), models, Keychain, Prefs
 │   ├── Net/                 TLSStream, IMAP parser and client, SMTP client
-│   ├── Mail/                MIME decoding, BODYSTRUCTURE, outgoing message builder
+│   ├── Mail/                MIME decoding, BODYSTRUCTURE, outgoing message builder, search query parser
 │   ├── Sync/                AccountEngine (sync, IDLE, actions), MailService, demo data
-│   └── UI/                  main window, sidebar, message list, preview, image loader, attachments,
+│   └── UI/                  main window, sidebar, message list, search filter bar, preview, message window, image loader, attachments,
 │                            compose, settings
 ├── Tests/SelfTest.swift     offline protocol / MIME checks (tools/selftest.sh)
 ├── tools/

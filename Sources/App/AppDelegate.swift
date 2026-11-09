@@ -312,7 +312,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
                 if env["MAC_MAIL_BENCH_HOLD"] == "1" {
                     w.preview.releaseWebView()
                     Memory.relieve()
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 4) {
+                    let delay = Double(env["MAC_MAIL_SNAPSHOT_DELAY"] ?? "") ?? 4
+                DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
                         Debug.log("after release; footprint \(Memory.footprintMB()) MB")
                     }
                     DispatchQueue.main.asyncAfter(deadline: .now() + 12) { NSApp.terminate(nil) }
@@ -335,11 +336,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
 
     private func runDemoHooks() {
         let env = ProcessInfo.processInfo.environment
+        // MAC_MAIL_DEMO_HTML=<file>: replace the second demo message's body with this HTML (reproduce rendering bugs).
+        if let file = env["MAC_MAIL_DEMO_HTML"], let html = try? String(contentsOfFile: file, encoding: .utf8),
+           let inbox = MailService.shared.store.folder(account: DemoData.account.id, role: .inbox),
+           let id = MailService.shared.store.ids(folderID: inbox.id, uids: [19]).first {
+            MailService.shared.store.saveBody(id, html: html, text: nil)
+            // Give the first message the image-heavy newsletter so a sequence can switch between two image emails.
+            if let first = MailService.shared.store.ids(folderID: inbox.id, uids: [20]).first {
+                MailService.shared.store.saveBody(first, html: DemoData.newsletterHTML, text: nil)
+            }
+        }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
             guard let w = self?.mainWindow else { return }
             if env["MAC_MAIL_DEMO_GROUP"] == "1" { w.list.setGrouped(true) }
             if let idx = env["MAC_MAIL_DEMO_SELECT"].flatMap(Int.init) {
                 w.list.selectAfterRemoval(previousIndex: idx)
+            }
+            if let q = env["MAC_MAIL_DEMO_SEARCH"] { w.runSearch(q) }
+            if let row = env["MAC_MAIL_DEMO_REPLY"].flatMap(Int.init) {
+                w.list.selectAfterRemoval(previousIndex: row)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { w.reply(nil) }
+            }
+            if let row = env["MAC_MAIL_DEMO_OPEN"].flatMap(Int.init) {
+                w.list.selectAfterRemoval(previousIndex: row)
+                if let r = w.list.focusedRow { w.openRow(r) }
+            }
+            // MAC_MAIL_DEMO_SEQUENCE=0,1: select these rows 3 s apart (reproduces bugs that need a previous message).
+            if let seq = env["MAC_MAIL_DEMO_SEQUENCE"] {
+                for (i, row) in seq.split(separator: ",").compactMap({ Int($0) }).enumerated() {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + Double(i) * 3) { w.list.selectAfterRemoval(previousIndex: row) }
+                }
             }
             if let row = env["MAC_MAIL_DEMO_CONTEXT"].flatMap(Int.init) {
                 // Simulates right-click → first read/unread command on `row`, then reports what changed.
@@ -361,7 +387,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             if let path = env["MAC_MAIL_SNAPSHOT"] {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 4) {
                     Task { @MainActor in
-                        let target = env["MAC_MAIL_DEMO_COMPOSE"] == "1" ? NSApp.windows.first(where: { $0.windowController is ComposeWindowController }) : w.window
+                        let target = env["MAC_MAIL_DEMO_COMPOSE"] == "1" || env["MAC_MAIL_DEMO_REPLY"] != nil
+                            ? NSApp.windows.first(where: { $0.windowController is ComposeWindowController })
+                            : env["MAC_MAIL_DEMO_OPEN"] != nil
+                                ? NSApp.windows.first(where: { $0.windowController is MessageWindowController })
+                                : w.window
                         if let win = target { await Snapshot.write(window: win, to: path) }
                         NSApp.terminate(nil)
                     }

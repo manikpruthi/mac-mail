@@ -28,6 +28,13 @@ final class MessageListViewController: NSViewController, NSOutlineViewDataSource
     private(set) var grouped = false
     private var searchRows: [MessageRow] = []
     private var serverSearching = false
+    private var serverSearchError: String?
+    private let filterBar = SearchFilterBar()
+    private var filterCollapsed: NSLayoutConstraint!
+    private var searchText = ""
+    /// Folder the search started from ("This folder" scope); nil when started from All Inboxes.
+    private var searchFolderID: Int64?
+    private var searchToken = 0
     private var reloadScheduled = false
 
     var onSelectionChange: (([MessageRow]) -> Void)?
@@ -75,7 +82,9 @@ final class MessageListViewController: NSViewController, NSOutlineViewDataSource
         olderButton.target = self
         olderButton.action = #selector(loadOlder)
 
-        for v in [titleLabel, subtitle, groupToggle, scroll, olderButton] as [NSView] {
+        filterBar.isHidden = true
+        filterBar.onChange = { [weak self] _ in self?.filtersChanged() }
+        for v in [titleLabel, subtitle, groupToggle, filterBar, scroll, olderButton] as [NSView] {
             v.translatesAutoresizingMaskIntoConstraints = false
             root.addSubview(v)
         }
@@ -89,13 +98,18 @@ final class MessageListViewController: NSViewController, NSOutlineViewDataSource
             subtitle.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 1),
             subtitle.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
             subtitle.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -14),
-            scroll.topAnchor.constraint(equalTo: subtitle.bottomAnchor, constant: 6),
+            filterBar.topAnchor.constraint(equalTo: subtitle.bottomAnchor, constant: 4),
+            filterBar.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+            filterBar.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+            scroll.topAnchor.constraint(equalTo: filterBar.bottomAnchor, constant: 2),
             scroll.leadingAnchor.constraint(equalTo: root.leadingAnchor),
             scroll.trailingAnchor.constraint(equalTo: root.trailingAnchor),
             scroll.bottomAnchor.constraint(equalTo: olderButton.topAnchor, constant: -4),
             olderButton.centerXAnchor.constraint(equalTo: root.centerXAnchor),
             olderButton.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -6),
         ])
+        filterCollapsed = filterBar.heightAnchor.constraint(equalToConstant: 0)
+        filterCollapsed.isActive = true
         view = root
         NotificationCenter.default.addObserver(self, selector: #selector(dataChanged(_:)), name: .mailDataChanged, object: nil)
     }
@@ -104,6 +118,7 @@ final class MessageListViewController: NSViewController, NSOutlineViewDataSource
 
     func show(_ source: MailSource) {
         self.source = source
+        setFilterBarVisible(false)
         if case .search = source {} else { searchRows = [] }
         grouped = Prefs.groupByConversation(folderKey: folderKey)
         groupToggle.state = grouped ? .on : .off
@@ -163,7 +178,10 @@ final class MessageListViewController: NSViewController, NSOutlineViewDataSource
         let unread = rows.filter { !$0.flags.contains(.seen) }.count
         var sub = "\(rows.count) message\(rows.count == 1 ? "" : "s")"
         if unread > 0 { sub += " · \(unread) unread" }
-        if case .search = source, serverSearching { sub += " · searching the server…" }
+        if case .search = source {
+            if serverSearching { sub += " · searching the server…" }
+            else if let e = serverSearchError { sub += " · server search failed: \(e)" }
+        }
         subtitle.stringValue = sub
     }
 
@@ -219,39 +237,92 @@ final class MessageListViewController: NSViewController, NSOutlineViewDataSource
 
     // MARK: Search
 
-    func showSearch(_ query: String) {
-        let q = query.trimmingCharacters(in: .whitespaces)
-        guard !q.isEmpty else { return }
-        source = .search(q)
-        searchRows = MailService.shared.store.search(q)
+    /// The typed text plus the filter bar's choices.
+    private var currentQuery: SearchQuery { filterBar.filters.apply(to: SearchQuery.parse(searchText)) }
+
+    private var scopeFolderID: Int64? { filterBar.filters.scope == .folder ? searchFolderID : nil }
+
+    private func setFilterBarVisible(_ visible: Bool) {
+        filterBar.isHidden = !visible
+        filterCollapsed.isActive = !visible
+    }
+
+    /// Instant local results as you type. `from` is where the search started (for the "This folder" scope).
+    func showSearch(_ text: String, from origin: MailSource) {
+        let starting: Bool
+        if case .search = source { starting = false } else { starting = true }
+        if starting {
+            filterBar.reset()
+            if case .folder(let id) = origin {
+                searchFolderID = id
+                filterBar.configure(folderName: MailService.shared.store.folder(id)?.name)
+            } else {
+                searchFolderID = nil
+                filterBar.configure(folderName: nil)
+            }
+            setFilterBarVisible(true)
+        }
+        searchText = text.trimmingCharacters(in: .whitespaces)
+        source = .search(searchText)
+        serverSearchError = nil
+        searchRows = Self.dedupe(MailService.shared.store.search(currentQuery, folderID: scopeFolderID))
         grouped = Prefs.groupByConversation(folderKey: "search")
         groupToggle.state = grouped ? .on : .off
         reload(keepSelection: false)
     }
 
-    /// Runs the server search for every account and merges the results with the local ones.
-    func runServerSearch(_ query: String) {
-        let q = query.trimmingCharacters(in: .whitespaces)
-        guard !q.isEmpty else { return }
+    private var filterWork: DispatchWorkItem?
+
+    private func filtersChanged() {
+        guard case .search = source else { return }
+        searchRows = Self.dedupe(MailService.shared.store.search(currentQuery, folderID: scopeFolderID))
+        reload(keepSelection: false)
+        selectFirst()
+        filterWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in self?.runServerSearch() }
+        filterWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4, execute: work)
+    }
+
+    /// Runs the server search for every account (or the scoped folder's account) and merges with the local results.
+    func runServerSearch() {
+        let q = currentQuery
+        guard !q.isEmpty, case .search = source else { return }
+        searchToken += 1
+        let token = searchToken
+        let scopeID = scopeFolderID
+        let store = MailService.shared.store
         serverSearching = true
-        reload(keepSelection: true)
+        serverSearchError = nil
+        updateSubtitle()
         Task {
             var ids: [Int64] = []
+            var errors: [String] = []
             for e in MailService.shared.engines.values {
-                if let found = try? await e.serverSearch(q) { ids += found }
+                var folder: Folder?
+                if let scopeID {
+                    guard let f = store.folder(scopeID), f.accountID == e.account.id else { continue }
+                    folder = f
+                }
+                do { ids += try await e.serverSearch(q, folder: folder) }
+                catch { errors.append((error as? LocalizedError)?.errorDescription ?? error.localizedDescription) }
             }
-            guard case .search(let current) = source, current == q else { return }
+            guard token == searchToken, case .search = source else { return }
             serverSearching = false
-            let store = MailService.shared.store
-            var merged = store.search(q) + store.rows(ids: ids)
-            var seen = Set<String>()
-            merged = merged.filter { r in
-                let key = r.gmailID != 0 ? "\(r.accountID):g\(r.gmailID)" : "\(r.accountID):\(r.subject):\(r.date.timeIntervalSince1970)"
-                return seen.insert(key).inserted
-            }
+            serverSearchError = errors.first
+            var merged = store.search(q, folderID: scopeID) + store.rows(ids: ids)
             merged.sort { $0.date > $1.date }
-            searchRows = merged
+            searchRows = Self.dedupe(merged)
             reload(keepSelection: true)
+        }
+    }
+
+    /// Gmail keeps one message in several folders (Inbox and All Mail); show it once.
+    static func dedupe(_ rows: [MessageRow]) -> [MessageRow] {
+        var seen = Set<String>()
+        return rows.filter { r in
+            let key = r.gmailID != 0 ? "\(r.accountID):g\(r.gmailID)" : "\(r.accountID):\(r.id)"
+            return seen.insert(key).inserted
         }
     }
 
@@ -341,6 +412,9 @@ final class MessageListViewController: NSViewController, NSOutlineViewDataSource
         guard e.modifierFlags.intersection([.command, .control, .option]).isEmpty else { return false }
         let app = NSApp.delegate as? AppDelegate
         switch e.keyCode {
+        case 36, 76: // return, enter: open in its own window
+            if let r = focusedRow { onOpen?(r) }
+            return true
         case 51, 117: // delete, forward delete
             app?.mainWindow?.deleteMessages(nil)
             return true

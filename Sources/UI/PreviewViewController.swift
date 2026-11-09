@@ -4,12 +4,12 @@ import WebKit
 
 /// The reading pane: header, image/clip banner, attachment chips and one reused WKWebView.
 @MainActor
-final class PreviewViewController: NSViewController, WKNavigationDelegate, WKScriptMessageHandler {
+final class PreviewViewController: NSViewController, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler {
     private let store = MailService.shared.store
     /// Created on demand and destroyed while the app is in the background, so WebKit's helper processes
     /// (content, GPU, networking ≈ 50 MB) exit when you're not reading mail.
     private var webView: WKWebView?
-    private static var ruleList: WKContentRuleList?
+    static var ruleList: WKContentRuleList?
     private let loader = ImageLoader()
     private var generation = 0
     private var current: MessageDetail?
@@ -268,9 +268,10 @@ final class PreviewViewController: NSViewController, WKNavigationDelegate, WKScr
         loader.cancelAll()
         // "View entire message" skips the clip but keeps every other protection.
         let forceLight = lightMessages.contains(d.id)
-        let prepared = HTMLPrep.prepare(html: body.html, text: body.text, clip: !showFullClipped, forceLight: forceLight)
-        updateLightButton()
         generation += 1
+        let prepared = HTMLPrep.prepare(html: body.html, text: body.text, clip: !showFullClipped, forceLight: forceLight,
+                                        page: generation)
+        updateLightButton()
         let senderPref = store.pref("img:" + d.from.email.lowercased())
         let isSpam = d.folderRole == .spam
         let autoLoad = forceImages || senderPref == "always" || (!isSpam && !Prefs.askBeforeImages && senderPref != "ask")
@@ -339,7 +340,7 @@ final class PreviewViewController: NSViewController, WKNavigationDelegate, WKScr
         page.forced.insert(id)
         let js = """
         document.querySelectorAll('img[data-lm="\(id)"]').forEach(function(e){
-          e.removeAttribute('data-lm-blocked'); e.src = 'lm://img/\(id)?f=' + Date.now();
+          e.removeAttribute('data-lm-blocked'); e.src = 'lm://img/\(page.generation)/\(id)?f=' + Date.now();
         });
         """
         webView?.evaluateJavaScript(js, in: nil, in: .defaultClient, completionHandler: nil)
@@ -357,18 +358,26 @@ final class PreviewViewController: NSViewController, WKNavigationDelegate, WKScr
     func webView(_ webView: WKWebView, decidePolicyFor action: WKNavigationAction,
                  decisionHandler: @escaping @MainActor (WKNavigationActionPolicy) -> Void) {
         guard let url = action.request.url else { decisionHandler(.cancel); return }
-        if action.navigationType == .linkActivated || (url.scheme != "lm" && url.scheme != "about") {
+        if action.navigationType == .linkActivated {
             decisionHandler(.cancel)
-            if action.navigationType == .linkActivated {
-                if url.scheme == "mailto" {
-                    (NSApp.delegate as? AppDelegate)?.compose(mailto: url)
-                } else if url.scheme == "http" || url.scheme == "https" {
-                    NSWorkspace.shared.open(url)
-                }
-            }
+            ExternalNavigation.open(url)
             return
         }
-        decisionHandler(.allow)
+        // Only the app's own lm:// document and about:blank may navigate in place. Everything else,
+        // including a custom scheme a sender might try, is swallowed rather than handed to LaunchServices.
+        if url.scheme == "lm" || url.scheme == "about" {
+            decisionHandler(.allow)
+        } else {
+            decisionHandler(.cancel)
+        }
+    }
+
+    /// target="_blank" links and script-opened windows. Returning nil keeps WebKit from asking macOS
+    /// to open a URL it cannot handle (the "There is no application set to open lm://…" alert).
+    func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration,
+                 for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
+        if let url = navigationAction.request.url { ExternalNavigation.open(url) }
+        return nil
     }
 
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
@@ -517,6 +526,7 @@ final class PreviewViewController: NSViewController, WKNavigationDelegate, WKScr
         if let list = Self.ruleList { ucc.add(list) }
         let w = WKWebView(frame: .zero, configuration: config)
         w.navigationDelegate = self
+        w.uiDelegate = self
         w.setValue(false, forKey: "drawsBackground")
         w.allowsMagnification = true
         w.translatesAutoresizingMaskIntoConstraints = false
@@ -580,6 +590,26 @@ final class PreviewViewController: NSViewController, WKNavigationDelegate, WKScr
 
     var currentDetail: MessageDetail? { current }
     var currentBodyValue: StoredBody? { currentBody }
+}
+
+/// The only bridge from rendered mail to the outside world. Custom schemes are never passed to
+/// NSWorkspace/LaunchServices; that is what produced repeated "no application set to open lm://…" alerts.
+@MainActor
+enum ExternalNavigation {
+    private static var lastOpen: (url: URL, at: Date)?
+
+    static func open(_ url: URL) {
+        let scheme = url.scheme?.lowercased() ?? ""
+        guard scheme == "http" || scheme == "https" || scheme == "mailto" else { return }
+        // A target="_blank" link can reach both the policy delegate and the UI delegate; avoid two tabs.
+        if let lastOpen, lastOpen.url == url, Date().timeIntervalSince(lastOpen.at) < 0.75 { return }
+        lastOpen = (url, Date())
+        if scheme == "mailto" {
+            (NSApp.delegate as? AppDelegate)?.compose(mailto: url)
+        } else {
+            NSWorkspace.shared.open(url)
+        }
+    }
 }
 
 /// Forwards script messages without the user content controller retaining the preview controller.

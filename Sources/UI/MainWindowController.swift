@@ -132,8 +132,13 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSSearc
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.25, execute: work)
     }
 
-    private func openRow(_ row: MessageRow) {
-        if row.folderRole == .drafts, let d = MailService.shared.store.detail(row.id) { editDraft(d) }
+    /// Double-click / Return: drafts open in the editor, everything else in its own window (like Outlook).
+    func openRow(_ row: MessageRow) {
+        if row.folderRole == .drafts, let d = MailService.shared.store.detail(row.id) {
+            editDraft(d)
+        } else {
+            MessageWindowController.show(messageID: row.id)
+        }
     }
 
     func showToast(_ text: String, action: (String, () -> Void)? = nil, duration: TimeInterval = 4) {
@@ -208,7 +213,7 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSSearc
             return item
         case TB.search:
             let item = NSSearchToolbarItem(itemIdentifier: id)
-            item.searchField.placeholderString = "Search mail"
+            item.searchField.placeholderString = "Search — from:, subject:, has:attachment"
             item.searchField.delegate = self
             item.searchField.sendsWholeSearchString = false
             item.searchField.sendsSearchStringImmediately = false
@@ -233,11 +238,20 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSSearc
         }
         // Local results while typing; the server search runs once typing pauses.
         sidebar.clearSelectionForSearch()
-        list.showSearch(q)
+        list.showSearch(q, from: lastSource)
         list.selectFirst()
-        let work = DispatchWorkItem { [weak self] in self?.list.runServerSearch(q) }
+        let work = DispatchWorkItem { [weak self] in self?.list.runServerSearch() }
         searchDebounce = work
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.6, execute: work)
+    }
+
+    /// Same as typing in the search field (used by the demo hook).
+    func runSearch(_ text: String) {
+        searchField?.stringValue = text
+        sidebar.clearSelectionForSearch()
+        list.showSearch(text, from: lastSource)
+        list.selectFirst()
+        list.runServerSearch()
     }
 
     @objc private func searchSubmitted(_ sender: NSSearchField) {
@@ -245,8 +259,8 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSSearc
         guard !q.trimmingCharacters(in: .whitespaces).isEmpty else { return }
         searchDebounce?.cancel()
         sidebar.clearSelectionForSearch()
-        list.showSearch(q)
-        list.runServerSearch(q)
+        list.showSearch(q, from: lastSource)
+        list.runServerSearch()
     }
 
     @objc func focusSearch(_ sender: Any?) {
@@ -423,7 +437,8 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSSearc
 
     func windowWillClose(_ notification: Notification) {
         // Closing the window quits: nothing keeps running in the background.
-        if !MailService.shared.hasPendingSends && ComposeWindowController.openCount == 0 { NSApp.terminate(nil) }
+        if !MailService.shared.hasPendingSends && ComposeWindowController.openCount == 0
+            && MessageWindowController.openCount == 0 { NSApp.terminate(nil) }
     }
 }
 

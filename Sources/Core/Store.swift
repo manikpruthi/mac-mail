@@ -311,6 +311,14 @@ final class Store {
         return out
     }
 
+    /// Removes cached bodies that came back empty for messages that clearly have content, so they're fetched again.
+    func repairEmptyBodies() {
+        db.run("""
+            DELETE FROM bodies WHERE (html IS NULL OR html = '') AND (text IS NULL OR text = '')
+            AND message_id IN (SELECT id FROM messages WHERE size > 2000)
+            """)
+    }
+
     /// Keeps the cache bounded: drops messages outside the offline window (keeping the newest 200 per folder) and old bodies.
     func prune(offlineDays: Int) {
         let cutoff = Date().addingTimeInterval(-Double(offlineDays + 7) * 86400).timeIntervalSince1970
@@ -324,17 +332,46 @@ final class Store {
 
     // MARK: Search and contacts
 
-    /// Local full-text search; each word is matched as a prefix.
-    func search(_ query: String, limit: Int = 300) -> [MessageRow] {
-        let words = query.split(whereSeparator: { $0.isWhitespace })
-            .filter { !$0.contains(":") }
-            .map { "\"" + $0.replacingOccurrences(of: "\"", with: "") + "\"*" }
-        guard !words.isEmpty else { return [] }
+    /// Local search over the offline cache: words via the full-text index (prefix match), operators and filters via SQL.
+    func search(_ q: SearchQuery, folderID: Int64? = nil, limit: Int = 400) -> [MessageRow] {
+        guard q.hasLocalCriteria else { return [] }
+        var sql = "SELECT \(rowCols) FROM messages m JOIN folders f ON f.id=m.folder_id"
+        var conds: [String] = []
+        var args: [Any?] = []
+        let words = q.words.map { "\"" + $0.replacingOccurrences(of: "\"", with: "") + "\"*" }
+        if !words.isEmpty {
+            sql += " JOIN fts ON fts.rowid=m.id"
+            conds.append("fts MATCH ?")
+            args.append(words.joined(separator: " "))
+        }
+        for v in q.from {
+            conds.append("(m.from_name LIKE ? OR m.from_addr LIKE ?)")
+            args += ["%\(v)%", "%\(v)%"]
+        }
+        for v in q.to {
+            conds.append("(m.to_list LIKE ? OR m.cc_list LIKE ?)")
+            args += ["%\(v)%", "%\(v)%"]
+        }
+        for v in q.subject {
+            conds.append("m.subject LIKE ?")
+            args.append("%\(v)%")
+        }
+        if q.hasAttachment { conds.append("m.has_att = 1") }
+        if q.unread { conds.append("(m.flags & 1) = 0") }
+        if q.flagged { conds.append("(m.flags & 2) != 0") }
+        if let d = q.withinDays {
+            conds.append("m.date >= ?")
+            args.append(Date().addingTimeInterval(-Double(d) * 86400))
+        }
+        if let folderID {
+            conds.append("m.folder_id = ?")
+            args.append(folderID)
+        }
+        if !conds.isEmpty { sql += " WHERE " + conds.joined(separator: " AND ") }
+        sql += " ORDER BY m.date DESC LIMIT ?"
+        args.append(limit)
         var out: [MessageRow] = []
-        db.query("""
-            SELECT \(rowCols) FROM fts JOIN messages m ON m.id=fts.rowid JOIN folders f ON f.id=m.folder_id
-            WHERE fts MATCH ? ORDER BY m.date DESC LIMIT ?
-            """, [words.joined(separator: " "), limit]) { out.append(self.rowFrom($0)) }
+        db.query(sql, args) { out.append(self.rowFrom($0)) }
         return out
     }
 

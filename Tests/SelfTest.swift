@@ -66,6 +66,7 @@ for chunk in stride(from: 0, to: encoded.count, by: 777) { decoded.append(sb.fee
 decoded.append(sb.finish())
 check("streaming base64", decoded == original)
 check("addresses", MIME.parseAddresses("\"Doe, Jane\" <jane@x.com>, bob@y.com").map { $0.email } == ["jane@x.com", "bob@y.com"])
+check("mailto address cleaned", MIME.parseAddresses("<mailto:customer.service@hdfc.bank.in.>, Bank <MAILTO:a@b.com?subject=x>").map { $0.email } == ["customer.service@hdfc.bank.in", "a@b.com"])
 check("plain from html", MIME.plainText(fromHTML: "<style>p{}</style><p>Hello&nbsp;<b>world</b> &amp; co</p>") == "Hello world & co")
 check("literal length", IMAPParser.literalLength(Array("BODY[] {42}".utf8)) == 42 && IMAPParser.literalLength(Array("x {7+}".utf8)) == 7)
 
@@ -75,6 +76,16 @@ let msg = OutgoingMessage(from: EmailAddress(name: "Manik", email: "m@example.co
 let built = String(data: (try? MessageBuilder.build(msg)) ?? Data(), encoding: .utf8) ?? ""
 check("builder headers", built.contains("Subject: =?UTF-8?B?") && built.contains("To: =?UTF-8?B?") && built.contains("multipart/alternative"))
 check("dot stuffing", String(data: SMTPClient.dotStuffed(Data("a\r\n.b\r\n".utf8)), encoding: .utf8) == "a\r\n..b\r\n")
+
+// Search parsing
+let sq1 = SearchQuery.parse("from: divya")
+check("from with space", sq1.from == ["divya"] && sq1.words.isEmpty)
+let sq2 = SearchQuery.parse("from:divya invoice has:attachment is:unread newer_than:2m")
+check("operators", sq2.from == ["divya"] && sq2.words == ["invoice"] && sq2.hasAttachment && sq2.unread && sq2.withinDays == 60)
+let sq3 = SearchQuery.parse("subject:\"q4 budget\" in:inbox")
+check("quoted + server-only", sq3.subject == ["q4 budget"] && sq3.serverOnly == ["in:inbox"])
+check("gmail raw", sq2.gmailRaw == "invoice from:divya has:attachment is:unread newer_than:60d")
+check("imap criteria", SearchQuery.parse("from: bob is:starred").imapCriteria == "FROM \"bob\" FLAGGED")
 
 print(failures == 0 ? "ALL PASS" : "\(failures) FAILED")
 exit(failures == 0 ? 0 : 1)

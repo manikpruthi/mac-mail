@@ -31,15 +31,17 @@ enum HTMLPrep {
     private static let urlLink = try! NSRegularExpression(pattern: "(https?://[^\\s<>\"]+)", options: [])
 
     /// `forceLight`: show the email exactly as designed on white ("Show with light background").
-    static func prepare(html: String?, text: String?, clip: Bool = true, forceLight: Bool = false) -> PreparedHTML {
-        if let html, !html.isEmpty { return prepareHTML(html, clip: clip, forceLight: forceLight) }
+    /// `page` makes every image URL unique to this render (lm://img/<page>/<n>). WebKit caches by URL, so if two
+    /// emails both used lm://img/1, the second would show the first one's picture.
+    static func prepare(html: String?, text: String?, clip: Bool = true, forceLight: Bool = false, page: Int = 0) -> PreparedHTML {
+        if let html, !html.isEmpty { return prepareHTML(html, clip: clip, forceLight: forceLight, page: page) }
         return PreparedHTML(html: wrapPlain(text ?? "", forceLight: forceLight))
     }
 
     /// Matches ReadingPaneView's dark background so the email blends into the app.
     static let darkBackground = "#1e1e1e"
 
-    private static func prepareHTML(_ input: String, clip: Bool, forceLight: Bool) -> PreparedHTML {
+    private static func prepareHTML(_ input: String, clip: Bool, forceLight: Bool, page: Int) -> PreparedHTML {
         var out = PreparedHTML(html: "")
         var s = input
         if clip, s.utf8.count > Prefs.htmlClipBytes {
@@ -80,10 +82,10 @@ enum HTMLPrep {
             let replacement: String
             if lower.hasPrefix("http://") || lower.hasPrefix("https://"), let url = URL(string: src) {
                 out.remote[id] = url
-                replacement = " src=\"lm://img/\(id)\" data-lm=\"\(id)\""
+                replacement = " src=\"lm://img/\(page)/\(id)\" data-lm=\"\(id)\""
             } else if lower.hasPrefix("cid:") {
                 out.cids[id] = String(src.dropFirst(4))
-                replacement = " src=\"lm://cid/\(id)\" data-lm=\"\(id)\""
+                replacement = " src=\"lm://cid/\(page)/\(id)\" data-lm=\"\(id)\""
             } else if lower.hasPrefix("data:") {
                 return t
             } else {
@@ -97,7 +99,7 @@ enum HTMLPrep {
             nextID += 1
             out.remote[id] = url
             out.backgrounds.insert(id)
-            return "url(lm://bg/\(id))"
+            return "url(lm://bg/\(page)/\(id))"
         }
         s = replace(bgAttr, in: s) { _, m in
             guard let url = URL(string: m[2]) else { return "" }
@@ -105,7 +107,7 @@ enum HTMLPrep {
             nextID += 1
             out.remote[id] = url
             out.backgrounds.insert(id)
-            return " background=\"lm://bg/\(id)\""
+            return " background=\"lm://bg/\(page)/\(id)\""
         }
 
         let scheme = forceLight ? "light" : "light dark"

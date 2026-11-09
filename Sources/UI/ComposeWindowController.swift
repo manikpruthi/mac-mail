@@ -1,10 +1,12 @@
 import AppKit
 import UniformTypeIdentifiers
+import WebKit
 
 /// New message / reply / forward / draft editing. Files dropped on the window, passed from Mac Explorer's
 /// "Email with Mac Mail", or opened with the app arrive as attachments.
 @MainActor
-final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTokenFieldDelegate, NSTextViewDelegate {
+final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTokenFieldDelegate, NSTextViewDelegate,
+                                      WKNavigationDelegate, WKUIDelegate {
     enum Kind {
         case new
         case files([URL])
@@ -177,7 +179,24 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
 
         let sep1 = NSBox(); sep1.boxType = .separator
         let sep2 = NSBox(); sep2.boxType = .separator
-        for v in [grid, sep1, scroll, attachmentScroll, sep2, includeOriginal, status, attach, send] as [NSView] {
+        // Header rows keep their natural height; the editor/original split takes the rest of the window.
+        for f in [toField, ccField, bccField, subjectField] as [NSView] {
+            f.setContentHuggingPriority(.required, for: .vertical)
+            f.setContentCompressionResistancePriority(.required, for: .vertical)
+        }
+        grid.setContentHuggingPriority(.required, for: .vertical)
+        split.setContentHuggingPriority(.defaultLow, for: .vertical)
+        split.setContentCompressionResistancePriority(.defaultLow, for: .vertical)
+        split.heightAnchor.constraint(greaterThanOrEqualToConstant: 220).isActive = true
+        // Editor on top, the original message (read-only, as it looked) underneath; drag the divider to resize.
+        split.isVertical = false
+        split.dividerStyle = .thin
+        split.addArrangedSubview(scroll)
+        split.addArrangedSubview(quotePane)
+        quotePane.isHidden = true
+        includeOriginal.target = self
+        includeOriginal.action = #selector(includeOriginalChanged)
+        for v in [grid, sep1, split, attachmentScroll, sep2, includeOriginal, status, attach, send] as [NSView] {
             v.translatesAutoresizingMaskIntoConstraints = false
             content.addSubview(v)
         }
@@ -188,10 +207,10 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
             sep1.topAnchor.constraint(equalTo: grid.bottomAnchor, constant: 10),
             sep1.leadingAnchor.constraint(equalTo: content.leadingAnchor),
             sep1.trailingAnchor.constraint(equalTo: content.trailingAnchor),
-            scroll.topAnchor.constraint(equalTo: sep1.bottomAnchor),
-            scroll.leadingAnchor.constraint(equalTo: content.leadingAnchor),
-            scroll.trailingAnchor.constraint(equalTo: content.trailingAnchor),
-            scroll.bottomAnchor.constraint(equalTo: attachmentScroll.topAnchor),
+            split.topAnchor.constraint(equalTo: sep1.bottomAnchor),
+            split.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+            split.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+            split.bottomAnchor.constraint(equalTo: attachmentScroll.topAnchor),
             attachmentScroll.leadingAnchor.constraint(equalTo: content.leadingAnchor),
             attachmentScroll.trailingAnchor.constraint(equalTo: content.trailingAnchor),
             attachmentScroll.bottomAnchor.constraint(equalTo: sep2.topAnchor),
@@ -264,7 +283,7 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
             replyRow = MailService.shared.store.rows(ids: [d.id]).first
             setQuote(d, body, header: "On \(Self.quoteDate(d.date)), \(d.from.full) wrote:")
             setBody("", signature: true)
-            window?.title = "Re: " + d.subject
+            window?.title = subjectField.stringValue
             window?.makeFirstResponder(textView)
             textView.setSelectedRange(NSRange(location: 0, length: 0))
         case .forward(let d, let body):
@@ -279,7 +298,7 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
             """
             setQuote(d, body, header: header, blockquote: false)
             setBody("", signature: true)
-            window?.title = "Fwd: " + d.subject
+            window?.title = subjectField.stringValue
             fetchForwardAttachments(d)
             window?.makeFirstResponder(toField)
         case .draft(let d, let body):
@@ -322,7 +341,98 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
             .font: NSFont.systemFont(ofSize: 14), .foregroundColor: NSColor.textColor]))
     }
 
+    // MARK: Original message pane
+
+    private let split = NSSplitView()
+    private let quotePane = NSView()
+    private var quoteWeb: WKWebView?
+    private let quoteLoader = ImageLoader()
+
+    /// Shows the message being replied to / forwarded under the editor, rendered like the reading pane
+    /// (same image limits, remote content blocked, scripts off). It's what gets quoted when you send.
+    private func showOriginal(_ d: MessageDetail, _ body: StoredBody?, header: String) {
+        let label = NSTextField(labelWithString: header)
+        label.font = .systemFont(ofSize: 11)
+        label.textColor = .secondaryLabelColor
+        label.maximumNumberOfLines = 6
+        label.lineBreakMode = .byTruncatingTail
+        let config = WKWebViewConfiguration()
+        config.setURLSchemeHandler(quoteLoader, forURLScheme: "lm")
+        config.websiteDataStore = .nonPersistent()
+        config.defaultWebpagePreferences.allowsContentJavaScript = false
+        config.userContentController.addUserScript(WKUserScript(source: DarkReader.script, injectionTime: .atDocumentEnd,
+                                                                forMainFrameOnly: true, in: .defaultClient))
+        if let list = PreviewViewController.ruleList { config.userContentController.add(list) }
+        let web = WKWebView(frame: .zero, configuration: config)
+        web.navigationDelegate = self
+        web.uiDelegate = self
+        web.setValue(false, forKey: "drawsBackground")
+        let prepared = HTMLPrep.prepare(html: body?.html, text: body?.text, page: 1)
+        let spam = d.folderRole == .spam
+        quoteLoader.page = ImagePage(generation: 1, messageID: d.id, accountID: d.accountID, prepared: prepared,
+                                     autoLoad: !spam && !Prefs.askBeforeImages, ignoreLimits: false)
+        quoteLoader.page?.dark = view.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        web.loadHTMLString(prepared.html, baseURL: URL(string: "lm://quote/\(d.id)/"))
+        quoteWeb = web
+        let sep = NSBox()
+        sep.boxType = .separator
+        for v in [sep, label, web] as [NSView] {
+            v.translatesAutoresizingMaskIntoConstraints = false
+            quotePane.addSubview(v)
+        }
+        NSLayoutConstraint.activate([
+            sep.topAnchor.constraint(equalTo: quotePane.topAnchor),
+            sep.leadingAnchor.constraint(equalTo: quotePane.leadingAnchor, constant: 14),
+            sep.trailingAnchor.constraint(equalTo: quotePane.trailingAnchor, constant: -14),
+            label.topAnchor.constraint(equalTo: sep.bottomAnchor, constant: 8),
+            label.leadingAnchor.constraint(equalTo: quotePane.leadingAnchor, constant: 18),
+            label.trailingAnchor.constraint(equalTo: quotePane.trailingAnchor, constant: -18),
+            web.topAnchor.constraint(equalTo: label.bottomAnchor, constant: 2),
+            web.leadingAnchor.constraint(equalTo: quotePane.leadingAnchor),
+            web.trailingAnchor.constraint(equalTo: quotePane.trailingAnchor),
+            web.bottomAnchor.constraint(equalTo: quotePane.bottomAnchor),
+        ])
+        quotePane.isHidden = false
+        // Give the editor the top third; the original fills the rest.
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.split.setPosition(max(160, self.split.bounds.height * 0.34), ofDividerAt: 0)
+        }
+    }
+
+    // MARK: Quote-pane navigation
+
+    func webView(_ webView: WKWebView, decidePolicyFor action: WKNavigationAction,
+                 decisionHandler: @escaping @MainActor (WKNavigationActionPolicy) -> Void) {
+        guard let url = action.request.url else { decisionHandler(.cancel); return }
+        if action.navigationType == .linkActivated {
+            decisionHandler(.cancel)
+            ExternalNavigation.open(url)
+            return
+        }
+        if url.scheme == "lm" || url.scheme == "about" {
+            decisionHandler(.allow)
+        } else {
+            decisionHandler(.cancel)
+        }
+    }
+
+    func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration,
+                 for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
+        if let url = navigationAction.request.url { ExternalNavigation.open(url) }
+        return nil
+    }
+
+    private var view: NSView { window?.contentView ?? NSView() }
+
+    @objc private func includeOriginalChanged() {
+        quotePane.isHidden = includeOriginal.state != .on
+        split.adjustSubviews()
+        dirty = true
+    }
+
     private func setQuote(_ d: MessageDetail, _ body: StoredBody?, header: String, blockquote: Bool = true) {
+        showOriginal(d, body, header: header)
         let originalHTML: String
         if let h = body?.html, !h.isEmpty {
             originalHTML = HTMLPrep.bodyInner(h)
@@ -576,6 +686,9 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
     }
 
     private func cleanUpAndForget() {
+        quoteLoader.cancelAll()
+        quoteWeb?.removeFromSuperview()
+        quoteWeb = nil
         for d in tempDirs { try? FileManager.default.removeItem(at: d) }
         tempDirs.removeAll()
         window?.orderOut(nil)
@@ -605,6 +718,42 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
 
     func tokenField(_ tokenField: NSTokenField, editingStringForRepresentedObject representedObject: Any) -> String? {
         representedObject as? String
+    }
+
+    // MARK: Dragging addresses between To / Cc / Bcc (a move, like Outlook)
+
+    private static let addressType = NSPasteboard.PasteboardType("com.manikpruthi.macmail.addresses")
+    /// The field a drag of address tokens started in, and what it carried.
+    private var dragSource: (field: NSTokenField, objects: [String], changeCount: Int)?
+
+    func tokenField(_ tokenField: NSTokenField, writeRepresentedObjects objects: [Any], to pboard: NSPasteboard) -> Bool {
+        let strings = objects.compactMap { $0 as? String }
+        guard !strings.isEmpty else { return false }
+        pboard.declareTypes([Self.addressType, .string], owner: nil)
+        pboard.setPropertyList(strings, forType: Self.addressType)
+        pboard.setString(strings.joined(separator: ", "), forType: .string)
+        dragSource = pboard.name == .drag ? (tokenField, strings, pboard.changeCount) : nil
+        return true
+    }
+
+    func tokenField(_ tokenField: NSTokenField, readFrom pboard: NSPasteboard) -> [Any]? {
+        let objects = (pboard.propertyList(forType: Self.addressType) as? [String])
+            ?? pboard.string(forType: .string).map { MIME.parseAddresses($0).map { $0.full } }
+        guard let objects, !objects.isEmpty else { return nil }
+        if pboard.name == .drag, let src = dragSource, src.changeCount == pboard.changeCount, src.field !== tokenField {
+            dragSource = nil
+            // After the drop finishes, take the tokens out of the field they were dragged from.
+            DispatchQueue.main.async { [weak self] in self?.remove(src.objects, from: src.field) }
+        }
+        return objects
+    }
+
+    private func remove(_ objects: [String], from field: NSTokenField) {
+        if field.currentEditor() != nil { field.validateEditing(); field.abortEditing() }
+        var current = (field.objectValue as? [Any])?.compactMap { $0 as? String } ?? []
+        for o in objects { if let i = current.firstIndex(of: o) { current.remove(at: i) } }
+        field.objectValue = current
+        dirty = true
     }
 
     func controlTextDidChange(_ obj: Notification) { dirty = true }

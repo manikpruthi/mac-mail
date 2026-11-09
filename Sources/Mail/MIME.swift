@@ -219,15 +219,26 @@ enum MIME {
             var name = String(s[..<lt]).trimmingCharacters(in: .whitespaces)
             if name.hasPrefix("\"") && name.hasSuffix("\"") && name.count >= 2 { name = String(name.dropFirst().dropLast()) }
             name = name.replacingOccurrences(of: "\\\"", with: "\"")
-            return EmailAddress(name: name, email: email)
+            return EmailAddress(name: name, email: cleanEmail(email))
         }
         // "addr (Name)" comment form.
         if let open = s.firstIndex(of: "("), let close = s.lastIndex(of: ")"), open < close {
             let email = String(s[..<open]).trimmingCharacters(in: .whitespaces)
             let name = String(s[s.index(after: open)..<close])
-            return EmailAddress(name: name, email: email)
+            return EmailAddress(name: name, email: cleanEmail(email))
         }
-        return EmailAddress(name: "", email: s.trimmingCharacters(in: CharacterSet(charactersIn: "\"")))
+        return EmailAddress(name: "", email: cleanEmail(s.trimmingCharacters(in: CharacterSet(charactersIn: "\""))))
+    }
+
+    /// Senders sometimes put a link in an address header ("<mailto:help@bank.in.>"); Gmail rejects that as not
+    /// RFC 5321. Strip a mailto: scheme and any ?query, and the trailing dots of a fully-qualified domain.
+    static func cleanEmail(_ raw: String) -> String {
+        var e = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if e.lowercased().hasPrefix("mailto:") { e = String(e.dropFirst(7)) }
+        if let q = e.firstIndex(of: "?") { e = String(e[..<q]) }
+        e = e.removingPercentEncoding ?? e
+        while e.hasSuffix(".") { e.removeLast() }
+        return e.trimmingCharacters(in: CharacterSet(charactersIn: "<> \t"))
     }
 
     // MARK: HTML helpers
