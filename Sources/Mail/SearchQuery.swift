@@ -2,7 +2,7 @@ import Foundation
 
 /// A parsed search: Gmail-style operators plus the filter bar's choices. Used for both the instant local search
 /// (SQL) and the server search (X-GM-RAW on Gmail, IMAP SEARCH elsewhere).
-struct SearchQuery: Equatable {
+struct SearchQuery: Equatable, Codable {
     var words: [String] = []
     var from: [String] = []
     var to: [String] = []

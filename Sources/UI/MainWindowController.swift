@@ -78,6 +78,7 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSSearc
 
         NotificationCenter.default.addObserver(self, selector: #selector(accountsChanged), name: .mailAccountsChanged, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(foldersChanged), name: .mailFoldersChanged, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(searchFiltersChanged(_:)), name: .mailSearchFiltersChanged, object: nil)
     }
 
     required init?(coder: NSCoder) { fatalError() }
@@ -98,14 +99,29 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSSearc
         if list.source == .unified, MailService.shared.accounts.count == 1 { sidebar.selectDefault() }
     }
 
+    /// Mirrors the list's filter bar so Save Search captures the full query (C-19). A filter change
+    /// also reloads the results without a selection, so the preview must not keep showing a message
+    /// the visible list no longer contains (C-14).
+    @objc private func searchFiltersChanged(_ note: Notification) {
+        liveFilters = (note.object as? SearchFilters) ?? SearchFilters()
+        if case .search = list.source { preview.showEmpty(text: "No message selected") }
+    }
+    private var liveFilters = SearchFilters()
+
     // MARK: Navigation
 
     private func showSource(_ source: MailSource) {
-        lastSource = source
+        // The folder a search was started from can be deleted while searching; never restore a dead source.
+        var target = source
+        if case .folder(let id) = source, MailService.shared.store.folder(id) == nil { target = .unified }
+        lastSource = target
+        // Every source change selects the sidebar row, so ⌘1…9 and clearing the search keep the
+        // highlight and the list in sync (C-15).
+        sidebar.select(source: target)
         searchField?.stringValue = ""
-        list.show(source)
+        list.show(target)
         preview.showEmpty(text: "No message selected")
-        syncSource(source)
+        syncSource(target)
         list.selectFirst()
     }
 
@@ -269,10 +285,18 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSSearc
         return menu
     }
 
-    /// Keeps the current query as a sidebar smart folder (F-29).
+    /// Keeps the current query — text plus filter-bar choices and scope — as a sidebar smart folder (F-29 / C-19).
     @objc func saveCurrentSearch(_ sender: Any?) {
-        let q = searchField?.stringValue.trimmingCharacters(in: .whitespaces) ?? ""
-        guard !q.isEmpty, let w = window else { NSSound.beep(); return }
+        guard case .search = list.source,
+              let q = searchField?.stringValue.trimmingCharacters(in: .whitespaces), !q.isEmpty,
+              let w = window else { NSSound.beep(); return }
+        var filters = liveFilters
+        var scopeID: Int64?
+        if filters.scope == .folder {
+            if case .folder(let id) = lastSource, MailService.shared.store.folder(id) != nil { scopeID = id }
+            else { filters.scope = .all } // the scoped folder is gone; the saved search covers all folders
+        }
+        let saved = SavedSearches.Entry.Saved(filters: filters, scopeFolderID: scopeID)
         let alert = NSAlert()
         alert.messageText = "Save search"
         alert.informativeText = "“\(q)” will appear under Saved Searches in the sidebar."
@@ -282,7 +306,7 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSSearc
         alert.addButton(withTitle: "Save")
         alert.addButton(withTitle: "Cancel")
         alert.beginSheetModal(for: w) { r in
-            if r == .alertFirstButtonReturn { SavedSearches.add(name: field.stringValue, query: q) }
+            if r == .alertFirstButtonReturn { SavedSearches.add(name: field.stringValue, query: q, structured: saved) }
         }
     }
 
@@ -320,6 +344,8 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSSearc
         // No auto-select while typing: the preview must not mark results read per keystroke.
         sidebar.clearSelectionForSearch()
         list.showSearch(q, from: lastSource)
+        // reload(keepSelection: false) drops the selection silently; the preview must follow (C-14).
+        preview.showEmpty(text: "No message selected")
         let work = DispatchWorkItem { [weak self] in self?.list.runServerSearch() }
         searchDebounce = work
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.6, execute: work)
@@ -330,8 +356,43 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSSearc
         searchField?.stringValue = text
         sidebar.clearSelectionForSearch()
         list.showSearch(text, from: lastSource)
+        preview.showEmpty(text: "No message selected")
         list.selectFirst(userInitiated: false)
         list.runServerSearch()
+    }
+
+    /// Runs a saved search, restoring the filter-bar state and scope it was saved with (C-19).
+    func runSearch(_ entry: SavedSearches.Entry) {
+        guard let saved = entry.structured else { runSearch(entry.query); return }
+        var filters = saved.filters
+        var origin = lastSource
+        if let id = saved.scopeFolderID, MailService.shared.store.folder(id) != nil {
+            origin = .folder(id)
+        } else if filters.scope == .folder {
+            filters.scope = .all // the scoped folder is gone; search everywhere
+        }
+        searchField?.stringValue = entry.query
+        sidebar.clearSelectionForSearch()
+        list.showSearch(entry.query, from: origin)
+        if filters != SearchFilters(), let bar = searchFilterBar {
+            bar.apply(filters) // re-runs the search with the restored filters
+        } else {
+            preview.showEmpty(text: "No message selected")
+            list.runServerSearch()
+        }
+        list.selectFirst(userInitiated: false)
+    }
+
+    /// The list's filter bar, found in the view hierarchy (it is owned by the list controller).
+    private var searchFilterBar: SearchFilterBar? {
+        var found: SearchFilterBar?
+        func walk(_ v: NSView) {
+            guard found == nil else { return }
+            if let bar = v as? SearchFilterBar { found = bar; return }
+            for s in v.subviews { walk(s) }
+        }
+        walk(list.view)
+        return found
     }
 
     @objc private func searchSubmitted(_ sender: Any?) {
@@ -345,6 +406,7 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSSearc
         searchDebounce?.cancel()
         sidebar.clearSelectionForSearch()
         list.showSearch(q, from: lastSource)
+        preview.showEmpty(text: "No message selected")
         list.runServerSearch()
     }
 
@@ -506,7 +568,9 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSSearc
         let selectedIDs = Set(list.selectedRows.map { $0.id })
         let touchesSelection = rows.contains { selectedIDs.contains($0.id) }
         // MailService.move posts a full data change; this reload already covers it (B-24 / O-18).
-        list.skipNextFullReload = true
+        // In search results the list refreshes from that notification instead (its .search branch),
+        // so the skip flag must stay clear or it would swallow the next genuine change (C-12).
+        if case .search = list.source {} else { list.skipNextFullReload = true }
         if let result = MailService.shared.move(rows, to: target) {
             if touchesSelection {
                 list.reload(keepSelection: false)
@@ -566,15 +630,51 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSSearc
         preview.printMessage()
     }
 
-    /// Mailbox ▸ Empty Trash / Empty Spam for the selected folder's account (F-10).
+    /// Mailbox ▸ Empty Trash / Empty Spam for the selected folder's account (F-10); from a unified
+    /// view it covers that role in every account, with an aggregate count (C-04).
     @objc func emptyTrash(_ sender: Any?) { emptyRole(.trash) }
     @objc func emptySpam(_ sender: Any?) { emptyRole(.spam) }
 
     private func emptyRole(_ role: FolderRole) {
         let store = MailService.shared.store
+        if list.source.isUnified {
+            let folders = MailService.shared.accounts.compactMap { store.folder(account: $0.id, role: role) }
+            guard !folders.isEmpty else { NSSound.beep(); return }
+            confirmEmptyAll(folders, in: window)
+            return
+        }
         let account = sidebar.selectedFolder?.accountID ?? list.focusedRow?.accountID ?? MailService.shared.defaultAccount?.id
         guard let account, let f = store.folder(account: account, role: role) else { NSSound.beep(); return }
         SidebarViewController.confirmEmpty(f, in: window)
+    }
+
+    /// One confirmation for emptying a role across every account (unified views — C-04).
+    private func confirmEmptyAll(_ folders: [Folder], in window: NSWindow?) {
+        guard let window, let role = folders.first?.role else { return }
+        let store = MailService.shared.store
+        let name = MessageListViewController.roleTitle(role)
+        let n = folders.reduce(0) { $0 + store.messageCount(folderID: $1.id) }
+        let alert = NSAlert()
+        alert.messageText = "Empty \(name) in all accounts?"
+        alert.informativeText = "\(n > 0 ? "\(n) cached message\(n == 1 ? "" : "s") and everything else" : "Everything") in \(folders.count) account\(folders.count == 1 ? "'s" : "s'") \(name) on the server will be deleted permanently. This can't be undone."
+        alert.addButton(withTitle: "Empty All")
+        alert.addButton(withTitle: "Cancel")
+        alert.buttons.first?.hasDestructiveAction = true
+        alert.beginSheetModal(for: window) { [weak self] r in
+            guard r == .alertFirstButtonReturn else { return }
+            Task {
+                var failure: String?
+                for f in folders {
+                    do { try await MailService.shared.emptyFolder(f) }
+                    catch { failure = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription; break }
+                }
+                if let failure {
+                    self?.toast.show("Couldn't empty \(name): \(failure)")
+                } else {
+                    self?.toast.show("All \(name) emptied")
+                }
+            }
+        }
     }
 
     @objc func syncNow(_ sender: Any?) {
