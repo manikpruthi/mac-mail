@@ -23,6 +23,9 @@ final class MessageListViewController: NSViewController, NSOutlineViewDataSource
     private let subtitle = NSTextField(labelWithString: "")
     private let groupToggle = NSButton(checkboxWithTitle: "Conversations", target: nil, action: nil)
     private let olderButton = NSButton(title: "Load older messages", target: nil, action: nil)
+    private let olderSpinner = NSProgressIndicator()
+    private let emptyLabel = NSTextField(wrappingLabelWithString: "")
+    private var allCaughtUp = false
     private var nodes: [ListNode] = []
     private(set) var source: MailSource = .unified
     private(set) var grouped = false
@@ -37,7 +40,7 @@ final class MessageListViewController: NSViewController, NSOutlineViewDataSource
     private var searchToken = 0
     private var reloadScheduled = false
 
-    var onSelectionChange: (([MessageRow]) -> Void)?
+    var onSelectionChange: (([MessageRow], _ userInitiated: Bool) -> Void)?
     var onOpen: ((MessageRow) -> Void)?
     var showToast: ((String) -> Void)?
 
@@ -75,16 +78,32 @@ final class MessageListViewController: NSViewController, NSOutlineViewDataSource
         menu.delegate = self
         outline.menu = menu
         outline.keyHandler = { [weak self] e in self?.handleKey(e) ?? false }
+        outline.onRedundantClick = { [weak self] in
+            // Clicking the row that was auto-selected at launch: treat it as an explicit open.
+            guard let self, let r = self.focusedRow else { return }
+            self.onSelectionChange?([r], true)
+        }
         scroll.documentView = outline
 
         olderButton.bezelStyle = .inline
         olderButton.controlSize = .small
         olderButton.target = self
         olderButton.action = #selector(loadOlder)
+        olderSpinner.style = .spinning
+        olderSpinner.controlSize = .small
+        olderSpinner.isDisplayedWhenStopped = false
+        emptyLabel.font = .systemFont(ofSize: 13)
+        emptyLabel.textColor = .secondaryLabelColor
+        emptyLabel.alignment = .center
+        emptyLabel.isEditable = false
+        emptyLabel.drawsBackground = false
+        emptyLabel.isBordered = false
+        emptyLabel.maximumNumberOfLines = 2
+        emptyLabel.isHidden = true
 
         filterBar.isHidden = true
         filterBar.onChange = { [weak self] _ in self?.filtersChanged() }
-        for v in [titleLabel, subtitle, groupToggle, filterBar, scroll, olderButton] as [NSView] {
+        for v in [titleLabel, subtitle, groupToggle, filterBar, scroll, olderButton, olderSpinner, emptyLabel] as [NSView] {
             v.translatesAutoresizingMaskIntoConstraints = false
             root.addSubview(v)
         }
@@ -107,6 +126,11 @@ final class MessageListViewController: NSViewController, NSOutlineViewDataSource
             scroll.bottomAnchor.constraint(equalTo: olderButton.topAnchor, constant: -4),
             olderButton.centerXAnchor.constraint(equalTo: root.centerXAnchor),
             olderButton.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -6),
+            olderSpinner.centerXAnchor.constraint(equalTo: root.centerXAnchor),
+            olderSpinner.centerYAnchor.constraint(equalTo: olderButton.centerYAnchor),
+            emptyLabel.centerXAnchor.constraint(equalTo: scroll.centerXAnchor),
+            emptyLabel.centerYAnchor.constraint(equalTo: scroll.centerYAnchor),
+            emptyLabel.widthAnchor.constraint(lessThanOrEqualToConstant: 320),
         ])
         filterCollapsed = filterBar.heightAnchor.constraint(equalToConstant: 0)
         filterCollapsed.isActive = true
@@ -118,6 +142,7 @@ final class MessageListViewController: NSViewController, NSOutlineViewDataSource
 
     func show(_ source: MailSource) {
         self.source = source
+        allCaughtUp = false
         setFilterBarVisible(false)
         if case .search = source {} else { searchRows = [] }
         grouped = Prefs.groupByConversation(folderKey: folderKey)
@@ -140,7 +165,13 @@ final class MessageListViewController: NSViewController, NSOutlineViewDataSource
             updateFlagsInPlace(Set(ids))
             return
         }
-        if case .search = source, note.userInfo?["flagsOnly"] == nil { return }
+        if case .search = source {
+            // Moves/deletes/new mail must be reflected in the live results: refresh the local search
+            // (cheap FTS query), keeping selection and expansion via reload(keepSelection:).
+            searchRows = Self.dedupe(MailService.shared.store.search(currentQuery, folderID: scopeFolderID))
+            reload(keepSelection: true)
+            return
+        }
         if let fid = note.object as? Int64, case .folder(let current) = source, fid != current { return }
         // Coalesce bursts (initial sync posts once per chunk).
         guard !reloadScheduled else { return }
@@ -189,18 +220,41 @@ final class MessageListViewController: NSViewController, NSOutlineViewDataSource
         let t0 = Date()
         defer { Debug.log("list reload (\(nodes.count) rows): \(Debug.ms(since: t0))") }
         let store = MailService.shared.store
-        let selectedIDs = Set(selectedRows.map { $0.id })
+        // Rebuilding the nodes changes item identity, so remember which threads were expanded and
+        // which messages were selected (including thread children) and restore them by id.
+        var expandedIDs = Set<Int64>()
+        var selectedIDs = Set<Int64>()
+        if keepSelection {
+            for r in 0..<outline.numberOfRows {
+                guard let n = outline.item(atRow: r) as? ListNode else { continue }
+                if n.isThread && outline.isItemExpanded(n) { expandedIDs.insert(n.row.id) }
+            }
+            selectedIDs = Set(outline.selectedRowIndexes.compactMap { outline.item(atRow: $0) as? ListNode }
+                .flatMap { $0.allRows.map { $0.id } })
+        }
         let rows: [MessageRow]
         switch source {
         case .unified:
             rows = store.unifiedInboxRows()
             titleLabel.stringValue = "All Inboxes"
-            olderButton.isHidden = true
+            if allCaughtUp {
+                olderButton.isHidden = false
+                olderButton.title = "All caught up"
+                olderButton.isEnabled = false
+            } else {
+                olderButton.isHidden = true
+            }
         case .folder(let id):
             rows = store.rows(folderID: id)
             let f = store.folder(id)
             titleLabel.stringValue = f?.name ?? "Folder"
-            olderButton.isHidden = rows.count < 50
+            if allCaughtUp {
+                olderButton.isHidden = false
+                olderButton.title = "All caught up"
+                olderButton.isEnabled = false
+            } else {
+                olderButton.isHidden = rows.count < 50
+            }
         case .search(let q):
             rows = searchRows
             titleLabel.stringValue = "Search: \(q)"
@@ -208,15 +262,36 @@ final class MessageListViewController: NSViewController, NSOutlineViewDataSource
         }
         nodes = grouped ? Self.group(rows) : rows.map { ListNode(row: $0) }
         updateSubtitle()
+        updateEmptyLabel(rows: rows)
         outline.reloadData()
+        for r in 0..<outline.numberOfRows {
+            if let n = outline.item(atRow: r) as? ListNode, n.isThread, expandedIDs.contains(n.row.id) {
+                outline.expandItem(n)
+            }
+        }
         if keepSelection && !selectedIDs.isEmpty {
             var idx = IndexSet()
             for r in 0..<outline.numberOfRows {
-                if let n = outline.item(atRow: r) as? ListNode, selectedIDs.contains(n.row.id) { idx.insert(r) }
+                if let n = outline.item(atRow: r) as? ListNode, n.allRows.contains(where: { selectedIDs.contains($0.id) }) { idx.insert(r) }
             }
             suppressSelection = true
             outline.selectRowIndexes(idx, byExtendingSelection: false)
             suppressSelection = false
+        }
+    }
+
+    /// Contextual empty state: blank folders, zero search results and in-flight server searches.
+    private func updateEmptyLabel(rows: [MessageRow]) {
+        if case .search(let q) = source {
+            if rows.isEmpty {
+                emptyLabel.stringValue = serverSearching ? "Searching…" : "No results for “\(q)”"
+                emptyLabel.isHidden = false
+            } else {
+                emptyLabel.isHidden = true
+            }
+        } else {
+            emptyLabel.stringValue = "No messages"
+            emptyLabel.isHidden = !rows.isEmpty
         }
     }
 
@@ -265,6 +340,8 @@ final class MessageListViewController: NSViewController, NSOutlineViewDataSource
         searchText = text.trimmingCharacters(in: .whitespaces)
         source = .search(searchText)
         serverSearchError = nil
+        // Any query change invalidates an in-flight server search for the older query.
+        searchToken += 1
         searchRows = Self.dedupe(MailService.shared.store.search(currentQuery, folderID: scopeFolderID))
         grouped = Prefs.groupByConversation(folderKey: "search")
         groupToggle.state = grouped ? .on : .off
@@ -277,7 +354,6 @@ final class MessageListViewController: NSViewController, NSOutlineViewDataSource
         guard case .search = source else { return }
         searchRows = Self.dedupe(MailService.shared.store.search(currentQuery, folderID: scopeFolderID))
         reload(keepSelection: false)
-        selectFirst()
         filterWork?.cancel()
         let work = DispatchWorkItem { [weak self] in self?.runServerSearch() }
         filterWork = work
@@ -342,6 +418,8 @@ final class MessageListViewController: NSViewController, NSOutlineViewDataSource
     // MARK: Selection
 
     private var suppressSelection = false
+    /// Programmatic selections (launch, folder switch, data reloads) must not count as opening a message.
+    private var selectionIsProgrammatic = false
 
     var selectedRows: [MessageRow] {
         outline.selectedRowIndexes.compactMap { (outline.item(atRow: $0) as? ListNode) }.flatMap { node -> [MessageRow] in
@@ -359,19 +437,27 @@ final class MessageListViewController: NSViewController, NSOutlineViewDataSource
 
     func outlineViewSelectionDidChange(_ notification: Notification) {
         guard !suppressSelection else { return }
-        onSelectionChange?(selectedRows)
+        let userInitiated = !selectionIsProgrammatic
+        selectionIsProgrammatic = false
+        onSelectionChange?(selectedRows, userInitiated)
     }
 
-    func selectFirst() {
-        guard outline.numberOfRows > 0 else { onSelectionChange?([]); return }
+    /// Selects the first row. Auto-selections pass userInitiated: false so the message isn't marked read.
+    func selectFirst(userInitiated: Bool = false) {
+        guard outline.numberOfRows > 0 else { onSelectionChange?([], userInitiated); return }
+        selectionIsProgrammatic = !userInitiated
         outline.selectRowIndexes([0], byExtendingSelection: false)
+        selectionIsProgrammatic = false
     }
 
-    /// After a move/delete: keep the cursor near where it was.
-    func selectAfterRemoval(previousIndex: Int) {
+    /// After a move/delete: keep the cursor near where it was. The demo/benchmark hooks use the
+    /// user-initiated default; the real cursor move after archive/delete passes false (never marks read).
+    func selectAfterRemoval(previousIndex: Int, userInitiated: Bool = true) {
         let n = outline.numberOfRows
-        guard n > 0 else { onSelectionChange?([]); return }
+        guard n > 0 else { onSelectionChange?([], userInitiated); return }
+        selectionIsProgrammatic = !userInitiated
         outline.selectRowIndexes([min(previousIndex, n - 1)], byExtendingSelection: false)
+        selectionIsProgrammatic = false
     }
 
     var selectedIndex: Int { outline.selectedRow }
@@ -396,13 +482,21 @@ final class MessageListViewController: NSViewController, NSOutlineViewDataSource
     @objc private func loadOlder() {
         guard case .folder(let id) = source, let f = MailService.shared.store.folder(id),
               let engine = MailService.shared.engine(f.accountID) else { return }
-        olderButton.isEnabled = false
-        olderButton.title = "Loading…"
+        olderButton.isHidden = true
+        olderSpinner.startAnimation(nil)
         Task {
             let n = await engine.loadOlder(folderID: id)
-            olderButton.isEnabled = true
-            olderButton.title = "Load older messages"
-            if n == 0 { showToast?("No older messages") }
+            olderSpinner.stopAnimation(nil)
+            olderButton.isHidden = false
+            if n == 0 {
+                allCaughtUp = true
+                olderButton.title = "All caught up"
+                olderButton.isEnabled = false
+                showToast?("All caught up")
+            } else {
+                olderButton.title = "Load older messages"
+                olderButton.isEnabled = true
+            }
         }
     }
 
@@ -460,6 +554,36 @@ final class MessageListViewController: NSViewController, NSOutlineViewDataSource
 
     func outlineView(_ outlineView: NSOutlineView, heightOfRowByItem item: Any) -> CGFloat {
         outlineView.parent(forItem: item) != nil ? 50 : 68
+    }
+
+    // MARK: Swipe actions
+
+    func tableView(_ tableView: NSTableView, rowActionsForRow row: Int, edge: NSTableView.RowActionEdge) -> [NSTableViewRowAction] {
+        guard let node = outline.item(atRow: row) as? ListNode else { return [] }
+        let rows = node.allRows
+        let app = NSApp.delegate as? AppDelegate
+        func action(_ title: String, _ color: NSColor, _ symbol: String, _ handler: @escaping () -> Void) -> NSTableViewRowAction {
+            let a = NSTableViewRowAction(style: .regular, title: title) { _, _ in handler() }
+            a.backgroundColor = color
+            a.image = NSImage(systemSymbolName: symbol, accessibilityDescription: title)
+            return a
+        }
+        switch edge {
+        case .trailing:
+            return [action("Archive", .systemGray, "archivebox") { app?.mainWindow?.moveRows(rows, to: .archive) }]
+        case .leading:
+            let anyUnread = rows.contains { !$0.flags.contains(.seen) }
+            let anyUnflagged = rows.contains { !$0.flags.contains(.flagged) }
+            let read = action(anyUnread ? "Read" : "Unread", .systemBlue, anyUnread ? "envelope.open" : "envelope.badge") {
+                MailService.shared.setFlag(rows, flag: .seen, on: anyUnread)
+            }
+            let flag = action(anyUnflagged ? "Flag" : "Unflag", .systemOrange, "flag") {
+                MailService.shared.setFlag(rows, flag: .flagged, on: anyUnflagged)
+            }
+            return [read, flag]
+        @unknown default:
+            return []
+        }
     }
 
     // MARK: Context menu
@@ -522,9 +646,16 @@ final class MoveChoice {
 
 final class MessageOutlineView: NSOutlineView {
     var keyHandler: ((NSEvent) -> Bool)?
+    /// Clicking the already-selected row (e.g. the one auto-selected at launch) — an explicit open.
+    var onRedundantClick: (() -> Void)?
     override func keyDown(with event: NSEvent) {
         if keyHandler?(event) == true { return }
         super.keyDown(with: event)
+    }
+    override func mouseDown(with event: NSEvent) {
+        let row = row(at: convert(event.locationInWindow, from: nil))
+        super.mouseDown(with: event)
+        if row >= 0 && row == selectedRow { onRedundantClick?() }
     }
 }
 
@@ -541,6 +672,7 @@ final class MessageCell: NSTableCellView {
     private let icons = NSStackView()
     private let clip = NSImageView(image: NSImage(systemSymbolName: "paperclip", accessibilityDescription: "Attachment") ?? NSImage())
     private let flag = NSImageView(image: NSImage(systemSymbolName: "flag.fill", accessibilityDescription: "Flagged") ?? NSImage())
+    private let answered = NSImageView(image: NSImage(systemSymbolName: "arrowshape.turn.up.left", accessibilityDescription: "Replied") ?? NSImage())
     private let count = NSTextField(labelWithString: "")
     private var subjectTop: NSLayoutConstraint!
 
@@ -564,11 +696,13 @@ final class MessageCell: NSTableCellView {
         clip.symbolConfiguration = .init(pointSize: 10, weight: .regular)
         flag.contentTintColor = .systemOrange
         flag.symbolConfiguration = .init(pointSize: 10, weight: .regular)
+        answered.contentTintColor = .secondaryLabelColor
+        answered.symbolConfiguration = .init(pointSize: 10, weight: .regular)
         count.font = .monospacedDigitSystemFont(ofSize: 10, weight: .semibold)
         count.textColor = .secondaryLabelColor
         icons.orientation = .horizontal
         icons.spacing = 4
-        for v in [count, clip, flag] { icons.addArrangedSubview(v) }
+        for v in [count, clip, flag, answered] { icons.addArrangedSubview(v) }
         for v in [dot, sender, date, subject, snippet, icons] as [NSView] {
             v.translatesAutoresizingMaskIntoConstraints = false
             addSubview(v)
@@ -622,6 +756,7 @@ final class MessageCell: NSTableCellView {
         date.stringValue = Self.format(r.date)
         clip.isHidden = !node.allRows.contains { $0.hasAttachments }
         flag.isHidden = !node.allRows.contains { $0.flags.contains(.flagged) }
+        answered.isHidden = !node.allRows.contains { $0.flags.contains(.answered) }
         if node.isThread, let n = node.children?.count {
             count.stringValue = "\(n)"
             count.isHidden = false
@@ -637,6 +772,21 @@ final class MessageCell: NSTableCellView {
             snippet.isHidden = true
         }
         applyColors()
+        updateAccessibility(node: node, who: who, unread: unread)
+    }
+
+    /// One combined label for VoiceOver: state first, then who, what and when.
+    private func updateAccessibility(node: ListNode, who: String, unread: Bool) {
+        var parts: [String] = []
+        if unread { parts.append("Unread") }
+        if !flag.isHidden { parts.append("Flagged") }
+        if !answered.isHidden { parts.append("Replied") }
+        if !clip.isHidden { parts.append("Attachment") }
+        if node.isThread, let n = node.children?.count { parts.append("\(n) messages") }
+        parts.append("from \(who)")
+        parts.append(subject.stringValue)
+        parts.append(date.stringValue)
+        setAccessibilityLabel(parts.joined(separator: ", "))
     }
 
     override var backgroundStyle: NSView.BackgroundStyle {
@@ -665,6 +815,7 @@ final class MessageCell: NSTableCellView {
             date.textColor = isUnread ? .controlAccentColor : .secondaryLabelColor
             snippet.textColor = .secondaryLabelColor
             count.textColor = .secondaryLabelColor
+            answered.contentTintColor = selected ? .alternateSelectedControlTextColor : .secondaryLabelColor
             subject.textColor = isChildRow ? .secondaryLabelColor : (isUnread ? .controlAccentColor : .labelColor)
         }
     }
