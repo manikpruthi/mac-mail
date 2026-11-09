@@ -38,6 +38,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             let handled = MainActor.assumeIsolated { () -> Bool in
                 guard MailService.shared.undoableSendID != nil else { return false }
                 if NSApp.keyWindow?.firstResponder is NSTextView { return false }
+                // Esc in a sheet, alert or save panel means that panel's own Cancel, never "undo the send".
+                if isEsc {
+                    let key = NSApp.keyWindow
+                    if key?.sheetParent != nil || key?.attachedSheet != nil || key is NSPanel { return false }
+                }
                 return MailService.shared.undoLatestSend()
             }
             return handled ? nil : event
@@ -139,11 +144,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
-        if !flag { mainWindow?.showWindow(nil) }
+        if !flag {
+            // A minimized window is not "visible": clicking the Dock icon must bring it back.
+            if let w = mainWindow?.window, w.isMiniaturized { w.deminiaturize(nil) }
+            mainWindow?.showWindow(nil)
+        }
         return true
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        // Quitting must not lose name/signature text typed in Settings: windowWillClose never runs then.
+        settings?.commitPendingEdits()
         if MailService.shared.hasPendingSends {
             let a = NSAlert()
             a.messageText = "A message is about to be sent"
