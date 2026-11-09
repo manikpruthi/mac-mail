@@ -748,6 +748,12 @@ final class PreviewViewController: NSViewController, WKNavigationDelegate, WKUID
             do {
                 guard let engine = MailService.shared.engine(d.accountID) else { throw NetError.server("Account unavailable") }
                 try await engine.download(messageID: d.id, part: part, to: url)
+                // The pane may have been torn down (window closed, WebKit released) while the download ran;
+                // releaseWebView cleaned up an empty quickLookDir, so the file written now must not be orphaned.
+                guard !tornDown else {
+                    try? FileManager.default.removeItem(at: dir)
+                    return
+                }
                 if let old = quickLookDir { try? FileManager.default.removeItem(at: old) }
                 quickLookDir = dir
                 quickLookURL = url
