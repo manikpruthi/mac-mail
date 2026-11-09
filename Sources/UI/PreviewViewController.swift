@@ -23,6 +23,10 @@ final class PreviewViewController: NSViewController, WKNavigationDelegate, WKUID
     private var fetchingID: Int64?
 
     private let stack = NSStackView()
+    /// Stands in for the web view while there is none (at launch, and after WebKit is released when idle).
+    /// Without a stretchable item the stack's height is fixed by the header, and Auto Layout then shrinks
+    /// the whole window to it.
+    private let webSpacer = NSView()
     private let headerBox = NSView()
     private let subjectLabel = NSTextField(wrappingLabelWithString: "")
     private let fromLabel = NSTextField(labelWithString: "")
@@ -45,7 +49,7 @@ final class PreviewViewController: NSViewController, WKNavigationDelegate, WKUID
 
     private static func lightKey(_ email: String) -> String { "lightBg:" + email.lowercased() }
     private func lightBackground(_ d: MessageDetail) -> Bool {
-        UserDefaults.standard.bool(forKey: Self.lightKey(d.from.email))
+        Prefs.d.bool(forKey: Self.lightKey(d.from.email))
     }
 
     private static let live = NSHashTable<PreviewViewController>.weakObjects()
@@ -96,6 +100,10 @@ final class PreviewViewController: NSViewController, WKNavigationDelegate, WKUID
             stack.addArrangedSubview(v)
             v.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
         }
+        webSpacer.translatesAutoresizingMaskIntoConstraints = false
+        webSpacer.setContentHuggingPriority(.init(1), for: .vertical)
+        webSpacer.setContentCompressionResistancePriority(.init(1), for: .vertical)
+        stack.addArrangedSubview(webSpacer)
         root.addSubview(stack)
 
         emptyLabel.textColor = .tertiaryLabelColor
@@ -222,10 +230,20 @@ final class PreviewViewController: NSViewController, WKNavigationDelegate, WKUID
         Debug.log("open → text visible: \(Debug.ms(since: openStarted))")
     }
 
-    func show(messageID: Int64) {
+    /// False for programmatic selections (launch, folder switch, search typing, cursor move after
+    /// archive/delete): the message is shown but not marked read.
+    private var markReadAllowed = true
+
+    func show(messageID: Int64, markRead: Bool = true) {
         guard let d = store.detail(messageID) else { showEmpty(text: "No message selected"); return }
+        // An explicit open of the message already on screen still marks it read.
+        if current?.id == messageID, markRead, !markReadAllowed {
+            markReadAllowed = true
+            markReadIfNeeded(messageID)
+        }
         // Already shown, or a body fetch for it is still in flight — but a failed fetch may be retried.
         if current?.id == messageID, currentBody != nil || fetchingID == messageID { return }
+        markReadAllowed = markRead
         tornDown = false
         spinner.stopAnimation(nil)
         openStarted = Date()
@@ -325,13 +343,20 @@ final class PreviewViewController: NSViewController, WKNavigationDelegate, WKUID
         } else if prepared.hasRemoteImages && !autoLoad {
             showImagesBanner(page)
         }
-        pendingNavigation = ensureWebView().loadHTMLString(prepared.html, baseURL: URL(string: "lm://message/\(d.id)/"))
-        if Prefs.markReadOnOpen, !Debug.bench, !(current?.flags.contains(.seen) ?? true) {
-            let rows = store.rows(ids: [d.id])
-            MailService.shared.setFlag(rows, flag: .seen, on: true)
-            // Keep the captured flags in sync so later re-renders (theme, zoom, load images) don't mark it read again.
-            current?.flags.insert(.seen)
-        }
+        let web = ensureWebView()
+        // Images of the previous message would otherwise stay decoded in WebKit's memory cache (every
+        // message's image URLs are unique, so they're never reused); drop them before the next page.
+        web.configuration.websiteDataStore.removeData(ofTypes: [WKWebsiteDataTypeMemoryCache],
+                                                      modifiedSince: .distantPast) {}
+        pendingNavigation = web.loadHTMLString(prepared.html, baseURL: URL(string: "lm://message/\(d.id)/"))
+        if markReadAllowed { markReadIfNeeded(d.id) }
+    }
+
+    private func markReadIfNeeded(_ id: Int64) {
+        guard Prefs.markReadOnOpen, !Debug.bench, current?.id == id, !(current?.flags.contains(.seen) ?? true) else { return }
+        MailService.shared.setFlag(store.rows(ids: [id]), flag: .seen, on: true)
+        // Keep the captured flags in sync so later re-renders (theme, zoom, load images) don't mark it read again.
+        current?.flags.insert(.seen)
     }
 
     private func viewEntire() {
@@ -571,6 +596,7 @@ final class PreviewViewController: NSViewController, WKNavigationDelegate, WKUID
         w.setContentHuggingPriority(.defaultLow, for: .vertical)
         stack.addArrangedSubview(w)
         w.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        webSpacer.isHidden = true
         webView = w
         Debug.log("web view created")
         return w
@@ -586,6 +612,7 @@ final class PreviewViewController: NSViewController, WKNavigationDelegate, WKUID
         w.navigationDelegate = nil
         w.configuration.userContentController.removeAllScriptMessageHandlers()
         w.removeFromSuperview()
+        webSpacer.isHidden = false
         webView = nil
         pendingNavigation = nil
         lastRenderedDark = nil
@@ -616,12 +643,12 @@ final class PreviewViewController: NSViewController, WKNavigationDelegate, WKUID
 
     private var readingZoom: CGFloat {
         get {
-            let v = UserDefaults.standard.double(forKey: "readingZoom")
+            let v = Prefs.d.double(forKey: "readingZoom")
             return v > 0 ? CGFloat(v) : 1
         }
         set {
             let clamped = min(max(newValue, 0.5), 3)
-            UserDefaults.standard.set(Double(clamped), forKey: "readingZoom")
+            Prefs.d.set(Double(clamped), forKey: "readingZoom")
             webView?.pageZoom = clamped
         }
     }
@@ -658,7 +685,7 @@ final class PreviewViewController: NSViewController, WKNavigationDelegate, WKUID
     @objc func toggleLight() {
         guard let d = current, let b = currentBody, isDark else { NSSound.beep(); return }
         let key = Self.lightKey(d.from.email)
-        UserDefaults.standard.set(!UserDefaults.standard.bool(forKey: key), forKey: key)
+        Prefs.d.set(!Prefs.d.bool(forKey: key), forKey: key)
         render(d, b)
     }
 

@@ -218,6 +218,29 @@ extension Notification.Name {
     static let mailDataChanged = Notification.Name("MacMail.dataChanged")
     static let mailFoldersChanged = Notification.Name("MacMail.foldersChanged")
     static let mailStatusChanged = Notification.Name("MacMail.statusChanged")
+    /// Server unread counts changed (sidebar and Dock badge only; the message list doesn't reload).
+    static let mailCountsChanged = Notification.Name("MacMail.countsChanged")
     static let mailAccountsChanged = Notification.Name("MacMail.accountsChanged")
     static let themeChanged = Notification.Name("MacMail.themeChanged")
+}
+
+/// What changed in the cached mail (the typed payload of `.mailDataChanged`, ARC-09).
+enum MailDataChange {
+    /// Anything may have changed (settings, account removal).
+    case all
+    /// Rows in this folder were added, removed or changed.
+    case folder(Int64)
+    /// Only these messages' flags changed; lists can patch rows in place.
+    case flags(ids: [Int64])
+}
+
+extension NotificationCenter {
+    func postMailDataChanged(_ change: MailDataChange) {
+        post(name: .mailDataChanged, object: nil, userInfo: ["change": change])
+    }
+}
+
+extension Notification {
+    /// The change carried by a `.mailDataChanged` notification (`.all` if none was attached).
+    var mailDataChange: MailDataChange { userInfo?["change"] as? MailDataChange ?? .all }
 }

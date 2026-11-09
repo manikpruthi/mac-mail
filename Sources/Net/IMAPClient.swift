@@ -274,6 +274,24 @@ actor IMAPClient {
         return out
     }
 
+    /// The server's unread count for a mailbox (STATUS … (UNSEEN)); nil if the server didn't report it.
+    func unseenCount(_ path: String) async throws -> Int? {
+        Self.unseen(from: try await run("STATUS \(MailboxName.encode(path).imapQuoted) (UNSEEN)"))
+    }
+
+    /// Extracts UNSEEN from a STATUS reply (`* STATUS "INBOX" (UNSEEN 12)`).
+    static func unseen(from rs: [IMAPResponse]) -> Int? {
+        for r in rs where r.isUntagged {
+            guard r.values.count >= 3, r.values[0].text?.uppercased() == "STATUS", let items = r.values[2].list else { continue }
+            var i = 0
+            while i + 1 < items.count {
+                if items[i].text?.uppercased() == "UNSEEN", let n = items[i + 1].number { return Int(clamping: n) }
+                i += 2
+            }
+        }
+        return nil
+    }
+
     @discardableResult
     func select(_ path: String, readOnly: Bool = false, force: Bool = true) async throws -> SelectInfo? {
         if !force, selectedPath == path, selectedReadOnly == readOnly || (!selectedReadOnly && readOnly) { return nil }

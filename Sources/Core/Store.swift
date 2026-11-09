@@ -64,7 +64,8 @@ final class Store {
         // Migration ladder: a v0 database (tables exist, user_version 0) migrates in place, no data loss.
         if db.userVersion < 2 { try migrate_1_to_2() }
         if db.userVersion < 3 { try migrate_2_to_3() }
-        db.run("PRAGMA user_version=3")
+        if db.userVersion < 4 { try migrate_3_to_4() }
+        db.run("PRAGMA user_version=4")
     }
 
     /// v1 → v2: pending ops bound to folder id + UIDVALIDITY, body full-text index, body-cache index, contacts table.
@@ -106,6 +107,18 @@ final class Store {
 
     // v2 → v3: the Bcc line is remembered per message so editing a draft restores its Bcc recipients
     // (Bcc never travels in the draft MIME itself).
+    /// v3 → v4: the server's unread count per folder (IMAP STATUS), so counts cover mail outside the offline window.
+    /// `unread_base` is the local unread count when the server count was taken; local changes since then
+    /// (read/unread, moves, new mail) are applied on top until the next STATUS.
+    private func migrate_3_to_4() throws {
+        if !db.columnExists(table: "folders", column: "server_unread") {
+            try db.exec("ALTER TABLE folders ADD COLUMN server_unread INTEGER NOT NULL DEFAULT -1")
+        }
+        if !db.columnExists(table: "folders", column: "unread_base") {
+            try db.exec("ALTER TABLE folders ADD COLUMN unread_base INTEGER NOT NULL DEFAULT 0")
+        }
+    }
+
     private func migrate_2_to_3() throws {
         if !db.columnExists(table: "messages", column: "bcc") {
             try db.exec("ALTER TABLE messages ADD COLUMN bcc TEXT NOT NULL DEFAULT ''")
@@ -497,12 +510,31 @@ final class Store {
         return out
     }
 
-    func unreadCount(folderID: Int64) -> Int {
+    private func localUnread(folderID: Int64) -> Int {
         Int(db.scalarInt("SELECT COUNT(*) FROM messages WHERE folder_id=? AND (flags & 1)=0", [folderID]) ?? 0)
     }
 
+    /// Unread count for a folder: the server's count (covers mail older than the offline window) adjusted by
+    /// local changes since it was taken; the cached count when the server hasn't reported one yet.
+    func unreadCount(folderID: Int64) -> Int {
+        let local = localUnread(folderID: folderID)
+        var server = -1, base = 0
+        db.query("SELECT server_unread, unread_base FROM folders WHERE id=?", [folderID]) {
+            server = $0.int(0); base = $0.int(1)
+        }
+        return server < 0 ? local : max(local, server + local - base)
+    }
+
+    /// Records the server's unread count (IMAP STATUS UNSEEN) together with the local count at that moment.
+    func setServerUnread(folderID: Int64, _ count: Int) {
+        db.run("UPDATE folders SET server_unread=?, unread_base=? WHERE id=?",
+               [Int64(count), Int64(localUnread(folderID: folderID)), folderID])
+    }
+
     func unifiedUnreadCount() -> Int {
-        Int(db.scalarInt("SELECT COUNT(*) FROM messages m JOIN folders f ON f.id=m.folder_id WHERE f.role='inbox' AND (m.flags & 1)=0") ?? 0)
+        var ids: [Int64] = []
+        db.query("SELECT id FROM folders WHERE role='inbox'") { ids.append($0.int64(0)) }
+        return ids.reduce(0) { $0 + unreadCount(folderID: $1) }
     }
 
     // MARK: Pending operations

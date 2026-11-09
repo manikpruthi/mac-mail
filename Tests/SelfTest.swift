@@ -48,6 +48,10 @@ check("rfc2231 filename", atts.first?.filename == "Rechnung März.pdf")
 check("cid lookup", ms?.part(withContentID: "<logo@x>")?.partID == "2")
 
 // Search, LIST, mailbox names
+// STATUS UNSEEN (server unread counts): quoted, atom and modified-UTF-7 names, several items
+check("STATUS unseen quoted", IMAPClient.unseen(from: [IMAPParser.parse(parts(["* STATUS \"INBOX\" (UNSEEN 2472)"]))]) == 2472)
+check("STATUS unseen with other items", IMAPClient.unseen(from: [IMAPParser.parse(parts(["* STATUS Drafts (MESSAGES 9 UNSEEN 0)"]))]) == 0)
+check("STATUS unseen absent", IMAPClient.unseen(from: [IMAPParser.parse(parts(["* STATUS \"[Gmail]/Spam\" (MESSAGES 3)"]))]) == nil)
 let search = IMAPParser.parse(parts(["* SEARCH 2 84 882"]))
 check("search values", search.values.compactMap { $0.number } == [2, 84, 882])
 let list = IMAPParser.parse(parts(["* LIST (\\HasNoChildren \\Sent) \"/\" \"[Gmail]/Sent Mail\""]))
@@ -121,14 +125,17 @@ let parsed = MIME.parseAddresses(rt.full)
 check("full round-trips one address", parsed.count == 1 && parsed.first?.email == "jane@x.com" && parsed.first?.name == "Doe, Jane")
 
 // Attachment filename cannot inject headers (SEC-03)
-let tmpUrl = URL(fileURLWithPath: ".selftest-attachment.tmp") // TMPDIR writes are restricted here
+let tmpUrl = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("macmail-selftest-attachment.tmp")
 try? Data("x".utf8).write(to: tmpUrl)
-defer { try? FileManager.default.removeItem(at: tmpUrl) }
 let evilAtt = OutgoingAttachment(url: tmpUrl, filename: "a\"\r\nBcc: hack@x.com;d.txt", mimeType: "text/plain")
 let attMsg = OutgoingMessage(from: EmailAddress(name: "M", email: "m@example.com"), to: [EmailAddress(name: "", email: "z@example.com")],
                              cc: [], bcc: [], subject: "s", textBody: "b", htmlBody: "b",
                              inReplyTo: nil, references: nil, attachments: [evilAtt])
 let built3 = String(data: (try? MessageBuilder.build(attMsg)) ?? Data(), encoding: .utf8) ?? ""
+try? FileManager.default.removeItem(at: tmpUrl)
+// Sender-supplied attachment names are safe for Save panels (SEC-A11)
+check("filename sanitised", BodyPart.safeFilename("..\u{0A}evil:/x.pdf") == "-evil--x.pdf"
+    && BodyPart.safeFilename("..") == nil && (BodyPart.safeFilename(String(repeating: "a", count: 500) + ".pdf")?.count ?? 0) == 200)
 check("filename injection blocked", !built3.contains("\r\nBcc:") && built3.contains("filename*=UTF-8''")
     && built3.contains("filename=\"a_"))
 

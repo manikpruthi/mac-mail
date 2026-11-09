@@ -63,8 +63,17 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSSearc
         preview.onAddAccount = { [weak self] in self?.addAccount() }
         preview.onEditDraft = { [weak self] d in self?.editDraft(d) }
 
-        window.setFrameAutosaveName("MacMailMainWindow")
-        if !window.setFrameUsingName("MacMailMainWindow") { window.center() }
+        // The demo has its own saved frame so screenshot runs never move or resize the real window.
+        let frameName = AppPaths.isDemo ? "MacMailMainWindowDemo" : "MacMailMainWindow"
+        Self.discardCollapsedSavedFrame(frameName, min: window.minSize)
+        window.setFrameAutosaveName(frameName)
+        if !window.setFrameUsingName(frameName) { window.center() }
+        // Older builds could save a collapsed frame (the reading pane used to shrink the window to ~200 pt);
+        // never restore anything smaller than the minimum size.
+        if window.frame.width < window.minSize.width || window.frame.height < window.minSize.height {
+            window.setContentSize(NSSize(width: 1280, height: 800))
+            window.center()
+        }
 
         NotificationCenter.default.addObserver(self, selector: #selector(accountsChanged), name: .mailAccountsChanged, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(foldersChanged), name: .mailFoldersChanged, object: nil)
@@ -107,15 +116,10 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSSearc
         if rows.isEmpty {
             preview.showEmpty(text: "No message selected")
         } else if let r = list.focusedRow {
-            if userInitiated {
-                // Only an explicit open (click, j/k, Return) marks the message read in the preview.
-                preview.show(messageID: r.id)
-                prefetchNeighbors(of: r)
-            } else {
-                // Launch / folder-switch auto-selection: the row is highlighted but not opened,
-                // so nothing is marked read or queued to the server.
-                preview.showEmpty(text: "Not opened yet — press Return to read")
-            }
+            // Only an explicit open (click, j/k, Return) marks the message read; launch, folder-switch,
+            // search and post-archive auto-selections show it without touching its flags.
+            preview.show(messageID: r.id, markRead: userInitiated)
+            prefetchNeighbors(of: r)
         } else {
             preview.showEmpty(text: "\(rows.count) messages selected")
         }
@@ -304,7 +308,7 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSSearc
         searchField?.stringValue = text
         sidebar.clearSelectionForSearch()
         list.showSearch(text, from: lastSource)
-        list.selectFirst(userInitiated: true)
+        list.selectFirst(userInitiated: false)
         list.runServerSearch()
     }
 
@@ -407,6 +411,28 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSSearc
         }
         folderPicker?.beginSheet(on: window)
     }
+
+    /// Older builds could save a collapsed window (~150–200 pt tall), including as the "untiled" size macOS
+    /// keeps for a tiled window. Such a frame is dropped once so the window opens at its default size.
+    private static func discardCollapsedSavedFrame(_ name: String, min: NSSize) {
+        let key = "NSWindow Frame \(name)"
+        guard let saved = UserDefaults.standard.string(forKey: key) else { return }
+        // "x y w h sx sy sw sh {json with untiledFrame "{{x, y}, {w, h}}"}"
+        let parts = saved.split(separator: " ").prefix(4).compactMap { Double($0) }
+        var sizes: [(Double, Double)] = parts.count == 4 ? [(parts[2], parts[3])] : []
+        if let r = saved.range(of: #"untiledFrame":"\{\{[-0-9.]+, [-0-9.]+\}, \{([0-9.]+), ([0-9.]+)\}\}"#, options: .regularExpression) {
+            let nums = saved[r].split(whereSeparator: { !"0123456789.-".contains($0) }).compactMap { Double($0) }
+            if nums.count >= 4 { sizes.append((nums[2], nums[3])) }
+        }
+        if sizes.contains(where: { $0.0 < Double(min.width) || $0.1 < Double(min.height) }) {
+            UserDefaults.standard.removeObject(forKey: key)
+        }
+    }
+
+    // Reading-pane zoom (View menu) works wherever focus is in this window, not only inside the web view.
+    @objc func zoomInReading(_ sender: Any?) { preview.zoomIn() }
+    @objc func zoomOutReading(_ sender: Any?) { preview.zoomOut() }
+    @objc func resetReadingZoom(_ sender: Any?) { preview.resetZoom() }
 
     /// Menu key equivalents ⌘1…⌘9: select the nth folder in the sidebar.
     @objc func selectFolderAtIndex(_ sender: NSMenuItem) {

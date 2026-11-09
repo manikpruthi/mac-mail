@@ -413,6 +413,78 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
 
     // MARK: Demo / screenshot hooks
 
+    /// MAC_MAIL_DEMO_SELFTEST=1: runs UI behaviours through their real code paths and logs PASS/FAIL lines
+    /// ("selftest: …" on stderr), then quits. Used to verify changes without driving the UI by hand.
+    private func runDemoSelfTest(_ w: MainWindowController) {
+        func log(_ s: String) { FileHandle.standardError.write(("selftest: " + s + "\n").data(using: .utf8)!) }
+        func step(_ delay: Double, _ f: @escaping () -> Void) { DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: f) }
+        // The window must keep its size when the reading pane has no web view (launch, idle release).
+        w.window?.setContentSize(NSSize(width: 1200, height: 760))
+        step(0.3) {
+            let before = w.window?.frame.height ?? 0
+            w.preview.releaseWebView()
+            w.window?.layoutIfNeeded()
+            let after = w.window?.frame.height ?? 0
+            log((after == before && after >= 700 ? "PASS" : "FAIL") + " window keeps its height without a web view (\(Int(before))→\(Int(after)))")
+            w.preview.restoreWebViewIfNeeded()
+        }
+        // ⌘2 → second sidebar folder.
+        let item = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+        item.tag = 2
+        w.selectFolderAtIndex(item)
+        step(0.5) {
+            var name = "\(w.list.source)"
+            if case .folder(let id) = w.list.source { name = MailService.shared.store.folder(id)?.name ?? name }
+            log((name == "Starred" ? "PASS" : "FAIL") + " ⌘2 selects the second folder (\(name))")
+            let one = NSMenuItem(title: "", action: nil, keyEquivalent: ""); one.tag = 1
+            w.selectFolderAtIndex(one)
+            // Zoom from the list (focus not in the reading pane) must still reach the preview.
+            w.window?.makeKeyAndOrderFront(nil)
+            w.list.focusList()
+            let before = Prefs.d.double(forKey: "readingZoom")
+            // Same walk a ⌘= press makes: from the focused list up the responder chain.
+            let handled = w.window?.firstResponder?.tryToPerform(Selector(("zoomInReading:")), with: nil) ?? false
+            let after = Prefs.d.double(forKey: "readingZoom")
+            log((handled && after > max(before, 1) - 0.001 && after != before ? "PASS" : "FAIL") + " ⌘= zooms the reading pane from the list (handled=\(handled) \(before)→\(after))")
+            _ = w.window?.firstResponder?.tryToPerform(Selector(("resetReadingZoom:")), with: nil)
+            // Focus cycling.
+            w.focusNextPane(nil)
+            let r1 = w.window?.firstResponder.map { String(describing: type(of: $0)) } ?? "nil"
+            w.focusNextPane(nil)
+            let r2 = w.window?.firstResponder.map { String(describing: type(of: $0)) } ?? "nil"
+            log((r1 != r2 ? "PASS" : "FAIL") + " ⌃Tab moves focus between panes (\(r1) → \(r2))")
+            // Message window opens at a usable size.
+            w.list.selectAfterRemoval(previousIndex: 0)
+            if let r = w.list.focusedRow { w.openRow(r) }
+        }
+        step(1.5) {
+            let mw = NSApp.windows.first(where: { $0.windowController is MessageWindowController })
+            let f = mw?.frame.size ?? .zero
+            log((f.width >= 800 && f.height >= 600 ? "PASS" : "FAIL") + " message window opens full size (\(Int(f.width))x\(Int(f.height)))")
+            mw?.close()
+            ComposeWindowController.open(.new)
+        }
+        step(2.5) {
+            guard let c = NSApp.windows.compactMap({ $0.windowController as? ComposeWindowController }).first else {
+                log("FAIL compose window did not open"); exit(1)
+            }
+            c.demoSelfTest { lines in
+                lines.forEach(log)
+                // Quit with a dirty composer: the app must stay running and show the save sheet.
+                // While termination waits for the composer, the run loop is in modal-panel mode; schedule there.
+                let check = Timer(timeInterval: 1.0, repeats: false) { _ in
+                    let sheet = c.window?.attachedSheet != nil
+                    log((sheet ? "PASS" : "FAIL") + " quitting with an unsaved message shows Save/Discard (sheet=\(sheet))")
+                    log("done")
+                    exit(0)
+                }
+                RunLoop.main.add(check, forMode: .common)
+                RunLoop.main.add(check, forMode: .modalPanel)
+                NSApp.terminate(nil)
+            }
+        }
+    }
+
     private func runDemoHooks() {
         let env = ProcessInfo.processInfo.environment
         // MAC_MAIL_DEMO_HTML=<file>: replace the second demo message's body with this HTML (reproduce rendering bugs).
@@ -427,6 +499,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
             guard let w = self?.mainWindow else { return }
+            // Screenshots use a fixed window size (MAC_MAIL_SNAPSHOT_SIZE=WxH, default 1440x900), independent of
+            // any saved or macOS-tiled frame.
+            if env["MAC_MAIL_SNAPSHOT"] != nil, let win = w.window {
+                let dims = (env["MAC_MAIL_SNAPSHOT_SIZE"] ?? "1440x900").split(separator: "x").compactMap { Double($0) }
+                if dims.count == 2 { win.setFrame(NSRect(x: 40, y: 40, width: dims[0], height: dims[1]), display: true) }
+            }
             if env["MAC_MAIL_DEMO_GROUP"] == "1" { w.list.setGrouped(true) }
             if let idx = env["MAC_MAIL_DEMO_SELECT"].flatMap(Int.init) {
                 w.list.selectAfterRemoval(previousIndex: idx)
@@ -476,6 +554,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
                     }
                 }
             }
+            if env["MAC_MAIL_DEMO_SELFTEST"] == "1" { self?.runDemoSelfTest(w) }
             if env["MAC_MAIL_DEMO_COMPOSE"] == "1" {
                 let f = FileManager.default.temporaryDirectory.appendingPathComponent("Q4 Budget.pdf")
                 try? Data("demo".utf8).write(to: f)

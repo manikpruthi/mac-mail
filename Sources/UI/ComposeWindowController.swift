@@ -438,9 +438,12 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
         web.uiDelegate = self
         web.setValue(false, forKey: "drawsBackground")
         let prepared = HTMLPrep.prepare(html: body?.html, text: body?.text, page: 1)
+        // Same image policy as the reading pane, including the per-sender choice (SEC-A10).
         let spam = d.folderRole == .spam
+        let senderPref = MailService.shared.store.pref("img:" + d.from.email.lowercased())
+        let autoLoad = senderPref == "always" || (!spam && !Prefs.askBeforeImages && senderPref != "ask" && senderPref != "never")
         quoteLoader.page = ImagePage(generation: 1, messageID: d.id, accountID: d.accountID, prepared: prepared,
-                                     autoLoad: !spam && !Prefs.askBeforeImages, ignoreLimits: false)
+                                     autoLoad: autoLoad, ignoreLimits: senderPref == "always")
         quoteLoader.page?.dark = view.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
         web.loadHTMLString(prepared.html, baseURL: URL(string: "lm://quote/\(d.id)/"))
         quoteWeb = web
@@ -747,7 +750,7 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
         window?.orderOut(nil)
         let main = (NSApp.delegate as? AppDelegate)?.mainWindow
         let pending = MailService.PendingSend(accountID: account.id, message: message, replyTo: replyRow,
-                                              draftToDelete: draftRow, composer: self)
+                                              draftToDelete: draftRow)
         let id = MailService.shared.queueSend(pending) { [weak self] error in
             guard let self else { return }
             // The pending id is dead either way; leaving it set would block cleanup on close (V2-11).
@@ -839,7 +842,7 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
                 let hasContent = !message.textBody.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                     || !message.attachments.isEmpty
                 if let old, hasContent {
-                    engine.queue(kind: "expunge", rows: [old]); MailService.shared.store.deleteMessages(ids: [old.id])
+                    engine.queue(.expunge, rows: [old]); MailService.shared.store.deleteMessages(ids: [old.id])
                 }
                 (NSApp.delegate as? AppDelegate)?.mainWindow?.showToast("Draft saved")
                 self.cleanUpAndForget()
@@ -874,6 +877,30 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
                 done(true)
             default: done(false)
             }
+        }
+    }
+
+    /// Demo self-test (MAC_MAIL_DEMO_SELFTEST): exercises the To→Cc drag-move and title-follows-subject paths
+    /// through the same delegate methods AppKit calls. Returns "PASS …"/"FAIL …" lines.
+    func demoSelfTest(done: @escaping ([String]) -> Void) {
+        var out: [String] = []
+        toField.objectValue = ["Ann <ann@example.com>", "Bob <bob@example.com>"]
+        ccField.objectValue = []
+        let pb = NSPasteboard(name: .drag)
+        _ = tokenField(toField, writeRepresentedObjects: ["Ann <ann@example.com>"], to: pb)
+        let dropped = tokenField(ccField, readFrom: pb) as? [String] ?? []
+        ccField.objectValue = dropped
+        subjectField.stringValue = "Lunch plans"
+        controlTextDidChange(Notification(name: NSControl.textDidChangeNotification, object: subjectField))
+        dirty = true
+        DispatchQueue.main.async { [self] in
+            let to = (toField.objectValue as? [String]) ?? []
+            let cc = (ccField.objectValue as? [String]) ?? []
+            out.append((to == ["Bob <bob@example.com>"] && cc == ["Ann <ann@example.com>"] ? "PASS" : "FAIL")
+                       + " drag To→Cc moves the address (to=\(to) cc=\(cc))")
+            out.append((window?.title == "Lunch plans" ? "PASS" : "FAIL") + " window title follows subject (\(window?.title ?? "nil"))")
+            out.append((Self.composersNeedingSave.contains(self) ? "PASS" : "FAIL") + " dirty composer is asked on quit")
+            done(out)
         }
     }
 
@@ -953,7 +980,7 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
 
     private static let addressType = NSPasteboard.PasteboardType("com.manikpruthi.macmail.addresses")
     /// The field a drag of address tokens started in, and what it carried.
-    private var dragSource: (field: NSTokenField, objects: [String], changeCount: Int)?
+    private var dragSource: (field: NSTokenField, objects: [String])?
 
     func tokenField(_ tokenField: NSTokenField, writeRepresentedObjects objects: [Any], to pboard: NSPasteboard) -> Bool {
         let strings = objects.compactMap { $0 as? String }
@@ -961,7 +988,9 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
         pboard.declareTypes([Self.addressType, .string], owner: nil)
         pboard.setPropertyList(strings, forType: Self.addressType)
         pboard.setString(strings.joined(separator: ", "), forType: .string)
-        dragSource = pboard.name == .drag ? (tokenField, strings, pboard.changeCount) : nil
+        // AppKit adds its own types to the drag pasteboard after this returns, so changeCount can't identify the
+        // drag; the dragged addresses themselves do.
+        dragSource = pboard.name == .drag ? (tokenField, strings) : nil
         return true
     }
 
@@ -969,7 +998,7 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
         let objects = (pboard.propertyList(forType: Self.addressType) as? [String])
             ?? pboard.string(forType: .string).map { MIME.parseAddresses($0).map { $0.full } }
         guard let objects, !objects.isEmpty else { return nil }
-        if pboard.name == .drag, let src = dragSource, src.changeCount == pboard.changeCount, src.field !== tokenField {
+        if pboard.name == .drag, let src = dragSource, src.objects == objects, src.field !== tokenField {
             dragSource = nil
             // After the drop finishes, take the tokens out of the field they were dragged from.
             DispatchQueue.main.async { [weak self] in self?.remove(src.objects, from: src.field) }

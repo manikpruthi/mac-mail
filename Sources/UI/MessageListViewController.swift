@@ -161,7 +161,8 @@ final class MessageListViewController: NSViewController, NSOutlineViewDataSource
 
     @objc private func dataChanged(_ note: Notification) {
         // Read/flag changes: patch the affected rows in place instead of re-querying the whole folder.
-        if note.userInfo?["flagsOnly"] != nil, let ids = note.userInfo?["ids"] as? [Int64] {
+        let change = note.mailDataChange
+        if case .flags(let ids) = change {
             updateFlagsInPlace(Set(ids))
             return
         }
@@ -172,7 +173,7 @@ final class MessageListViewController: NSViewController, NSOutlineViewDataSource
             reload(keepSelection: true)
             return
         }
-        if let fid = note.object as? Int64, case .folder(let current) = source, fid != current { return }
+        if case .folder(let fid) = change, case .folder(let current) = source, fid != current { return }
         // Coalesce bursts (initial sync posts once per chunk).
         guard !reloadScheduled else { return }
         reloadScheduled = true

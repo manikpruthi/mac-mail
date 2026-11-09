@@ -95,6 +95,7 @@ final class SidebarViewController: NSViewController, NSOutlineViewDataSource, NS
         nc.addObserver(self, selector: #selector(reloadNote), name: .mailFoldersChanged, object: nil)
         nc.addObserver(self, selector: #selector(reloadNote), name: .mailAccountsChanged, object: nil)
         nc.addObserver(self, selector: #selector(countsNote), name: .mailDataChanged, object: nil)
+        nc.addObserver(self, selector: #selector(countsNote), name: .mailCountsChanged, object: nil)
         nc.addObserver(self, selector: #selector(statusNote), name: .mailStatusChanged, object: nil)
     }
 
@@ -155,7 +156,7 @@ final class SidebarViewController: NSViewController, NSOutlineViewDataSource, NS
             }
             for c in r.children {
                 if case .folder(let id) = c.kind {
-                    // Unread for every folder from the offline cache (no network per refresh).
+                    // Server unread count (STATUS) adjusted by local changes; no network per refresh.
                     c.unread = store.unreadCount(folderID: id)
                 }
             }

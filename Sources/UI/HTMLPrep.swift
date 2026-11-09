@@ -96,8 +96,10 @@ enum HTMLPrep {
             let nlen = tn.length
             func attrMatch(_ re: NSRegularExpression) -> (String, NSRange)? {
                 guard let m = re.firstMatch(in: t, range: NSRange(location: 0, length: nlen)) else { return nil }
+                // The value is one of the three quoting forms; the range to replace is the whole attribute
+                // (the replacement is a complete ` src="…"`), not just the value.
                 for g in 1...3 where m.range(at: g).location != NSNotFound {
-                    return (tn.substring(with: m.range(at: g)), m.range(at: g))
+                    return (tn.substring(with: m.range(at: g)), m.range)
                 }
                 return nil
             }
@@ -180,9 +182,9 @@ enum HTMLPrep {
         return out
     }
 
-    /// Linear removal of <script>/<iframe>/<object>/<embed>/<applet>/<form>: a properly closed tag loses its
-    /// body too, an unclosed one loses only its tag (the leftover content is inert — scripts are disabled and
-    /// the CSP blocks every load). Single pass, no scan to end-of-string per unclosed tag.
+    /// Linear removal of <script>/<iframe>/<object>/<embed>/<applet>/<form>: script, iframe, object and applet
+    /// lose their content up to the matching close tag (an unclosed one swallows the rest, as browsers do);
+    /// form and embed lose only their tags. Single pass, no rescans.
     private static func stripActive(_ s: String) -> String {
         let names: [[UInt8]] = ["script", "iframe", "object", "embed", "applet", "form"].map { Array($0.utf8) }
         let b = Array(s.utf8)
@@ -211,7 +213,20 @@ enum HTMLPrep {
             return j + 1
         }
 
+        // Elements whose content must go too (script source, JSON-LD, iframe/object fallbacks). <form> keeps
+        // its content (emails often wrap the whole layout in one) and <embed> is a void element.
+        let dropBody: Set<[UInt8]> = Set(["script", "iframe", "object", "applet"].map { Array($0.utf8) })
         while i < b.count {
+            if let p = pending {
+                // Inside a dropped element: skip forward to its closing tag (still one pass over the input).
+                if b[i] == 0x3C, i + 2 < b.count, b[i + 1] == 0x2F, isTag(i + 2, p) {
+                    i = skipToGT(i + 2 + p.count)
+                    pending = nil
+                } else {
+                    i += 1
+                }
+                continue
+            }
             if b[i] == 0x3C, i + 1 < b.count {
                 if b[i + 1] == 0x2F {
                     let j = i + 2
@@ -221,8 +236,11 @@ enum HTMLPrep {
                         continue
                     }
                 } else if let n = names.first(where: { isTag(i + 1, $0) }) {
-                    i = skipToGT(i + 1 + n.count)
-                    if pending == nil { pending = n }
+                    let end = skipToGT(i + 1 + n.count)
+                    // A self-closing <script/> has no body to drop.
+                    let selfClosing = end >= 2 && end - 2 < b.count && b[end - 2] == 0x2F
+                    i = end
+                    if dropBody.contains(n), !selfClosing { pending = n }
                     continue
                 }
             }

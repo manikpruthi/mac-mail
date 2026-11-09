@@ -194,9 +194,25 @@ final class AccountEngine {
             store.upsertFolders(account: account.id, listed, isGmail: gmail)
             NotificationCenter.default.post(name: .mailFoldersChanged, object: self)
             report(nil)
+            await refreshServerUnread()
         } catch {
             report(error)
         }
+    }
+
+    /// STATUS (UNSEEN) for every selectable folder, after the folder list refreshes (launch and on demand).
+    /// Runs on the sync connection, one short command per folder, never on the click path.
+    private func refreshServerUnread() async {
+        let folders = store.folders(account: account.id).filter { $0.selectable }
+        guard !folders.isEmpty else { return }
+        _ = try? await syncGate.run {
+            let c = try await client(.sync)
+            for f in folders {
+                if Task.isCancelled { return }
+                if let n = try? await c.unseenCount(f.path) { store.setServerUnread(folderID: f.id, n) }
+            }
+        }
+        NotificationCenter.default.post(name: .mailCountsChanged, object: self)
     }
 
     // MARK: Sync
@@ -261,7 +277,7 @@ final class AccountEngine {
                 for chunk in uids.sorted(by: >).chunked(200) {
                     let headers = try await c.fetchHeaders(imapUIDSet(chunk))
                     store.insert(folderID: folderID, headers)
-                    NotificationCenter.default.post(name: .mailDataChanged, object: folderID)
+                    NotificationCenter.default.postMailDataChanged(.folder(folderID))
                 }
                 store.updateFolderState(folderID, uidValidity: info.uidValidity, uidNext: finalUIDNext, modseq: info.highestModseq)
             } else {
@@ -307,8 +323,11 @@ final class AccountEngine {
                 // MODSEQ only advances when the flag stage succeeded, so missed flag changes re-fetch.
                 store.updateFolderState(folderID, uidValidity: info.uidValidity, uidNext: finalUIDNext,
                                         modseq: flagsOK ? info.highestModseq : state.modseq)
+                // Server unread count (one small command on the sync connection), so the sidebar and badge
+                // count mail older than the offline window too.
+                if let unseen = try? await c.unseenCount(folder.path) { store.setServerUnread(folderID: folderID, unseen) }
             }
-            NotificationCenter.default.post(name: .mailDataChanged, object: folderID)
+            NotificationCenter.default.postMailDataChanged(.folder(folderID))
             report(nil)
             if folder.role == .inbox, !newHeaders.isEmpty {
                 onNewMail?(self, newHeaders.filter { !$0.flags.contains(.seen) })
@@ -334,7 +353,9 @@ final class AccountEngine {
         let t0 = Date()
         await prefetch(ids: ids)
         Debug.log("prefetched \(ids.count) bodies: \(Debug.ms(since: t0))")
-        NotificationCenter.default.post(name: .mailDataChanged, object: folderID)
+        NotificationCenter.default.postMailDataChanged(.folder(folderID))
+        // Prefetch runs after the sync's own relief; hand its freed pages back too.
+        if syncingFolders == 0 { Memory.relieve() }
     }
 
     /// Caches message text for several messages at once: messages that share the same text part numbers
@@ -364,6 +385,9 @@ final class AccountEngine {
                 guard let raw else { continue }
                 for item in chunk where !store.hasBody(item.id) {
                     guard let parts = raw[item.uid] else { continue }
+                    // Decoding, HTML→text for the body index and the SQLite writes make many short-lived
+                    // Foundation objects; drain them per message instead of once per batch.
+                    autoreleasepool {
                     var html: String?
                     var text: String?
                     if let h = item.html, let r = parts[h.partID] {
@@ -374,8 +398,9 @@ final class AccountEngine {
                     }
                     // Nothing came back for this message: leave it uncached so opening it fetches again,
                     // instead of caching an empty body forever.
-                    guard html != nil || text != nil else { continue }
+                    guard html != nil || text != nil else { return }
                     store.saveBody(item.id, html: html, text: text)
+                    }
                 }
             }
         }
@@ -395,7 +420,7 @@ final class AccountEngine {
                 return try await c.fetchHeaders(imapUIDSet(older))
             }
             store.insert(folderID: folderID, headers)
-            NotificationCenter.default.post(name: .mailDataChanged, object: folderID)
+            NotificationCenter.default.postMailDataChanged(.folder(folderID))
             return headers.count
         } catch {
             report(error)
@@ -411,7 +436,14 @@ final class AccountEngine {
             while !Task.isCancelled {
                 guard let self else { return }
                 guard let inbox = self.store.folder(account: self.account.id, role: .inbox) else {
+                    // The startup folder list failed (e.g. launched before the network was up): retry it
+                    // instead of waiting forever, then catch the Inbox up once it exists (S3).
                     try? await Task.sleep(nanoseconds: 30_000_000_000)
+                    if Task.isCancelled { return }
+                    await self.refreshFolders()
+                    if let inbox = self.store.folder(account: self.account.id, role: .inbox) {
+                        await self.sync(folderID: inbox.id)
+                    }
                     continue
                 }
                 do {
@@ -534,7 +566,10 @@ final class AccountEngine {
 
     // MARK: Actions (optimistic locally, queued for the server)
 
-    func queue(kind: String, rows: [MessageRow], arg: String = "") {
+    func queue(_ op: PendingOpKind, rows: [MessageRow]) {
+        let (kind, arg) = op.stored
+        // The demo mailbox has no server: local changes are the whole action, nothing waits to be sent.
+        if isDemo { return }
         let byFolder = Dictionary(grouping: rows, by: { $0.folderID })
         for (fid, list) in byFolder {
             guard let f = store.folder(fid) else { continue }
@@ -626,7 +661,7 @@ final class AccountEngine {
                 return try await c.fetchHeaders(imapUIDSet(uids))
             }
             store.insert(folderID: folder.id, headers)
-            NotificationCenter.default.post(name: .mailDataChanged, object: folder.id)
+            NotificationCenter.default.postMailDataChanged(.folder(folder.id))
         } catch {
             report(error)
         }
@@ -691,6 +726,15 @@ enum PendingOpKind: Equatable {
         case "move": self = .move(toPath: op.arg)
         case "expunge": self = .expunge
         default: return nil
+        }
+    }
+
+    /// How the op is persisted in pending_ops (kind, arg); `init?(_:)` reads it back.
+    var stored: (kind: String, arg: String) {
+        switch self {
+        case .flag(let set, let flag): return (set ? "flag+" : "flag-", flag)
+        case .move(let path): return ("move", path)
+        case .expunge: return ("expunge", "")
         }
     }
 

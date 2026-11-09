@@ -132,8 +132,26 @@ struct BodyPart: Codable, Equatable {
 
     var hasAttachments: Bool { !attachments().isEmpty }
 
+    /// A sender-supplied filename made safe for Save panels and temp paths (SEC-A11): no control characters,
+    /// path separators or colons, no leading dots ("..", hidden files), at most 200 characters (extension kept).
+    static func safeFilename(_ raw: String) -> String? {
+        var s = String(raw.unicodeScalars.map { c -> Character in
+            if c.value < 0x20 || c.value == 0x7F || c == "/" || c == "\\" || c == ":" { return "-" }
+            return Character(c)
+        })
+        s = s.trimmingCharacters(in: .whitespaces)
+        while s.hasPrefix(".") { s.removeFirst() }
+        guard !s.isEmpty, s.contains(where: { $0 != "-" }) else { return nil }
+        if s.count > 200 {
+            let ext = (s as NSString).pathExtension
+            let keep = ext.isEmpty || ext.count > 10 ? "" : "." + ext
+            s = String(s.prefix(200 - keep.count)) + keep
+        }
+        return s
+    }
+
     var suggestedFilename: String {
-        if let f = filename, !f.isEmpty { return f.replacingOccurrences(of: "/", with: "-") }
+        if let f = filename, let safe = Self.safeFilename(f) { return safe }
         let ext: String
         switch mimeType {
         case "message/rfc822": ext = "eml"

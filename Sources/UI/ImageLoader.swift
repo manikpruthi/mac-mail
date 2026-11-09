@@ -56,16 +56,36 @@ final class ImageLoader: NSObject, WKURLSchemeHandler {
     var markBlocked: ((Int) -> Void)?
 
     private var active: [ObjectIdentifier: Task<Void, Never>] = [:]
-    /// No redirects at all: images must come straight from the https host named in the HTML.
+    /// Redirects are followed only to https URLs on public hosts (image CDNs and mail trackers redirect a lot);
+    /// http targets are upgraded to https, and anything resolving to a local/private address is refused.
     private final class RedirectBlocker: NSObject, URLSessionDataDelegate {
         func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse,
                         newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) {
-            completionHandler(nil)
+            guard let url = request.url.flatMap(ImageLoader.httpsURL), let host = url.host,
+                  !ImageLoader.resolvesToPrivateAddressSync(host) else { completionHandler(nil); return }
+            var next = request
+            next.url = url
+            completionHandler(next)
+        }
+    }
+
+    /// https URLs pass through; http ones are upgraded (App Transport Security refuses plain http, and nearly
+    /// every image host serves both). Anything else is nil.
+    nonisolated static func httpsURL(_ url: URL) -> URL? {
+        switch url.scheme?.lowercased() {
+        case "https": return url
+        case "http":
+            var c = URLComponents(url: url, resolvingAgainstBaseURL: false)
+            c?.scheme = "https"
+            if c?.port == 80 { c?.port = nil }
+            return c?.url
+        default: return nil
         }
     }
     private static let redirectBlocker = RedirectBlocker()
-    private static let maxRequestsPerPage = 40
-    private static let maxRequestsPerHost = 8
+    // Newsletters serve every image from one CDN host, so the per-host cap matches the per-message one.
+    private static let maxRequestsPerPage = 60
+    private static let maxRequestsPerHost = 60
     private let session: URLSession = {
         let c = URLSessionConfiguration.ephemeral
         c.urlCache = nil
@@ -139,14 +159,14 @@ final class ImageLoader: NSObject, WKURLSchemeHandler {
     // MARK: Remote images
 
     private func loadRemote(id: Int, isBackground: Bool, page: ImagePage) async -> (Data, String) {
-        guard let url = page.prepared.remote[id] else { return (Self.transparentGIF, "image/gif") }
+        guard let original = page.prepared.remote[id] else { return (Self.transparentGIF, "image/gif") }
         let forced = page.forced.contains(id)
         if !page.autoLoad && !forced {
             return hold(id: id, bytes: 0, isBackground: isBackground, page: page)
         }
-        // Only https to a named host: plain http is never contacted (ATS enforces the same).
-        guard url.scheme?.lowercased() == "https", let host = url.host, !host.isEmpty else {
-            Debug.log("image rejected non-https \(url)")
+        // Only https to a named host: plain http is upgraded, never contacted in the clear.
+        guard let url = Self.httpsURL(original), let host = url.host, !host.isEmpty else {
+            Debug.log("image rejected \(original)")
             return (Self.transparentGIF, "image/gif")
         }
         if let cached = Self.cached(url) { return cached }
@@ -235,7 +255,12 @@ final class ImageLoader: NSObject, WKURLSchemeHandler {
 
     /// True if any address the host resolves to is loopback, link-local, private, CGNAT or unroutable.
     nonisolated private static func resolvesToPrivateAddress(_ host: String) async -> Bool {
-        await Task.detached(priority: .userInitiated) {
+        await Task.detached(priority: .userInitiated) { resolvesToPrivateAddressSync(host) }.value
+    }
+
+    /// Blocking DNS lookup; call off the main thread (the URLSession delegate queue or a detached task).
+    nonisolated static func resolvesToPrivateAddressSync(_ host: String) -> Bool {
+        do {
             var info: UnsafeMutablePointer<addrinfo>?
             // Unresolvable hosts fail closed.
             guard getaddrinfo(host, nil, nil, &info) == 0, let first = info else { return true }
@@ -250,7 +275,7 @@ final class ImageLoader: NSObject, WKURLSchemeHandler {
                 cur = p.pointee.ai_next
             }
             return false
-        }.value
+        }
     }
 
     /// `b` is a raw sockaddr: byte 0 is sa_len, byte 1 sa_family (Darwin layout).

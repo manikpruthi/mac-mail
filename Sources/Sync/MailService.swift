@@ -23,7 +23,11 @@ final class MailService {
     }
 
     func start() {
-        if AppPaths.isDemo { DemoData.seed(store: store) }
+        if AppPaths.isDemo {
+            DemoData.seed(store: store)
+            // Older demo builds queued actions that can never be sent; clear them.
+            for op in store.ops(account: DemoData.account.id) { store.removeOp(op.id) }
+        }
         store.repairEmptyBodies()
         accounts = AppPaths.isDemo ? [DemoData.account] : Prefs.accounts
         for a in accounts { makeEngine(a) }
@@ -32,6 +36,9 @@ final class MailService {
         // Coming back to the app pushes queued offline actions to the server.
         NotificationCenter.default.addObserver(forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main) { _ in
             MainActor.assumeIsolated { MailService.shared.flushAll() }
+        }
+        NotificationCenter.default.addObserver(forName: .mailCountsChanged, object: nil, queue: .main) { _ in
+            MainActor.assumeIsolated { MailService.shared.updateBadge() }
         }
         // Tapping a notification opens the message it refers to (BUG-35).
         UNUserNotificationCenter.current().delegate = NotificationTapHandler.shared
@@ -134,11 +141,10 @@ final class MailService {
         for r in changing { if on { r.flags.insert(flag) } else { r.flags.remove(flag) } }
         store.setFlag(messageIDs: changing.map { $0.id }, flag: flag, on: on)
         for (acct, list) in Dictionary(grouping: changing, by: { $0.accountID }) {
-            engines[acct]?.queue(kind: on ? "flag+" : "flag-", rows: list, arg: imapFlag)
+            engines[acct]?.queue(.flag(set: on, flag: imapFlag), rows: list)
         }
         updateBadge()
-        NotificationCenter.default.post(name: .mailDataChanged, object: nil,
-                                        userInfo: ["flagsOnly": true, "ids": changing.map { $0.id }])
+        NotificationCenter.default.postMailDataChanged(.flags(ids: changing.map { $0.id }))
     }
 
     enum MoveTarget { case archive, trash, spam, inbox, folder(String) }
@@ -172,7 +178,7 @@ final class MailService {
             }
             // Deleting from Trash (or Spam) removes the message for good.
             if case .trash = target, list.allSatisfy({ $0.folderRole == .trash || $0.folderRole == .spam }) {
-                engine.queue(kind: "expunge", rows: list)
+                engine.queue(.expunge, rows: list)
                 store.deleteMessages(ids: list.map { $0.id })
                 label = "Deleted permanently"
                 done += list.count
@@ -181,12 +187,12 @@ final class MailService {
             guard let dest = destination else { continue }
             let movable = list.filter { $0.folderID != dest.id }
             guard !movable.isEmpty else { continue }
-            engine.queue(kind: "move", rows: movable, arg: dest.path)
+            engine.queue(.move(toPath: dest.path), rows: movable)
             store.deleteMessages(ids: movable.map { $0.id })
             done += movable.count
         }
         updateBadge()
-        NotificationCenter.default.post(name: .mailDataChanged, object: nil)
+        NotificationCenter.default.postMailDataChanged(.all)
         guard done > 0 else {
             // Everything already lives in the destination (e.g. archiving from All Mail): say so.
             if case .archive = target { return "Already archived" }
@@ -203,7 +209,6 @@ final class MailService {
         let message: OutgoingMessage
         let replyTo: MessageRow?
         let draftToDelete: MessageRow?
-        weak var composer: ComposeWindowController?
     }
 
     private var pendingSends: [UUID: Task<Void, Never>] = [:]
@@ -229,14 +234,14 @@ final class MailService {
                 // The safety copy failed; the send itself can still go out.
             }
             if Task.isCancelled {
-                if let d = safetyDraft { self.store.deleteMessages(ids: [d.id]); engine.queue(kind: "expunge", rows: [d]) }
+                if let d = safetyDraft { self.store.deleteMessages(ids: [d.id]); engine.queue(.expunge, rows: [d]) }
                 return
             }
             do {
                 try await engine.send(p.message)
-                if let d = safetyDraft { self.store.deleteMessages(ids: [d.id]); engine.queue(kind: "expunge", rows: [d]) }
+                if let d = safetyDraft { self.store.deleteMessages(ids: [d.id]); engine.queue(.expunge, rows: [d]) }
                 if let r = p.replyTo { self.setFlag([r], flag: .answered, on: true) }
-                if let d = p.draftToDelete { engine.queue(kind: "expunge", rows: [d]); self.store.deleteMessages(ids: [d.id]) }
+                if let d = p.draftToDelete { engine.queue(.expunge, rows: [d]); self.store.deleteMessages(ids: [d.id]) }
                 onResult(nil)
             } catch {
                 onResult(error)
@@ -258,8 +263,8 @@ final class MailService {
 
     func updateBadge() {
         // "Show unread count on Dock icon" preference (default on).
-        guard UserDefaults.standard.object(forKey: "showDockBadge") == nil
-            || UserDefaults.standard.bool(forKey: "showDockBadge") else {
+        guard Prefs.d.object(forKey: "showDockBadge") == nil
+            || Prefs.d.bool(forKey: "showDockBadge") else {
             NSApp.dockTile.badgeLabel = nil
             return
         }

@@ -211,6 +211,8 @@ final class SettingsWindowController: NSWindowController, NSTableViewDataSource,
         ask.state = Prefs.askBeforeImages ? .on : .off
         let notify = NSButton(checkboxWithTitle: "Notify about new mail while Mac Mail is open", target: self, action: #selector(notifyChanged(_:)))
         notify.state = Prefs.notifyNewMail ? .on : .off
+        let badge = NSButton(checkboxWithTitle: "Show unread count on the Dock icon", target: self, action: #selector(badgeChanged(_:)))
+        badge.state = (Prefs.d.object(forKey: "showDockBadge") as? Bool ?? true) ? .on : .off
 
         let perImage = NSPopUpButton()
         for mb in [0.5, 1, 2, 5, 10] {
@@ -272,6 +274,7 @@ final class SettingsWindowController: NSWindowController, NSTableViewDataSource,
             [NSGridCell.emptyContentView, ask],
             [label("Undo Send:"), undo],
             [NSGridCell.emptyContentView, notify],
+            [NSGridCell.emptyContentView, badge],
             [NSGridCell.emptyContentView, defaultMail],
         ])
         grid.rowSpacing = 10
@@ -303,12 +306,20 @@ final class SettingsWindowController: NSWindowController, NSTableViewDataSource,
         Prefs.offlineDays = s.selectedTag()
         // Apply the new offline window right away instead of waiting for the next launch.
         MailService.shared.store.prune(offlineDays: Prefs.offlineDays)
-        NotificationCenter.default.post(name: .mailDataChanged, object: nil)
+        NotificationCenter.default.postMailDataChanged(.all)
     }
     @objc private func groupChanged(_ s: NSButton) { Prefs.groupByConversationDefault = s.state == .on }
     @objc private func markReadChanged(_ s: NSButton) { Prefs.markReadOnOpen = s.state == .on }
     @objc private func askChanged(_ s: NSButton) { Prefs.askBeforeImages = s.state == .on }
-    @objc private func notifyChanged(_ s: NSButton) { Prefs.notifyNewMail = s.state == .on }
+    @objc private func notifyChanged(_ s: NSButton) {
+        Prefs.notifyNewMail = s.state == .on
+        // Ask for permission when the user turns notifications on, not on the first delivery (UX-09).
+        if Prefs.notifyNewMail { MailService.shared.requestNotificationPermission() }
+    }
+    @objc private func badgeChanged(_ s: NSButton) {
+        Prefs.d.set(s.state == .on, forKey: "showDockBadge")
+        MailService.shared.updateBadge()
+    }
     @objc private func undoChanged(_ s: NSPopUpButton) { Prefs.undoSendSeconds = s.selectedTag() }
     @objc private func perImageChanged(_ s: NSPopUpButton) { Prefs.imageMaxMB = s.selectedItem?.representedObject as? Double ?? 2 }
     @objc private func perMessageChanged(_ s: NSPopUpButton) { Prefs.imageMessageMaxMB = s.selectedItem?.representedObject as? Double ?? 10 }

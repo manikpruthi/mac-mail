@@ -3,7 +3,7 @@ import Foundation
 /// User settings, backed by UserDefaults.
 enum Prefs {
     /// Demo mode keeps its own settings so screenshot runs never touch the real app's accounts or preferences.
-    private static let d: UserDefaults = AppPaths.isDemo
+    static let d: UserDefaults = AppPaths.isDemo
         ? (UserDefaults(suiteName: "com.manikpruthi.macmail.demo") ?? .standard) : .standard
 
     static func register() {

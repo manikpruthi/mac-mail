@@ -16,10 +16,17 @@ final class MessageWindowController: NSWindowController, NSWindowDelegate, NSToo
         let c = MessageWindowController(messageID: messageID)
         open[messageID] = c
         c.showWindow(nil)
+        if let w = c.window, w.frame.width < 600 { w.setContentSize(defaultSize) }
         c.window?.makeKeyAndOrderFront(nil)
     }
 
     static var openCount: Int { open.count }
+
+    /// Opening size, clamped to the screen so it never spills off a small display.
+    private static var defaultSize: NSSize {
+        let vis = NSScreen.main?.visibleFrame.size ?? NSSize(width: 1440, height: 900)
+        return NSSize(width: min(900, vis.width - 80), height: min(820, vis.height - 80))
+    }
 
     private let messageID: Int64
     private let preview = PreviewViewController()
@@ -37,8 +44,9 @@ final class MessageWindowController: NSWindowController, NSWindowDelegate, NSToo
         super.init(window: w)
         w.delegate = self
         w.keyHandler = { [weak self] e in self?.handleKey(e) ?? false }
+        // The reading pane has no intrinsic width; without a preferred size the window shrinks to its minimum.
+        preview.preferredContentSize = Self.defaultSize
         w.contentViewController = preview
-        w.setContentSize(NSSize(width: 860, height: 760))
         let toolbar = NSToolbar(identifier: "MacMailMessageWindow")
         toolbar.delegate = self
         toolbar.displayMode = .iconOnly
@@ -50,6 +58,8 @@ final class MessageWindowController: NSWindowController, NSWindowDelegate, NSToo
             toast.bottomAnchor.constraint(equalTo: preview.view.bottomAnchor, constant: -18),
         ])
         preview.showToast = { [weak self] s in self?.toast.show(s) }
+        // Size last: setting the toolbar and constraints can re-fit the window to the content's fitting size.
+        w.setContentSize(Self.defaultSize)
         preview.onEditDraft = { d in ComposeWindowController.open(.draft(d, MailService.shared.store.body(d.id))) }
         preview.show(messageID: messageID)
         let subject = MailService.shared.store.detail(messageID)?.subject ?? ""
@@ -60,15 +70,22 @@ final class MessageWindowController: NSWindowController, NSWindowDelegate, NSToo
         } else {
             w.center()
         }
-        NotificationCenter.default.addObserver(self, selector: #selector(dataChanged), name: .mailDataChanged, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(dataChanged(_:)), name: .mailDataChanged, object: nil)
     }
 
     required init?(coder: NSCoder) { fatalError() }
 
+    // Reading-pane zoom (View menu) works wherever focus is in this window, not only inside the web view.
+    @objc func zoomInReading(_ sender: Any?) { preview.zoomIn() }
+    @objc func zoomOutReading(_ sender: Any?) { preview.zoomOut() }
+    @objc func resetReadingZoom(_ sender: Any?) { preview.resetZoom() }
+
     private var row: MessageRow? { MailService.shared.store.rows(ids: [messageID]).first }
 
     /// Closes the window if the message left its folder (archived, deleted, moved here or elsewhere).
-    @objc private func dataChanged() {
+    @objc private func dataChanged(_ note: Notification) {
+        // A flag change can't remove the message; only row changes can.
+        if case .flags = note.mailDataChange { return }
         if MailService.shared.store.detail(messageID) == nil { window?.close() }
     }
 
