@@ -1,8 +1,8 @@
 import AppKit
 
 /// Filters chosen in the search filter bar, merged into the typed query.
-struct SearchFilters: Equatable {
-    enum Scope: Equatable { case all, folder }
+struct SearchFilters: Equatable, Codable {
+    enum Scope: Equatable, Codable { case all, folder }
     var scope: Scope = .all
     var withinDays: Int?
     var unread = false
@@ -28,6 +28,12 @@ struct SearchFilters: Equatable {
         if !s.isEmpty { q.subject.append(s) }
         return q
     }
+}
+
+extension Notification.Name {
+    /// Posted whenever the bar's filters change, so the window can mirror them (Save Search — C-19)
+    /// and drop the preview when the results no longer contain the selected message (C-14).
+    static let mailSearchFiltersChanged = Notification.Name("MacMail.searchFiltersChanged")
 }
 
 /// Outlook-style search filters shown under the list header while searching:
@@ -127,6 +133,23 @@ final class SearchFilterBar: NSView, NSPopoverDelegate {
         toField.stringValue = ""
         subjectField.stringValue = ""
         updateMoreTitle()
+        NotificationCenter.default.post(name: .mailSearchFiltersChanged, object: filters)
+    }
+
+    /// Restores a saved set of filters, updating every control, then re-runs the search (C-19).
+    func apply(_ f: SearchFilters) {
+        filters = f
+        scope.selectItem(at: f.scope == .folder ? 1 : 0)
+        date.selectItem(at: Self.dayChoices.firstIndex { $0.1 == f.withinDays } ?? 0)
+        unread.state = f.unread ? .on : .off
+        flagged.state = f.flagged ? .on : .off
+        attachments.state = f.attachments ? .on : .off
+        fromField.stringValue = f.from
+        toField.stringValue = f.to
+        subjectField.stringValue = f.subject
+        updateMoreTitle()
+        NotificationCenter.default.post(name: .mailSearchFiltersChanged, object: filters)
+        onChange?(filters)
     }
 
     @objc private func changed() {
@@ -135,6 +158,7 @@ final class SearchFilterBar: NSView, NSPopoverDelegate {
         filters.unread = unread.state == .on
         filters.flagged = flagged.state == .on
         filters.attachments = attachments.state == .on
+        NotificationCenter.default.post(name: .mailSearchFiltersChanged, object: filters)
         onChange?(filters)
     }
 
@@ -203,6 +227,7 @@ final class SearchFilterBar: NSView, NSPopoverDelegate {
         filters.to = toField.stringValue
         filters.subject = subjectField.stringValue
         updateMoreTitle()
+        NotificationCenter.default.post(name: .mailSearchFiltersChanged, object: filters)
         popover?.performClose(nil)
         onChange?(filters)
     }

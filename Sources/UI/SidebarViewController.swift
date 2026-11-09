@@ -54,9 +54,12 @@ final class SidebarViewController: NSViewController, NSOutlineViewDataSource, NS
     private let status = NSTextField(labelWithString: "")
     private let statusSpinner = NSProgressIndicator()
     var onSelect: ((MailSource) -> Void)?
-    /// A saved search was picked: run it in the search field (F-29).
-    var onSavedSearch: ((String) -> Void)?
+    /// A saved search was picked: run it with the filters it was saved with (F-29 / C-19).
+    var onSavedSearch: ((SavedSearches.Entry) -> Void)?
     private var suppressSelection = false
+    /// Nothing is expanded until the first reload has built the outline; after that the
+    /// user's collapsed/expanded state is preserved across reloads (C-35).
+    private var hasExpansionState = false
 
     override func loadView() {
         let root = NSView()
@@ -173,14 +176,28 @@ final class SidebarViewController: NSViewController, NSOutlineViewDataSource, NS
             }
             items.append(acct)
         }
+        // Remember which roots were expanded so a reload doesn't pop collapsed accounts open (C-35).
+        var expanded: [SidebarItem.Kind] = []
+        for r in roots where !r.children.isEmpty && (hasExpansionState ? outline.isItemExpanded(r) : true) {
+            expanded.append(r.kind)
+        }
+        hasExpansionState = true
         roots = items
         refreshCounts(reloadOutline: false)
         suppressSelection = true
         outline.reloadData()
-        for r in roots where !r.children.isEmpty { outline.expandItem(r) }
-        if let selected { select(kind: selected) }
+        for r in roots where !r.children.isEmpty && expanded.contains(r.kind) { outline.expandItem(r) }
+        // Re-select the old row; when it vanished (deleted or renamed elsewhere) select(kind:) falls
+        // back while suppressed, so report the fallback to the list once the suppression is lifted
+        // — otherwise the highlight moves but list.source keeps pointing at the dead folder (B-37 / C-07).
+        var fellBack = false
+        if let selected, !select(kind: selected) {
+            selectDefault()
+            fellBack = true
+        }
         Debug.log("sidebar roots=\(roots.count) rows=\(outline.numberOfRows)")
         suppressSelection = false
+        if fellBack, let source = selectedSource { onSelect?(source) }
         updateStatus()
     }
 
@@ -190,6 +207,9 @@ final class SidebarViewController: NSViewController, NSOutlineViewDataSource, NS
         // Two aggregate queries instead of several per folder (O-06).
         let counts = store.unreadCounts()
         let ops = store.opCounts()
+        // Unified role rows (All Sent, All Trash, …) show the summed unread of every folder with
+        // that role (C-35); built lazily, only when such a row exists.
+        var roleUnread: [FolderRole: Int]?
         for r in roots {
             switch r.kind {
             case .account(let id):
@@ -205,6 +225,15 @@ final class SidebarViewController: NSViewController, NSOutlineViewDataSource, NS
                     c.unread = counts[id] ?? 0
                 case .unified:
                     c.unread = store.unifiedUnreadCount()
+                case .unifiedRole(let role):
+                    if roleUnread == nil {
+                        var map: [FolderRole: Int] = [:]
+                        for a in service.accounts {
+                            for f in store.folders(account: a.id) { map[f.role, default: 0] += counts[f.id] ?? 0 }
+                        }
+                        roleUnread = map
+                    }
+                    c.unread = roleUnread?[role] ?? 0
                 default: break
                 }
             }
@@ -261,16 +290,45 @@ final class SidebarViewController: NSViewController, NSOutlineViewDataSource, NS
         (outline.item(atRow: outline.selectedRow) as? SidebarItem)?.kind
     }
 
-    func select(kind: SidebarItem.Kind) {
+    /// The selected row as a list source, for the reload fallback and programmatic selection.
+    private var selectedSource: MailSource? {
+        switch selectedKind {
+        case .unified: return .unified
+        case .unifiedRole(let role): return .unifiedRole(role)
+        case .flagged: return .flagged
+        case .folder(let id): return .folder(id)
+        default: return nil
+        }
+    }
+
+    /// Highlights the row for a source without re-triggering onSelect — for source changes that
+    /// didn't come from a sidebar click (⌘1…9, clearing the search — C-15).
+    func select(source: MailSource) {
+        let kind: SidebarItem.Kind
+        switch source {
+        case .unified: kind = .unified
+        case .unifiedRole(let role): kind = .unifiedRole(role)
+        case .flagged: kind = .flagged
+        case .folder(let id): kind = .folder(id)
+        case .search: return
+        }
+        suppressSelection = true
+        select(kind: kind)
+        suppressSelection = false
+    }
+
+    @discardableResult
+    func select(kind: SidebarItem.Kind) -> Bool {
         for row in 0..<outline.numberOfRows {
             if let item = outline.item(atRow: row) as? SidebarItem, item.kind == kind {
                 outline.selectRowIndexes([row], byExtendingSelection: false)
-                return
+                return true
             }
         }
         // The folder vanished (deleted or renamed elsewhere): fall back instead of leaving a stale
         // list on screen with nothing highlighted (B-37).
         selectDefault()
+        return false
     }
 
     /// Picks All Inboxes, or the first account's Inbox.
@@ -494,7 +552,7 @@ final class SidebarViewController: NSViewController, NSOutlineViewDataSource, NS
         case .flagged: onSelect?(.flagged)
         case .folder(let id): onSelect?(.folder(id))
         case .saved(let name):
-            if let q = SavedSearches.all.first(where: { $0.name == name })?.query { onSavedSearch?(q) }
+            if let e = SavedSearches.all.first(where: { $0.name == name }) { onSavedSearch?(e) }
         case .account, .group: break
         }
     }
@@ -646,7 +704,19 @@ extension Notification.Name {
 /// Named searches shown in the sidebar (F-29), kept in the store's prefs table.
 @MainActor
 enum SavedSearches {
-    struct Entry: Codable, Equatable { var name: String; var query: String }
+    struct Entry: Codable, Equatable {
+        var name: String
+        var query: String
+        /// Filter-bar state captured when the search was saved (C-19); nil on entries saved by
+        /// older builds, which stored the raw query text only and still load through `query`.
+        var structured: Saved?
+
+        struct Saved: Codable, Equatable {
+            var filters: SearchFilters
+            /// The folder "This folder" was scoped to when the search was saved.
+            var scopeFolderID: Int64?
+        }
+    }
 
     static var all: [Entry] {
         guard let raw = MailService.shared.store.pref("savedSearches"), let data = raw.data(using: .utf8),
@@ -660,10 +730,10 @@ enum SavedSearches {
         NotificationCenter.default.post(name: .mailSavedSearchesChanged, object: nil)
     }
 
-    static func add(name: String, query: String) {
+    static func add(name: String, query: String, structured: Entry.Saved? = nil) {
         let clean = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !clean.isEmpty, !query.isEmpty else { return }
-        save(all.filter { $0.name != clean } + [Entry(name: clean, query: query)])
+        save(all.filter { $0.name != clean } + [Entry(name: clean, query: query, structured: structured)])
     }
 
     static func remove(_ name: String) { save(all.filter { $0.name != name }) }
