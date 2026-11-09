@@ -28,12 +28,26 @@ final class AccountEngine {
     private var flushPending = false
     private(set) var isGmail: Bool
     private(set) var lastError: String?
+    /// Classification of `lastError` (credentials vs network vs server refusal); the string stays as the human form.
+    private(set) var lastErrorKind: MailErrorKind?
     private(set) var syncingFolders = 0
     var onNewMail: ((AccountEngine, [ParsedHeader]) -> Void)?
 
-    init(account: Account, store: Store) {
+    /// Creates the IMAP client for a lane; injectable so tests can substitute a fake.
+    typealias ClientFactory = @Sendable (_ host: String, _ port: UInt16, _ username: String, _ password: String) -> IMAPClient
+    /// Resolves the account password; injectable so tests can bypass the Keychain.
+    typealias PasswordProvider = @Sendable (_ accountID: String) async throws -> String?
+
+    private let clientFactory: ClientFactory
+    private let passwordProvider: PasswordProvider
+
+    init(account: Account, store: Store,
+         clientFactory: @escaping ClientFactory = { IMAPClient(host: $0, port: $1, username: $2, password: $3) },
+         passwordProvider: @escaping PasswordProvider = { Keychain.get($0) }) {
         self.account = account
         self.store = store
+        self.clientFactory = clientFactory
+        self.passwordProvider = passwordProvider
         self.isGmail = account.provider == .gmail
     }
 
@@ -49,10 +63,11 @@ final class AccountEngine {
         // Publish the connecting task before anything can suspend, so a second caller shares this
         // connection instead of opening a second one.
         let a = account
+        let makeClient = clientFactory
         let t0 = Date()
         let task = Task<IMAPClient, Error> {
             let password = try await appPassword()
-            let c = IMAPClient(host: a.imapHost, port: a.imapPort, username: a.username, password: password)
+            let c = makeClient(a.imapHost, a.imapPort, a.username, password)
             try await c.connect()
             return c
         }
@@ -72,24 +87,25 @@ final class AccountEngine {
     }
 
     private var cachedPassword: String?
-    private var passwordTask: Task<String?, Never>?
+    private var passwordTask: Task<String?, Error>?
 
     /// Reads the App Password once, off the main thread: a Keychain read can block for seconds
     /// (macOS verifies the app before releasing the item), which would freeze the window.
     func appPassword() async throws -> String {
         if let p = cachedPassword { return p }
+        let provide = passwordProvider
         let task = passwordTask ?? {
             let id = account.id
             let t = Task.detached(priority: .userInitiated) { () -> String? in
                 let t0 = Date()
-                let p = Keychain.get(id)
+                let p = try await provide(id)
                 Debug.log("keychain read: \(Debug.ms(since: t0))")
                 return p
             }
             passwordTask = t
             return t
         }()
-        guard let p = await task.value else {
+        guard let p = try await task.value else {
             passwordTask = nil
             throw NetError.auth("no App Password saved for \(account.email). Open Settings → Accounts.")
         }
@@ -102,6 +118,10 @@ final class AccountEngine {
         startupTasks.removeAll()
         idleTask?.cancel()
         idleTask = nil
+        searchTask?.cancel()
+        searchTask = nil
+        for t in connecting.values { t.cancel() }
+        connecting.removeAll()
         let all = clients.values
         clients.removeAll()
         for c in all { Task { await c.disconnect() } }
@@ -109,9 +129,22 @@ final class AccountEngine {
 
     private func report(_ error: Error?) {
         let message = error.map { ($0 as? LocalizedError)?.errorDescription ?? $0.localizedDescription }
+        lastErrorKind = Self.classify(error)
         if message != lastError {
             lastError = message
             NotificationCenter.default.post(name: .mailStatusChanged, object: self)
+        }
+    }
+
+    /// Why an operation failed, so callers can tell a credentials problem from a network blip
+    /// or a retryable server refusal without parsing the message text.
+    private static func classify(_ error: Error?) -> MailErrorKind? {
+        guard let error else { return nil }
+        switch error as? NetError {
+        case .auth: return .auth
+        case .closed, .timeout, .protocolError: return .network
+        case .server(let m): return isTemporaryRefusal(m) ? .temporary : .permanent
+        case nil: return .network
         }
     }
 
@@ -242,7 +275,7 @@ final class AccountEngine {
                 // Don't let server flag writes clobber what the user just changed: UIDs with a queued
                 // flag op keep their local (and soon server) state.
                 let pendingFlagUIDs = Set(store.ops(account: account.id)
-                    .filter { ($0.kind == "flag+" || $0.kind == "flag-") && $0.folderPath == folder.path }
+                    .filter { PendingOpKind($0)?.isFlagChange == true && $0.folderPath == folder.path }
                     .flatMap { $0.uids })
                 var flagsOK = true
                 if let minUID = store.minUID(folderID: folderID) {
@@ -481,6 +514,9 @@ final class AccountEngine {
                 if await c.isGmail {
                     uids = try await c.uidSearch(prefix: "X-GM-RAW", text: query.gmailRaw)
                 } else {
+                    // Unrepresentable criteria (has:attachment, server-only operators, non-ASCII) must not
+                    // widen to "ALL": leave the results to the local cache search instead.
+                    guard query.isIMAPRepresentable else { return [] }
                     uids = try await c.uidSearch(query.imapCriteria)
                 }
                 let newest = Array(uids.sorted(by: >).prefix(200))
@@ -538,16 +574,18 @@ final class AccountEngine {
                 store.removeOp(op.id) // Stale UIDs would land on the wrong messages.
                 continue
             }
+            guard let opKind = PendingOpKind(op) else {
+                store.removeOp(op.id) // Unknown kind (older cache): dropping beats skipping forever.
+                continue
+            }
             do {
                 try await syncGate.run {
                     let c = try await client(.sync)
                     try self.verifySelection(try await c.ensureSelected(op.folderPath, readOnly: false), folder: f)
-                    switch op.kind {
-                    case "flag+": try await c.store(op.uids, "+FLAGS.SILENT (\(op.arg))")
-                    case "flag-": try await c.store(op.uids, "-FLAGS.SILENT (\(op.arg))")
-                    case "move": try await c.move(op.uids, to: op.arg)
-                    case "expunge": try await c.expungeUIDs(op.uids)
-                    default: break
+                    switch opKind {
+                    case .flag(let set, let flag): try await c.store(op.uids, "\(set ? "+" : "-")FLAGS.SILENT (\(flag))")
+                    case .move(let dest): try await c.move(op.uids, to: dest)
+                    case .expunge: try await c.expungeUIDs(op.uids)
                     }
                 }
                 store.removeOp(op.id)
@@ -557,7 +595,7 @@ final class AccountEngine {
                     // The server refused it for good; don't retry forever.
                     store.removeOp(op.id)
                     report(e)
-                    if op.kind == "move" || op.kind == "expunge" { await refetchHeaders(folder: f, uids: op.uids) }
+                    if opKind.needsRefetchOnRefusal { await refetchHeaders(folder: f, uids: op.uids) }
                     continue
                 }
                 report(e)
@@ -565,7 +603,7 @@ final class AccountEngine {
                 if n >= 3 {
                     // Temporary refusal that won't clear: give up and undo the optimistic local delete.
                     store.removeOp(op.id)
-                    if op.kind == "move" || op.kind == "expunge" { await refetchHeaders(folder: f, uids: op.uids) }
+                    if opKind.needsRefetchOnRefusal { await refetchHeaders(folder: f, uids: op.uids) }
                 } else {
                     attempts[op.id] = n
                     try? await Task.sleep(nanoseconds: UInt64(2_000_000_000 << (n - 1)))
@@ -627,6 +665,45 @@ final class AccountEngine {
         // Gmail (and other servers) need a moment to file the sent copy before the Sent sync runs.
         if let sent = store.folder(account: account.id, role: .sent) {
             Task { try? await Task.sleep(nanoseconds: 3_000_000_000); await self.sync(folderID: sent.id) }
+        }
+    }
+}
+
+/// What kind of failure the engine last reported.
+enum MailErrorKind {
+    case auth
+    case network
+    case temporary
+    case permanent
+}
+
+/// A queued server action, typed here at the engine boundary. `Store.PendingOp` keeps the string
+/// form in SQLite (it survives relaunch); everything the engine does with an op goes through this.
+enum PendingOpKind: Equatable {
+    case flag(set: Bool, flag: String)
+    case move(toPath: String)
+    case expunge
+
+    init?(_ op: Store.PendingOp) {
+        switch op.kind {
+        case "flag+": self = .flag(set: true, flag: op.arg)
+        case "flag-": self = .flag(set: false, flag: op.arg)
+        case "move": self = .move(toPath: op.arg)
+        case "expunge": self = .expunge
+        default: return nil
+        }
+    }
+
+    var isFlagChange: Bool {
+        if case .flag = self { return true }
+        return false
+    }
+
+    /// A refusal of these ops must re-fetch the source headers so the messages reappear locally.
+    var needsRefetchOnRefusal: Bool {
+        switch self {
+        case .move, .expunge: return true
+        case .flag: return false
         }
     }
 }

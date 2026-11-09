@@ -18,8 +18,8 @@ trap 'rm -rf "$STAGE"' EXIT
 ditto "$APP" "$STAGE/$APP_NAME.app"
 ln -s /Applications "$STAGE/Applications"
 
-diskutil image create from --format UDZO --volumeName "$APP_NAME" \
-    "$STAGE" "$RELEASE_DIR/MacMail-$VERSION.dmg" >/dev/null
+hdiutil create -volname "$APP_NAME" -srcfolder "$STAGE" -ov -format UDZO \
+    "$RELEASE_DIR/MacMail-$VERSION.dmg" >/dev/null
 
 touch "$RELEASE_DIR/.metadata_never_index"
 
