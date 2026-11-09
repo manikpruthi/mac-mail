@@ -28,9 +28,10 @@ Graphic emails look the way the sender designed them. Small images load automati
     - Date: past week, month, 6 months or year.
     - Toggles: Unread, Flagged, Attachments.
     - **More**: From, To and Subject fields.
-  - **Saved searches:** the search field's menu → *Save This Search…* (or Mailbox → Save Search…) adds the query to *Saved Searches* in the sidebar; right-click to delete.
+  - **Saved searches:** the search field's menu → *Save This Search…* (or Mailbox → Save Search…) saves the text together with the filter-bar choices and the folder scope under *Saved Searches* in the sidebar; selecting one restores all of it, and right-click deletes it.
+- **Paging.** The list shows 1,000 rows at a time. *Show more messages* pages in the next 1,000 from the cache, search results included, before *Load older messages* asks the server for older mail in a folder.
 - **Conversations on or off per folder.** Like Outlook, each folder can either group messages by conversation (threads expand in place) or show every message separately (⌥⌘C). Gmail threads use Gmail's own thread ids; other servers thread by `References` / `In-Reply-To`, falling back to subject plus participants (never subject alone).
-- **Sort and density.** View → Sort By (newest, oldest, sender, subject) and View → Compact Rows (two-line rows). Big folders load 1,000 rows at a time; *Show more messages* pages in more from the cache before *Load older messages* asks the server.
+- **Sort and density.** View → Sort By (newest, oldest, sender, subject) and View → Compact Rows (two-line rows). Newest and oldest are applied by the list's query (search results are reordered in memory), so the loaded page and *Load older messages* both follow that direction; sender and subject sort the loaded page.
 - **Preview pane**, with a three-pane layout: folders, list and message.
 - **Open in a separate window**, like Outlook:
   - Double-click a message (or press Return) to open it in its own window.
@@ -72,7 +73,7 @@ Graphic emails look the way the sender designed them. Small images load automati
   - Drafts saved to the server, with Bcc, attachments and reply threading restored when you reopen one. Reopened attachments are downloaded before Save or Send is allowed, and the old draft is removed only after its replacement is confirmed on the server (found by its Message-ID, never by subject).
   - **Autosave:** every open composer is saved locally a few seconds after each change. After a crash or forced quit, unsent messages reopen at the next launch ("Recovered unsent message").
   - Quitting with an unsaved message asks Save / Discard / Cancel. A message in its Undo Send countdown is kept as a draft until the server accepts it, so a failed send or quit never loses it.
-  - **Outbox:** sending while offline (or while the server can't be reached) puts the finished message in the Outbox instead of failing. It goes out by itself when the network is back, when you return to the app, or when you click the sidebar status.
+  - **Outbox:** sending while offline (or while the server can't be reached) puts the finished message in the Outbox instead of failing. It goes out by itself when the network is back, when you return to the app, or when you click the sidebar status. A message is only listed as queued once its record has been read back from disk, and an unreadable record is moved to an `Outbox Corrupt` folder instead of being silently lost (see [Outbox troubleshooting](#outbox-troubleshooting)).
   - **Images go in the body, like Outlook.** Paste a screenshot or a copied picture, or paste or drop image files copied in Finder or Mac Explorer, and they appear inline where the cursor is. Other files (and images over 20 MB) are attached. Inline images are sent as standard `cid:` parts (multipart/related), so they show in the body in Apple Mail, Outlook and Gmail. HEIC, TIFF and other formats those apps can't show inline are converted to JPEG (or PNG when transparent). **Resize** an image like in Outlook: click it and drag a corner handle (the aspect ratio is kept; ⌘Z undoes), or right-click → **Image Size** (Small, Medium, Large, Fit to Window, Original Size). Click a selected image and drag it to move it. The size you pick is the size recipients see, and the full-resolution image is still sent. Images and their sizes stay in autosaves and saved drafts. The editor shows a screen-sized copy, so a large photo doesn't cost its full size in RAM. The window title follows the subject.
   - Changing the From account swaps in that account's signature, even if you typed below the old one.
   - Undo Send (10 s by default): click Undo, press ⌘Z or Esc (outside a text field), or use Edit → Undo Send. Undo is only possible while the countdown runs; once the upload starts the toast says it's too late rather than pretending.
@@ -81,13 +82,13 @@ Graphic emails look the way the sender designed them. Small images load automati
 - **Mail actions:** read/unread, flag, archive, delete, report spam / not spam, and move to any label or folder. Actions apply instantly and are queued for the server, so they also work offline. Queued actions are sent after every sync, reconnect and when the app becomes active; temporary server refusals are retried, and a message whose move is refused reappears. The sidebar shows "N actions waiting" while anything is queued.
   - **Undo** for archive, delete, move and spam: the toast's Undo button (8 s) puts the messages back; the server is only told once the undo window closes (or at quit).
   - **Archive** goes to Gmail's All Mail, or to the account's Archive folder elsewhere. An account without one gets an "Archive" folder created on the server; Archive never falls back to Trash.
-  - **Empty Trash / Empty Spam** (Mailbox menu, or right-click the folder), after a confirmation.
+  - **Empty Trash / Empty Spam** (Mailbox menu, or right-click the folder), after a confirmation. From All Inboxes or another unified view, the command covers that folder in every account, with one confirmation and an aggregate count.
   - **Folders:** right-click a folder for New Folder Inside…, Rename… and Delete Folder…, or an account for New Folder…. System folders can't be renamed or deleted.
   - Mark-all-as-read is deliberately not offered (too easy to trigger by accident).
 - **Accounts:**
   - Gmail (App Password) and other IMAP/SMTP servers, with **SSL/TLS** (993 / 465) or **STARTTLS** (143 / 587) for each side, a separate login name when it differs from the address, and a separate SMTP login if needed. Mac Mail never sends a password without TLS: a server that doesn't offer STARTTLS is refused.
   - Adding an account signs in to **both** IMAP and SMTP before anything is saved, and says which side failed.
-  - **Edit Account / Sign in again** (Settings → Accounts → Edit Account…, or right-click the account): change servers, ports, security, logins or the password; the account reconnects with the new settings at once.
+  - **Edit Account / Sign in again** (Settings → Accounts → Edit Account…, or right-click the account): change servers, ports, security, logins or the password; the account reconnects with the new settings at once. **Save Without Verifying** stores the edit and password locally and reconnects in the background, so a wrong host or an offline Mac can still be fixed; cancelling during the check puts the old settings and password back.
   - Each account appears in the sidebar with its folders; right-click it for Sync Now, Edit Account, Notify About New Mail, New Folder, storage use (quota) and Remove. A sign-in problem shows a warning on the account row.
   - With more than one account, **All Accounts** shows All Inboxes, Flagged, Sent, Drafts, Archive and Trash across every account.
   - Choose a default account for new mail. A Keychain refusal when saving a password is shown instead of silently losing the old password.
@@ -97,8 +98,8 @@ Graphic emails look the way the sender designed them. Small images load automati
 - **Spam:** Gmail filters spam on its own servers before mail reaches any app. Mac Mail shows the Spam folder, and its Spam / Not Spam buttons apply Gmail's real spam label, which trains Google's filter.
 - **Other:**
   - Unread counts in the sidebar and Dock badge come from the server (IMAP `STATUS`), so they include mail older than the offline window; reading or moving mail updates them instantly. The badge can be turned off in Settings.
-  - Notifications for new mail while the app is open (also when its window is hidden, minimised or on another Space); clicking one opens that exact message, and its **Mark as Read** / **Archive** buttons act without opening the app. Turn them off per account in Settings or the account's right-click menu.
-  - **Settings → Storage:** cache sizes, outbox and queue state, last prune and last errors; Prune Now, Clear Message Text Cache, Clear Image Cache, and Export Diagnostics Log (connection/sync errors only, never mail content or passwords).
+  - Notifications for new mail while the app is open (also when its window is hidden, minimised or on another Space); clicking one opens that exact message, and its **Mark as Read** / **Archive** buttons act without opening the app. macOS asks for permission when you turn them on (or add your first account); if macOS is blocking them, Settings says so and links to System Settings. Turn them off per account in Settings or the account's right-click menu.
+  - **Settings → Storage:** cache sizes, outbox and queue state, last prune and last errors, read off the main thread when the tab opens; Prune Now, Clear Message Text Cache (with compaction), Clear Image Cache, and Export Diagnostics Log (connection/sync errors only, never mail content or passwords).
   - Unsubscribe when the sender supports it, after a confirmation that shows where it goes.
   - Replied messages show an arrow in the list. Swipe a row for Archive or Read/Flag.
   - Reading-pane zoom (⌘+ / ⌘- / ⌘0) and the light-background choice are remembered (zoom globally, light background per sender).
@@ -120,7 +121,7 @@ Graphic emails look the way the sender designed them. Small images load automati
 
 1. Run `./package.sh` (or download a release), then open `release/MacMail-<version>-<build>-universal.dmg` (a `.sha256` checksum sits next to it). DMGs aren't committed to git; older ones in `release/` are kept.
 2. Drag **Mac Mail.app** into `Applications`.
-3. Open it from Applications. The build is ad-hoc signed, so the first time, right-click → **Open**.
+3. Open it from Applications. A locally built DMG is ad-hoc signed, so the first time, right-click → **Open**; a Developer ID build that `package.sh` notarised opens normally.
 4. Click **Add Account…**, then enter your Gmail address and App Password.
 
 ### Option 2: Build from source
@@ -135,7 +136,8 @@ Graphic emails look the way the sender designed them. Small images load automati
 - `build.sh` compiles into a staging folder and replaces the previous app only after compiling and signing succeed, so a compile error never leaves you without a working build.
 - The build number (`CFBundleVersion`) is the git commit count; the version comes from `Resources/Info.plist`. The macOS minimum is read from `LSMinimumSystemVersion` there too.
 - `build.sh` runs the offline selftest first; `MAC_MAIL_SKIP_SELFTEST=1` skips it.
-- Signing is ad hoc by default (hardened runtime, `Resources/MacMail.entitlements`). Set `MAC_MAIL_SIGN_IDENTITY="Developer ID Application: …"` to sign with a real identity, and `MAC_MAIL_NOTARY_PROFILE=<notarytool profile>` for `package.sh` to notarise and staple the DMG.
+- Signing is ad hoc by default (`--timestamp=none`, hardened runtime, `Resources/MacMail.entitlements`), which keeps a Keychain grant tied to the exact binary. Set `MAC_MAIL_SIGN_IDENTITY="Developer ID Application: …"` for a Developer ID signature: `build.sh` signs with a secure timestamp, fails if the timestamp or hardened runtime is missing, and the Keychain grant survives updates.
+- `package.sh` notarises, staples and verifies the DMG only when `MAC_MAIL_NOTARY_PROFILE=<notarytool profile>` is set; it refuses to notarise without a Developer ID identity, and with no profile it notes that the build isn't notarised.
 - `package.sh` verifies the signature, includes LICENSE and README in the DMG, mounts the finished image to check the app inside, and writes a SHA-256 checksum.
 - `tools/clean.sh` removes local build output and worker state.
 - CI (`.github/workflows/selftest.yml`) runs the selftest and type-checks **every** source file on each push to `main` and each pull request.
@@ -162,7 +164,7 @@ tools/selftest.sh
 - **⌘S:** save the open message as `.eml`. **⌘P:** print it.
 - **⌘R / ⇧⌘R / ⌘J:** reply, reply all, forward.
 - **⌘↩:** send. A toast offers **Undo** for 10 seconds; ⌘Z or Esc (outside text fields) and Edit → Undo Send do the same.
-- **⌥⇧⌘⌫:** Empty Trash (Mailbox menu, with confirmation).
+- **⌥⇧⌘⌫:** Empty Trash (Mailbox menu, with confirmation; from All Inboxes it empties every account's Trash).
 - **⇧⌘A:** attach files. Dropping files on the message or the Dock icon also attaches them; image files dropped on the body go inline.
 - **⇧⌘S:** save attachments (one opens a Save dialog, several save as a `.zip`).
 - **⌫ / E / ⌃⌘A:** delete, archive.
@@ -178,13 +180,13 @@ tools/selftest.sh
 - **Message → Move to…:** pick a folder with the keyboard.
 - **⌘+ / ⌘- / ⌘0:** reading-pane zoom (works wherever focus is in the window).
 - **⌥⌘F:** search all mail.
-- **⌥⌘R:** sync now.
+- **⌥⌘R:** sync now. **Click the sidebar status** to retry queued actions or messages in the Outbox.
 - **⌘,:** Settings (accounts, signatures, appearance, offline window, image limits, Undo Send delay, default email app).
 - **Double-click a draft:** continue editing it.
 
 ## How it works
 
-- **Protocol.** The app talks to the server directly over IMAP and SMTP: implicit TLS (993 / 465) through `Network.framework`, or STARTTLS (143 / 587) on a Foundation stream that is upgraded to TLS in place (Network.framework can't upgrade a connection). After STARTTLS any bytes read before the handshake are discarded and capabilities are asked for again. SMTP signs in with AUTH PLAIN, or AUTH LOGIN where PLAIN isn't offered. It uses Gmail's IMAP extensions: `X-GM-THRID` for conversations, `X-GM-MSGID` to de-duplicate, and `X-GM-RAW` for real Gmail search. It also uses CONDSTORE for flag deltas, MOVE, and IDLE.
+- **Protocol.** The app talks to the server directly over IMAP and SMTP: implicit TLS (993 / 465) through `Network.framework`, or STARTTLS (143 / 587) on a Foundation stream that is upgraded to TLS in place (Network.framework can't upgrade a connection). After STARTTLS any bytes already read are discarded on the transport's own run-loop thread before the handshake, so plaintext can't be served as if it arrived over TLS, and capabilities are asked for again. SMTP signs in with AUTH PLAIN, or AUTH LOGIN where PLAIN isn't offered. It uses Gmail's IMAP extensions: `X-GM-THRID` for conversations, `X-GM-MSGID` to de-duplicate, and `X-GM-RAW` for real Gmail search. It also uses CONDSTORE for flag deltas, MOVE, and IDLE.
 - **Five connections per account**, each with its own job, so what you click never waits behind background work (Gmail allows 15):
   - *sync*: delta syncs and the queued actions.
   - *fetch*: what you click, such as message text, inline images and search. It's opened and pointed at the Inbox right at launch.
@@ -197,13 +199,14 @@ tools/selftest.sh
 - **Never caches an empty message.** If Gmail sends no text for a message, it isn't saved, so opening it fetches again. Empty bodies left by older versions are cleared on launch.
 - **Small updates.** Read/flag changes patch only the affected rows, with no full list reload. A sync announces only what actually changed, and a list reload that finds the same messages in the same order patches the changed rows in place instead of rebuilding every visible row. The sidebar status line has a fixed height, so status changes never shift the folder list.
 - **Bounded server replies.** The deletion check after each sync asks only about cached UIDs (1,000 per command), and "Load older messages" pages backwards in bounded UID windows, taking the newest 200 below what's cached. A reply never grows with the size of the mailbox. The App Password is read from the Keychain once, off the main thread, and kept in memory.
+- **Deleting for good.** Empty Trash / Empty Spam flags every message in the selected folder and expunges with `UID EXPUNGE 1:*` when the server supports UIDPLUS. Without UIDPLUS, a bare `EXPUNGE` runs only when the server's `\Deleted` set is exactly the UIDs just flagged; otherwise nothing is expunged, so another client's pending deletions survive. In a unified view the command runs in every account.
 - **Structure first.** Each message's MIME tree (`BODYSTRUCTURE`) is cached, so reading a message downloads only its text part. Inline images and attachments are fetched only when you look at them or save them.
-- **Storage.** Mail is kept in SQLite (system `libsqlite3`, WAL, 2 MB page cache, owner-only file permissions) with FTS5 indexes for headers and cached message text. The schema is versioned (`PRAGMA user_version`) and migrates older caches in place. Queued actions remember the folder's UIDVALIDITY, so they're dropped instead of hitting the wrong message if Gmail renumbers a folder; every fetch checks UIDVALIDITY too. An empty or broken folder list never prunes the cache. The body cache is capped by size, not row count. The message list loads small row objects and creates only the visible cells. Deleting messages, folders or accounts keeps the search indexes and the address-autocomplete list in step (`recursive_triggers`, explicit deletes). A refetched header updates every header field, not just flags.
+- **Storage.** Mail is kept in SQLite (system `libsqlite3`, WAL, 2 MB page cache, owner-only file permissions) with FTS5 indexes for headers and cached message text. The schema is versioned (`PRAGMA user_version`) and migrates older caches in place. Queued actions remember the folder's UIDVALIDITY, so they're dropped instead of hitting the wrong message if Gmail renumbers a folder; every fetch checks UIDVALIDITY too. An empty or broken folder list never prunes the cache. The body cache is capped by size, not row count. The message list loads small row objects and creates only the visible cells. Deleting messages, folders or accounts keeps the search indexes and the address-autocomplete list in step (`recursive_triggers`, explicit deletes). A refetched header updates every header field, not just flags. Folder, unified and flagged lists are ordered and windowed in SQL (newest or oldest, with an id tiebreak), so the displayed page is the right end of the folder and *Load older messages* walks the same direction; search results are ordered in memory and paged 1,000 at a time. `Store+ListQueries` holds those queries, and `Store+Maintenance` reads the Storage figures and clears the text cache on their own connections.
 - **Pruning.** The cache is pruned to exactly the offline window from Settings (newest 200 per folder always kept) 20 s after launch, every 6 hours while the app runs, and when you change the window. It runs on a utility queue with its own SQLite connection, in batches of 500, so it never blocks the window. The image cache prunes itself every 200 new images.
 - **Reading pane.** One reused `WKWebView` with email scripts disabled. Dark mode recolouring runs as an app-injected script in WebKit's separate client script world (`DarkReader` in `HTMLPrep.swift`), so it works even though the email's own scripts are off. Every remote image URL is rewritten to `lm://img/<render>/<n>`, served by the app's own loader. The render number makes the URLs unique to each message: WebKit caches by URL, and without it one email could show another email's pictures. The loader enforces the size limits and shrinks images with ImageIO. A content-blocking rule (installed before the first message renders) and a Content-Security-Policy stop WebKit from loading anything else over the network. HTML is sanitised off the main thread. Links open in your default browser.
 - **Unread counts.** After each folder sync (and for every folder when the folder list refreshes) one `STATUS (UNSEEN)` command runs on the sync connection. The cache stores the server count with the local count at that moment, and shows `server + local changes since`.
 - **Window size.** The reading pane keeps a stretchable spacer while WebKit is shut down, so the window never collapses to the header's height; a collapsed frame saved by an older build is discarded on launch.
-- **Sending.** MIME is built off the main thread by hand (multipart/alternative plus base64 attachments encoded slice by slice, headers folded per RFC 5322, control characters stripped). The upload goes out in 256 KB slices with a 60 s idle limit per command and a size-scaled limit for the server's final answer, so a big attachment on a slow line isn't cut off by one overall deadline. A send is *waiting* (undoable), then *uploading* (not undoable), then done. Quoted replies use a stricter sanitiser than the reading pane: no `<style>`, `<link>`, `on*` handlers or `javascript:`/`data:` links, and only https images.
+- **Sending.** MIME is built off the main thread by hand (multipart/alternative plus base64 attachments encoded slice by slice, headers folded per RFC 5322, control characters stripped). The upload goes out in 256 KB slices with a 60 s idle limit per command and a size-scaled limit for the server's final answer, so a big attachment on a slow line isn't cut off by one overall deadline. A send is *waiting* (undoable), then *uploading* (not undoable), then done. A message that can't be sent is parked in the Outbox as a folder with its `item.json` and `message.eml`; the record is written and read back before the queue reports it, and a half-written folder is removed. Quoted replies use a stricter sanitiser than the reading pane: no `<style>`, `<link>`, `on*` handlers or `javascript:`/`data:` links, and only https images.
 - **Hardening.** The IMAP parser caps line length, literal size (64 MB), nesting depth and response counts, and every connection has read timeouts, so a hostile or stuck server can't crash or hang the app. Only one copy of the app can run at a time. Gmail files the copy in Sent itself.
 
 ### Performance (measured, Apple silicon)
@@ -234,8 +237,16 @@ Timings can be reproduced with `MAC_MAIL_DEBUG=1 MAC_MAIL_BENCH=1`, which opens 
 - Unlike Gmail on the web, loaded images come straight from the sender's server, so the sender can tell the message was opened. Use "Ask before loading any remote images" in Settings if that matters.
 - Encrypted mail (S/MIME, PGP) and calendar aren't included.
 - An image whose server offers no https version can't be shown (plain http is never used).
-- The app is ad-hoc signed with the hardened runtime, but it isn't sandboxed or notarized, and the local cache, autosaves and outbox aren't encrypted (they're readable only by your user account).
-- The SQLite cache is still read and written on the main thread (bulk work such as pruning and body decoding runs off it).
+- Default builds are ad-hoc signed with the hardened runtime and no secure timestamp; they aren't sandboxed or notarized. A Developer ID build can be notarized with `package.sh`. The local cache, autosaves and outbox aren't encrypted (they're readable only by your user account).
+- The Outbox has no per-message Retry or Delete yet: clicking the sidebar status retries messages that haven't already failed five times, and a message the server keeps refusing stays there.
+- Local search returns at most 2,000 matches, shown 1,000 at a time.
+- The SQLite cache is still read and written on the main thread (bulk work such as pruning, clearing the text cache and the Storage figures runs off it).
+
+### Outbox troubleshooting
+
+Messages that couldn't be sent are kept in `~/Library/Application Support/MacMail/Outbox`, one folder per message holding `item.json` and `message.eml` (owner-only permissions). The sidebar status shows how many are waiting; click it to retry. Network failures keep retrying whenever the connection returns; a message the server refuses is retried on later flushes until five attempts have failed.
+
+If a record can't be read back (damaged JSON, an unusable id, or a missing `message.eml`), it is moved to `~/Library/Application Support/MacMail/Outbox Corrupt` instead of being deleted, and the move is written to the diagnostics log (Settings → Storage → Export Diagnostics Log). Nothing else in the Outbox is affected. There is no per-message Retry or Delete yet.
 
 More detail: [docs/architecture.md](docs/architecture.md), [docs/security.md](docs/security.md) and the decision records in [docs/adr/](docs/adr/).
 
@@ -244,18 +255,21 @@ More detail: [docs/architecture.md](docs/architecture.md), [docs/security.md](do
 ```text
 mac-mail/
 ├── .github/workflows/       selftest CI
-├── build.sh                 selftest + staged universal swiftc build, signed (hardened runtime)
-├── package.sh               release build + verified, versioned DMG + checksum in release/
+├── build.sh                 selftest + staged universal swiftc build, signed (hardened runtime;
+│                            Developer ID gets a secure timestamp)
+├── package.sh               release build + verified, versioned DMG + checksum; optional notarisation
 ├── Resources/
 │   ├── Info.plist           bundle id, version, mailto: handler, .eml viewer type, Dock-drop type
 │   ├── MacMail.entitlements hardened runtime, no exceptions
 │   └── AppIcon.icns
 ├── Sources/
 │   ├── App/                 main.swift, AppDelegate (menus, file/mailto handling), Snapshot (demo captures)
-│   ├── Core/                SQLite wrapper, Store (cache + FTS + action queue), models, Keychain, Prefs
+│   ├── Core/                SQLite wrapper; Store (cache, FTS, action queue) with Store+ListQueries
+│   │                        (windowed SQL) and Store+Maintenance (stats, clear cache); models, Keychain, Prefs
 │   ├── Net/                 TLS / STARTTLS transports, IMAP parser and client, SMTP client
 │   ├── Mail/                MIME decoding, BODYSTRUCTURE, .eml reader, message builder, address/header safety, search parser
-│   ├── Sync/                AccountEngine (sync, IDLE, actions, folders), MailService (undo, send states), Outbox, demo data
+│   ├── Sync/                AccountEngine (sync, IDLE, actions, folders), MailService (undo, send states)
+│   │                        with MailService+Offline (unverified account edits), Outbox, demo data
 │   └── UI/                  main window, sidebar, message list, search filter bar, preview, message window, .eml viewer,
 │                            shared message actions, image loader, attachments, compose (autosave, formatting bar), settings
 ├── Tests/SelfTest.swift     offline checks: protocol, MIME, .eml, cache, sanitiser, outbox (tools/selftest.sh)

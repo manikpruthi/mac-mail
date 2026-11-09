@@ -6,7 +6,7 @@
 #   MAC_MAIL_BUILD_DIR      output folder (default ~/Library/Caches/MacMailBuild)
 #   MAC_MAIL_ARCHS          "arm64" for faster local iteration (release requires both)
 #   MAC_MAIL_SKIP_SELFTEST  skip the offline selftest
-#   MAC_MAIL_SIGN_IDENTITY  a "Developer ID Application: …" identity; ad-hoc signing otherwise
+#   MAC_MAIL_SIGN_IDENTITY  a "Developer ID Application: …" identity (secure timestamp); ad-hoc signing otherwise
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -91,11 +91,28 @@ printf 'APPL????' > "$STAGED_APP/Contents/PkgInfo"
 
 # Hardened runtime, no App Sandbox (sandboxing would move the cache and Keychain items).
 # Ad-hoc builds keep the default designated requirement (the code hash), so a Keychain grant belongs to
-# exactly this binary; a Developer ID identity gets the usual team-based requirement (R-07).
+# exactly this binary and no timestamp is needed. A Developer ID identity gets the usual team-based
+# requirement, a secure timestamp, and a check that both really landed (R-07, C-34).
 IDENTITY="${MAC_MAIL_SIGN_IDENTITY:--}"
-codesign --force --options runtime --timestamp=none --entitlements Resources/MacMail.entitlements \
+if [ "$IDENTITY" = "-" ]; then
+    TIMESTAMP=(--timestamp=none)
+else
+    TIMESTAMP=(--timestamp)
+fi
+codesign --force --options runtime "${TIMESTAMP[@]}" --entitlements Resources/MacMail.entitlements \
     --sign "$IDENTITY" "$STAGED_APP"
 codesign --verify --strict "$STAGED_APP"
+if [ "$IDENTITY" != "-" ]; then
+    SIGNATURE="$(codesign --display --verbose=4 "$STAGED_APP" 2>&1 || true)"
+    case "$SIGNATURE" in
+        *"Timestamp="*) ;;
+        *) echo "error: the Developer ID signature has no secure timestamp" >&2; exit 1 ;;
+    esac
+    case "$SIGNATURE" in
+        *"flags="*runtime*) ;;
+        *) echo "error: the Developer ID signature is missing the hardened runtime" >&2; exit 1 ;;
+    esac
+fi
 
 rm -rf "$APP"
 mv "$STAGED_APP" "$APP"
