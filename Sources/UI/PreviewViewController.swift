@@ -278,24 +278,31 @@ final class PreviewViewController: NSViewController, WKNavigationDelegate, WKUID
         if let body = store.body(messageID) {
             render(d, body)
         } else {
-            fetchingID = messageID
-            ensureWebView().loadHTMLString("", baseURL: nil)
-            spinner.startAnimation(nil)
-            let id = messageID
-            Task {
-                defer { if fetchingID == id { fetchingID = nil } }
-                do {
-                    guard let engine = MailService.shared.engine(d.accountID) else { throw NetError.server("Account unavailable") }
-                    let body = try await engine.loadBody(messageID: id)
-                    guard current?.id == id, !tornDown else { return }
-                    spinner.stopAnimation(nil)
-                    render(d, body)
-                } catch {
-                    guard current?.id == id, !tornDown else { return }
-                    spinner.stopAnimation(nil)
-                    let msg = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
-                    ensureWebView().loadHTMLString(HTMLPrep.prepare(html: nil, text: "Couldn't load this message.\n\n\(msg)\n\nSelect it again to retry.").html, baseURL: nil)
-                }
+            fetchBody(for: d)
+        }
+    }
+
+    /// Fetches the message text and renders it. `fetchingID` stops a second fetch for the same message,
+    /// since both show() and restoreWebViewIfNeeded() come through here (F-03).
+    private func fetchBody(for d: MessageDetail) {
+        guard fetchingID != d.id else { return }
+        fetchingID = d.id
+        ensureWebView().loadHTMLString("", baseURL: nil)
+        spinner.startAnimation(nil)
+        let id = d.id
+        Task {
+            defer { if fetchingID == id { fetchingID = nil } }
+            do {
+                guard let engine = MailService.shared.engine(d.accountID) else { throw NetError.server("Account unavailable") }
+                let body = try await engine.loadBody(messageID: id)
+                guard current?.id == id, !tornDown else { return }
+                spinner.stopAnimation(nil)
+                render(d, body)
+            } catch {
+                guard current?.id == id, !tornDown else { return }
+                spinner.stopAnimation(nil)
+                let msg = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                ensureWebView().loadHTMLString(HTMLPrep.prepare(html: nil, text: "Couldn't load this message.\n\n\(msg)\n\nSelect it again to retry.").html, baseURL: nil)
             }
         }
     }
@@ -354,6 +361,7 @@ final class PreviewViewController: NSViewController, WKNavigationDelegate, WKUID
         loader.page = page
         banner.isHidden = true
         if prepared.clipped && !showFullClipped {
+            banner.kind = .clipped
             banner.show(text: "This message is large, so only the first part is shown.",
                         actions: [("View entire message", { [weak self] in self?.viewEntire() })])
         } else if prepared.hasRemoteImages && !autoLoad {
@@ -382,7 +390,9 @@ final class PreviewViewController: NSViewController, WKNavigationDelegate, WKUID
     }
 
     private func imagesHeld(_ page: ImagePage) {
-        guard page.generation == generation, banner.isHidden || banner.tag != 2 else { return }
+        // A clipped-message banner keeps its "View entire message" action; the image notice then
+        // appears once the full message has rendered (F-14).
+        guard page.generation == generation, banner.isHidden || banner.kind == .images else { return }
         showImagesBanner(page)
     }
 
@@ -404,7 +414,7 @@ final class PreviewViewController: NSViewController, WKNavigationDelegate, WKUID
             }))
         }
         banner.show(text: text, actions: actions)
-        banner.tag = 2
+        banner.kind = .images
     }
 
     private func loadAllImages() {
@@ -645,11 +655,16 @@ final class PreviewViewController: NSViewController, WKNavigationDelegate, WKUID
         Debug.log("web view released")
     }
 
-    /// Brings the open message back after the web view was released.
+    /// Brings the open message back after the web view was released. A body fetch dropped by the
+    /// teardown is started again, rather than leaving a header-only pane (F-03).
     func restoreWebViewIfNeeded() {
         tornDown = false
-        guard webView == nil, let d = current, let b = currentBody else { return }
-        render(d, b)
+        guard webView == nil, let d = current else { return }
+        if let b = currentBody {
+            render(d, b)
+        } else {
+            fetchBody(for: d)
+        }
     }
 
     // MARK: App-wide web view trimming (BUG-28)
@@ -832,14 +847,12 @@ final class ReadingPaneView: NSView {
 // MARK: - Banner
 
 final class BannerView: NSView {
+    /// What the banner is for, so a held-image notice never replaces the clipped-message banner (F-14).
+    enum Kind { case general, clipped, images }
     private let label = NSTextField(wrappingLabelWithString: "")
     private let buttons = NSStackView()
     private var handlers: [() -> Void] = []
-    private var bannerTag = 0
-    override var tag: Int {
-        get { bannerTag }
-        set { bannerTag = newValue }
-    }
+    var kind: Kind = .general
 
     override init(frame: NSRect) {
         super.init(frame: frame)

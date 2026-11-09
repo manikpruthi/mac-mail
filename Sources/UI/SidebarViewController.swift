@@ -203,6 +203,7 @@ final class SidebarViewController: NSViewController, NSOutlineViewDataSource, NS
         // Remember which roots were expanded so a reload doesn't pop collapsed accounts open (C-35).
         // The first population opens every account/group; capturing the old roots only works once the
         // outline has had items (loadView's first reload runs while `roots` is still empty).
+        let previousKinds = roots.map(\.kind)
         var expanded: [SidebarItem.Kind] = []
         if hasExpansionState {
             for r in roots where !r.children.isEmpty && outline.isItemExpanded(r) { expanded.append(r.kind) }
@@ -214,7 +215,10 @@ final class SidebarViewController: NSViewController, NSOutlineViewDataSource, NS
         refreshCounts(reloadOutline: false)
         suppressSelection = true
         outline.reloadData()
-        for r in roots where !r.children.isEmpty && expanded.contains(r.kind) { outline.expandItem(r) }
+        // A root that wasn't there at the previous reload (a newly added account or group) starts expanded (F-20).
+        for r in roots where !r.children.isEmpty && (expanded.contains(r.kind) || !previousKinds.contains(r.kind)) {
+            outline.expandItem(r)
+        }
         // Re-select the old row; when it vanished (deleted or renamed elsewhere) select(kind:) falls
         // back while suppressed, so report the fallback to the list once the suppression is lifted
         // — otherwise the highlight moves but list.source keeps pointing at the dead folder (B-37 / C-07).

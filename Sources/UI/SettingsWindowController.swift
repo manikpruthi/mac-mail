@@ -294,11 +294,15 @@ final class SettingsWindowController: NSWindowController, NSTableViewDataSource,
 
     /// Account editor / Sign in again (F-04): servers, ports, logins, security and the password.
     func editAccount(_ id: String) {
+        // Unsaved name/signature text is saved before the sheet copies the account and before its
+        // completion reloads the account, so it isn't dropped (F-02).
+        commitPendingEdits()
         guard let a = MailService.shared.account(id), a.provider != .demo else { return }
         present(AddAccountSheet(editing: a))
     }
 
     @objc func addAccount() {
+        commitPendingEdits()
         present(AddAccountSheet())
     }
 
