@@ -15,7 +15,7 @@ concurrency:
 jobs:
   # Fast offline tests: protocol, MIME, cache, sanitiser, outbox (R-02).
   selftest:
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
@@ -24,7 +24,7 @@ jobs:
 
   # Every source file is compiled, UI included, so a broken file can't merge green (R-01).
   typecheck:
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
