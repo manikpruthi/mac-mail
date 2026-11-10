@@ -216,27 +216,76 @@ enum MIME {
 
     // MARK: Addresses
 
+    /// Splits an address header into addresses. A separator only counts outside quoted strings, angle
+    /// brackets, (comments) and RFC 2047 encoded words: a comment such as "(sales; EU)" or an encoded
+    /// name containing a literal comma must never cut one address into two, because the second half can
+    /// then read as a different, clean address (and Reply All would write to it).
     static func parseAddresses(_ s: String) -> [EmailAddress] {
+        splitAddresses(s, comments: true).compactMap { parseAddress($0) }
+    }
+
+    private static func splitAddresses(_ s: String, comments: Bool) -> [String] {
+        let chars = Array(s)
         var parts: [String] = []
         var current = ""
         var inQuote = false
         var inAngle = false
         var escaped = false
-        for ch in s {
-            // A backslash inside a quoted name escapes the next character ("Bob \"the\" Smith").
+        var depth = 0
+        var i = 0
+        while i < chars.count {
+            let ch = chars[i]
+            i += 1
+            // A backslash inside a quoted name or a comment escapes the next character.
             if escaped { escaped = false; current.append(ch); continue }
-            if inQuote, ch == "\\" { escaped = true; current.append(ch); continue }
+            if inQuote || depth > 0, ch == "\\" { escaped = true; current.append(ch); continue }
+            if inQuote {
+                if ch == "\"" { inQuote = false }
+                current.append(ch)
+                continue
+            }
+            if depth > 0 {
+                if ch == "(" { depth += 1 } else if ch == ")" { depth -= 1 }
+                current.append(ch)
+                continue
+            }
+            if ch == "=", let end = encodedWordEnd(chars, from: i - 1) {
+                current.append(contentsOf: chars[(i - 1)..<end])
+                i = end
+                continue
+            }
             switch ch {
-            case "\"": inQuote.toggle(); current.append(ch)
-            case "<" where !inQuote: inAngle = true; current.append(ch)
-            case ">" where !inQuote: inAngle = false; current.append(ch)
+            case "\"": inQuote = true; current.append(ch)
+            case "(" where comments && !inAngle: depth = 1; current.append(ch)
+            case "<": inAngle = true; current.append(ch)
+            case ">": inAngle = false; current.append(ch)
             case ",", ";":
-                if inQuote || inAngle { current.append(ch) } else { parts.append(current); current = "" }
+                if inAngle { current.append(ch) } else { parts.append(current); current = "" }
+            case ":" where !inAngle && !current.contains("@") && !current.contains("<") && chars[i...].contains(";"):
+                // Group syntax ("undisclosed-recipients:;", "Team: a@x, b@y;"): the name before the
+                // colon is a label, not an address.
+                current = ""
             default: current.append(ch)
             }
         }
+        // A comment that never closes would swallow every address after it: read the header again
+        // with parentheses as ordinary characters.
+        if depth > 0, comments { return splitAddresses(s, comments: false) }
         parts.append(current)
-        return parts.compactMap { parseAddress($0) }
+        return parts
+    }
+
+    /// End index (exclusive) of the encoded word "=?charset?B|Q?text?=" starting at `start`, or nil.
+    private static func encodedWordEnd(_ c: [Character], from start: Int) -> Int? {
+        guard start + 1 < c.count, c[start] == "=", c[start + 1] == "?" else { return nil }
+        var j = start + 2
+        let limit = min(c.count, start + 300)
+        while j < limit, c[j] != "?", !c[j].isWhitespace { j += 1 }
+        guard j > start + 2, j + 2 < limit, c[j] == "?", "bBqQ".contains(c[j + 1]), c[j + 2] == "?" else { return nil }
+        j += 3
+        while j < limit, c[j] != "?", !c[j].isWhitespace { j += 1 }
+        guard j + 1 < limit, c[j] == "?", c[j + 1] == "=" else { return nil }
+        return j + 2
     }
 
     static func parseAddress(_ raw: String) -> EmailAddress? {
@@ -263,6 +312,11 @@ enum MIME {
             let email = String(s[..<open]).trimmingCharacters(in: .whitespaces)
             let name = String(s[s.index(after: open)..<close])
             return EmailAddress(name: name, email: cleanEmail(email))
+        }
+        // A comment that never closes is dropped, not kept as part of the address.
+        if let open = s.firstIndex(of: "(") {
+            let email = cleanEmail(String(s[..<open]).trimmingCharacters(in: CharacterSet(charactersIn: "\" \t")))
+            return email.isEmpty ? nil : EmailAddress(name: "", email: email)
         }
         return EmailAddress(name: "", email: cleanEmail(s.trimmingCharacters(in: CharacterSet(charactersIn: "\""))))
     }
@@ -297,6 +351,9 @@ enum MIME {
 
     private static let blockStrip = try! NSRegularExpression(
         pattern: "<(style|script|head|title)[^>]*>.*?</\\1\\s*>", options: [.caseInsensitive, .dotMatchesLineSeparators])
+    /// A <script> or <style> that never closes: everything after it is code, not readable text.
+    private static let openBlockStrip = try! NSRegularExpression(
+        pattern: "<(style|script)\\b[^>]*>.*$", options: [.caseInsensitive, .dotMatchesLineSeparators])
     private static let tagStrip = try! NSRegularExpression(pattern: "<[^>]+>", options: [])
     private static let entity = try! NSRegularExpression(pattern: "&(#x?[0-9a-fA-F]+|[a-zA-Z]+);")
     private static let spaces = try! NSRegularExpression(pattern: "\\s+")
@@ -306,6 +363,7 @@ enum MIME {
         var s = html
         if s.utf16.count > 200_000 { s = String(s.prefix(200_000)) }
         s = blockStrip.stringByReplacingMatches(in: s, range: NSRange(location: 0, length: (s as NSString).length), withTemplate: " ")
+        s = openBlockStrip.stringByReplacingMatches(in: s, range: NSRange(location: 0, length: (s as NSString).length), withTemplate: " ")
         s = tagStrip.stringByReplacingMatches(in: s, range: NSRange(location: 0, length: (s as NSString).length), withTemplate: " ")
         s = decodeEntities(s)
         s = spaces.stringByReplacingMatches(in: s, range: NSRange(location: 0, length: (s as NSString).length), withTemplate: " ")
@@ -357,7 +415,9 @@ enum MIME {
 
     static func snippet(html: String?, text: String?) -> String {
         if let t = text, !t.isEmpty {
-            let collapsed = t.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
+            // Only the start of the text can end up in the 240 characters; splitting a multi-megabyte
+            // body to get them cost time and memory for nothing.
+            let collapsed = t.prefix(4000).split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
             return String(collapsed.prefix(240))
         }
         if let h = html { return String(plainText(fromHTML: h, limit: 240)) }
@@ -365,6 +425,8 @@ enum MIME {
     }
 
     // MARK: Dates
+    // The shared formatters below are read from several threads. DateFormatter is thread-safe on
+    // macOS 10.9+ (64-bit) as long as it is not reconfigured after creation, and these never are.
 
     private static let rfc2822Formatter: DateFormatter = {
         let f = DateFormatter()

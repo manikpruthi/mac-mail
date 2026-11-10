@@ -37,6 +37,10 @@ over TLS; capabilities are asked for again.
    prefetched in batches, decoded off the main actor, then written.
 2. **Actions** — optimistic local change, then a row in `pending_ops` bound to folder id + UIDVALIDITY.
    Moves/deletes first wait out an 8 s Undo window (`MailService.undoables`, restored from `Store.Snapshot`).
+   The window's folder ids and UIDs are journalled in the `prefs` table (`undo.<id>`); an entry left by a
+   crash is replayed at launch by re-fetching those headers. A final refusal (or a failed queue write) marks
+   the source folder in `AccountEngine.unsettledSources`, which `settleOps` checks before a folder is
+   deleted, renamed or emptied.
    An undoable holds one part per account (rows, destination folder, commit). Empty Trash/Spam, Delete
    Folder and Rename Folder take out and commit only the parts that touch that folder (`takeParts`),
    trimming the snapshot (`Snapshot.removing`) so Undo restores just what is still waiting; removing an

@@ -1,4 +1,5 @@
 import AppKit
+import WebKit
 
 /// The three-pane window: sidebar, message list and preview pane, with an Outlook-style toolbar.
 @MainActor
@@ -554,16 +555,21 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSSearc
         switch pane(of: w.firstResponder) {
         case 0: list.focusList()
         case 1:
-            if let web = Self.firstFocusable(in: preview.view) { w.makeFirstResponder(web) }
+            // The message itself first (its web view); the header's selectable labels only if there is none.
+            if let web = Self.firstFocusable(in: preview.view, where: { $0 is WKWebView })
+                ?? Self.firstFocusable(in: preview.view, where: { _ in true }) { w.makeFirstResponder(web) }
             else { sidebar.focus() }
         default: sidebar.focus()
         }
     }
 
-    private static func firstFocusable(in view: NSView) -> NSView? {
-        if view.acceptsFirstResponder && view.canBecomeKeyView { return view }
+    /// The first view that can take keyboard focus and passes `matches`. Hidden views (and everything
+    /// inside them, such as a collapsed banner's buttons) are skipped.
+    private static func firstFocusable(in view: NSView, where matches: (NSView) -> Bool) -> NSView? {
+        guard !view.isHidden else { return nil }
+        if view.acceptsFirstResponder && view.canBecomeKeyView && matches(view) { return view }
         for sub in view.subviews {
-            if let hit = firstFocusable(in: sub) { return hit }
+            if let hit = firstFocusable(in: sub, where: matches) { return hit }
         }
         return nil
     }
@@ -856,6 +862,8 @@ final class FolderPicker: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         sheet = w
         parent.beginSheet(w)
         parent.makeFirstResponder(field)
+        // Return is the Move button: with nothing selected the first press did nothing at all.
+        if !shown.isEmpty { table.selectRowIndexes([0], byExtendingSelection: false) }
     }
 
     @objc private func filterChanged() {

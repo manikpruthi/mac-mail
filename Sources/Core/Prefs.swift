@@ -125,13 +125,74 @@ enum Prefs {
     static let htmlClipBytes = 512 * 1024
     static let imageCacheBytes = 200 * 1_048_576
 
+    /// Accounts are decoded one by one: a single entry this version can't read (damaged, or written by a
+    /// newer build) must not make the whole list come back empty, because the next save would then
+    /// persist the shortened list and orphan every other account. Unreadable entries are kept verbatim
+    /// and written back untouched, so a newer build still finds them.
     static var accounts: [Account] {
-        get {
-            guard let data = d.data(forKey: "accounts"),
-                  let list = try? JSONDecoder().decode([Account].self, from: data) else { return [] }
-            return list
+        get { decodeAccounts(d.data(forKey: "accounts")).accounts }
+        set {
+            let kept = decodeAccounts(d.data(forKey: "accounts")).unreadable
+            guard let encoded = encodeAccounts(newValue, keeping: kept) else {
+                DiagnosticsLog.record("The account list couldn't be encoded; the saved list was left as it was.")
+                return
+            }
+            d.set(encoded, forKey: "accounts")
         }
-        set { d.set(try? JSONEncoder().encode(newValue), forKey: "accounts") }
+    }
+
+    /// One account entry that failed to decode, as its raw JSON.
+    private struct RawEntry: Decodable {
+        let json: Data
+        init(from decoder: Decoder) throws {
+            json = try JSONSerialization.data(withJSONObject: try AnyJSON(from: decoder).value, options: [.fragmentsAllowed])
+        }
+    }
+
+    /// Any JSON value, re-serialisable; only used to carry entries this version can't interpret.
+    private struct AnyJSON: Decodable {
+        let value: Any
+        init(from decoder: Decoder) throws {
+            let c = try decoder.singleValueContainer()
+            if c.decodeNil() { value = NSNull() }
+            else if let v = try? c.decode(Bool.self) { value = v }
+            else if let v = try? c.decode(Int64.self) { value = v }
+            else if let v = try? c.decode(Double.self) { value = v }
+            else if let v = try? c.decode(String.self) { value = v }
+            else if let v = try? c.decode([AnyJSON].self) { value = v.map { $0.value } }
+            else { value = try c.decode([String: AnyJSON].self).mapValues { $0.value } }
+        }
+    }
+
+    private struct Lenient: Decodable {
+        var account: Account?
+        var raw: Data?
+        init(from decoder: Decoder) throws {
+            if let a = try? Account(from: decoder) { account = a } else { raw = try? RawEntry(from: decoder).json }
+        }
+    }
+
+    static func decodeAccounts(_ data: Data?) -> (accounts: [Account], unreadable: [Data]) {
+        guard let data else { return ([], []) }
+        guard let entries = try? JSONDecoder().decode([Lenient].self, from: data) else {
+            DiagnosticsLog.record("The saved account list couldn't be read.")
+            return ([], [])
+        }
+        let unreadable = entries.compactMap { $0.raw }
+        if !unreadable.isEmpty {
+            DiagnosticsLog.record("\(unreadable.count) saved account entr\(unreadable.count == 1 ? "y" : "ies") couldn't be read and \(unreadable.count == 1 ? "was" : "were") left untouched.")
+        }
+        return (entries.compactMap { $0.account }, unreadable)
+    }
+
+    static func encodeAccounts(_ accounts: [Account], keeping unreadable: [Data]) -> Data? {
+        guard let encoded = try? JSONEncoder().encode(accounts) else { return nil }
+        guard !unreadable.isEmpty,
+              var list = (try? JSONSerialization.jsonObject(with: encoded)) as? [Any] else { return encoded }
+        for raw in unreadable {
+            if let object = try? JSONSerialization.jsonObject(with: raw, options: [.fragmentsAllowed]) { list.append(object) }
+        }
+        return (try? JSONSerialization.data(withJSONObject: list)) ?? encoded
     }
 
     static var defaultAccountID: String? {

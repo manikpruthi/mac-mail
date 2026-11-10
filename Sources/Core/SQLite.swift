@@ -197,6 +197,10 @@ final class SQLiteDB {
         return found
     }
 
+    /// Inside a transaction: forgets a statement failure the caller handled itself, so the rest of the
+    /// batch still commits.
+    func clearFailure() { failedWrite = false }
+
     var lastInsertID: Int64 { sqlite3_last_insert_rowid(handle) }
     var changes: Int { Int(sqlite3_changes(handle)) }
 }

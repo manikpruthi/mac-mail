@@ -17,7 +17,16 @@ final class Outbox {
         var safetyDraftID: Int64?
         var attempts: Int = 0
         var lastError: String?
+        /// Set once SMTP accepted the message. From then on it must never be sent again: all that is
+        /// left is deleting the queued copy. Optional so records written by older versions still decode.
+        var delivered: Bool?
+
+        var wasDelivered: Bool { delivered == true }
     }
+
+    /// What the decision marker holds for a message that was delivered but whose record couldn't be rewritten.
+    private static let deliveredMarker = "delivered"
+    private static let deliveredNote = "This message was sent. Its queued copy couldn't be deleted yet; choose Delete to remove it."
 
     /// Automatic attempts before a failed item is left for the user (C-26).
     static let maxAttempts = 5
@@ -64,7 +73,17 @@ final class Outbox {
             }
             if let reason = try? String(contentsOf: marker(item.id), encoding: .utf8) {
                 item.attempts = max(item.attempts, Self.maxAttempts)
-                item.lastError = reason
+                if reason == Self.deliveredMarker { item.delivered = true } else { item.lastError = reason }
+            }
+            if item.wasDelivered {
+                // Sent before the last quit or crash, but its folder was still there: finish the delete.
+                // If that fails again it stays listed as sent, never as something to retry.
+                if (try? fm.removeItem(at: f)) != nil {
+                    try? fm.removeItem(at: marker(item.id))
+                    continue
+                }
+                item.attempts = max(item.attempts, Self.maxAttempts)
+                item.lastError = Self.deliveredNote
             }
             found.append(item)
         }
@@ -131,8 +150,23 @@ final class Outbox {
         NotificationCenter.default.post(name: .mailOutboxChanged, object: nil)
     }
 
+    /// The queued MIME file, so callers can read it off the main thread.
+    func messageURL(_ item: Item) -> URL { folder(item.id).appendingPathComponent("message.eml") }
+
     func data(_ item: Item) throws -> Data {
-        try Data(contentsOf: folder(item.id).appendingPathComponent("message.eml"))
+        try Data(contentsOf: messageURL(item))
+    }
+
+    /// Records that SMTP accepted the message, before anything else happens to it: a crash or a failed
+    /// delete after this point must not lead to a second delivery.
+    func markDelivered(_ id: String) {
+        guard let i = items.firstIndex(where: { $0.id == id }) else { return }
+        items[i].delivered = true
+        do { try write(items[i]) } catch {
+            do { try Data(Self.deliveredMarker.utf8).write(to: marker(id), options: .atomic) } catch {
+                DiagnosticsLog.record("Outbox: couldn't record that a queued message was sent: \(error.localizedDescription)")
+            }
+        }
     }
 
     func remove(_ id: String) {
@@ -142,7 +176,9 @@ final class Outbox {
             // A folder that couldn't be deleted is loaded again next launch and would be sent, so keep
             // the item and say why (F-05). An already-missing folder counts as deleted.
             if (error as NSError).code != NSFileNoSuchFileError {
-                markNeedsDecision(id, reason: "Couldn't delete the queued message: \(error.localizedDescription).")
+                let sent = items.first { $0.id == id }?.wasDelivered == true
+                markNeedsDecision(id, reason: sent ? Self.deliveredNote
+                                  : "Couldn't delete the queued message: \(error.localizedDescription).")
                 return
             }
         }
@@ -170,6 +206,8 @@ final class Outbox {
     /// Clears a refusal so the next flush tries the message again (C-26).
     func resetFailure(_ id: String) {
         guard let i = items.firstIndex(where: { $0.id == id }) else { return }
+        // A delivered message has nothing left to retry: trying again only means deleting its copy.
+        if items[i].wasDelivered { remove(id); return }
         items[i].attempts = 0
         items[i].lastError = nil
         try? FileManager.default.removeItem(at: marker(id))

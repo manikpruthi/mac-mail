@@ -26,6 +26,18 @@ enum NetError: Error, LocalizedError {
     }
 }
 
+/// The "connection closed" callback of a transport. Set by the stream's owner and called from the
+/// transport's own queue or thread, so it sits behind a lock.
+private final class ClosedHandlerBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var handler: (@Sendable () -> Void)?
+    func set(_ h: @escaping @Sendable () -> Void) { lock.lock(); handler = h; lock.unlock() }
+    func call() {
+        lock.lock(); let h = handler; lock.unlock()
+        h?()
+    }
+}
+
 private final class OnceFlag: @unchecked Sendable {
     private let lock = NSLock()
     private var done = false
@@ -56,8 +68,11 @@ protocol ByteTransport: AnyObject, Sendable {
 /// Implicit TLS from the first byte (IMAP 993, SMTP 465).
 final class NWTransport: ByteTransport, @unchecked Sendable {
     private let connection: NWConnection
+    /// False for a port no endpoint can have (0); open() then fails instead of dialling a default.
+    private let validPort: Bool
 
     init(host: String, port: UInt16) {
+        validPort = port != 0
         let tcp = NWProtocolTCP.Options()
         tcp.enableKeepalive = true
         tcp.keepaliveIdle = 60
@@ -66,16 +81,19 @@ final class NWTransport: ByteTransport, @unchecked Sendable {
         connection = NWConnection(host: NWEndpoint.Host(host), port: NWEndpoint.Port(rawValue: port) ?? 993, using: params)
     }
 
-    private var closedHandler: (@Sendable () -> Void)?
-    func setClosedHandler(_ handler: @escaping @Sendable () -> Void) { closedHandler = handler }
+    private let closedHandler = ClosedHandlerBox()
+    func setClosedHandler(_ handler: @escaping @Sendable () -> Void) { closedHandler.set(handler) }
 
     func open() async throws {
+        guard validPort else { throw NetError.server("The server port isn't valid. Check the account's settings.") }
         let once = OnceFlag()
         let conn = connection
         try await withCheckedThrowingContinuation { (c: CheckedContinuation<Void, Error>) in
             conn.stateUpdateHandler = { state in
                 switch state {
                 case .ready: if once.take() { c.resume() }
+                // .waiting (no route yet) fails the attempt on purpose: callers treat it as "offline" and
+                // retry on the next trigger, instead of holding a command until the network returns.
                 case .failed(let e), .waiting(let e): if once.take() { c.resume(throwing: e) }
                 case .cancelled: if once.take() { c.resume(throwing: NetError.closed) }
                 default: break
@@ -86,7 +104,7 @@ final class NWTransport: ByteTransport, @unchecked Sendable {
         let handler = closedHandler
         conn.stateUpdateHandler = { state in
             switch state {
-            case .failed, .cancelled: handler?()
+            case .failed, .cancelled: handler.call()
             default: break
             }
         }
@@ -142,19 +160,38 @@ final class StartTLSTransport: NSObject, ByteTransport, StreamDelegate, @uncheck
     private var failure: Error?
     private var atEnd = false
     private var finished = false
-    private var closedHandler: (@Sendable () -> Void)?
+    private let closedHandler = ClosedHandlerBox()
+    /// Guards `stopped` and the hand-off of blocks to the run loop.
+    private let threadLock = NSLock()
+    /// Set (under the lock) once the run-loop thread will take no more blocks.
+    private var stopped = false
 
     init(host: String, port: UInt16) {
         self.host = host
         self.port = port
     }
 
-    func setClosedHandler(_ handler: @escaping @Sendable () -> Void) { closedHandler = handler }
+    func setClosedHandler(_ handler: @escaping @Sendable () -> Void) { closedHandler.set(handler) }
 
-    /// Runs `block` on the streams' run-loop thread.
+    /// Runs `block` on the streams' run-loop thread. Once that thread has stopped, a queued block would
+    /// never run and its caller would wait forever, so `stopped` is checked under the same lock that
+    /// shutDown() sets it under: a block is either queued before the thread's final drain, or run here.
+    /// By then the thread is gone or draining and every block only reports the closed state.
     private func onThread(_ block: @escaping () -> Void) {
-        guard let rl = runLoop else { block(); return }
+        threadLock.lock()
+        guard let rl = runLoop else {
+            threadLock.unlock()
+            block() // not opened yet: nothing else can be running
+            return
+        }
+        if stopped {
+            // Late callers run one at a time; shutDown() returns before it would take this lock again.
+            block()
+            threadLock.unlock()
+            return
+        }
         CFRunLoopPerformBlock(rl, CFRunLoopMode.defaultMode.rawValue, block)
+        threadLock.unlock()
         CFRunLoopWakeUp(rl)
     }
 
@@ -169,6 +206,10 @@ final class StartTLSTransport: NSObject, ByteTransport, StreamDelegate, @uncheck
                 while !self.finished {
                     _ = RunLoop.current.run(mode: .default, before: .distantFuture)
                 }
+                // Blocks queued just before the stop was recorded still run (each sees the closed state
+                // and fails its caller), so no continuation is left waiting on a dead thread.
+                while CFRunLoopRunInMode(.defaultMode, 0, true) == .handledSource {}
+                _ = CFRunLoopRunInMode(.defaultMode, 0, false)
             }
             t.name = "MacMail STARTTLS \(host)"
             t.qualityOfService = .userInitiated
@@ -177,8 +218,16 @@ final class StartTLSTransport: NSObject, ByteTransport, StreamDelegate, @uncheck
         }
         try await withCheckedThrowingContinuation { (c: CheckedContinuation<Void, Error>) in
             onThread { [self] in
+                // Closed before it opened (the connect watchdog, or a reset).
+                guard !finished else { c.resume(throwing: failure ?? NetError.closed); return }
+                guard port != 0 else {
+                    c.resume(throwing: NetError.server("The server port isn't valid. Check the account's settings."))
+                    return
+                }
                 var i: InputStream?
                 var o: OutputStream?
+                // Only creates the stream pair; the name lookup and the connect happen asynchronously
+                // after open(), so the connect watchdog's close() can interrupt them.
                 Stream.getStreamsToHost(withName: host, port: Int(port), inputStream: &i, outputStream: &o)
                 guard let i, let o else { c.resume(throwing: NetError.closed); return }
                 input = i
@@ -199,6 +248,11 @@ final class StartTLSTransport: NSObject, ByteTransport, StreamDelegate, @uncheck
             onThread { [self] in
                 if let failure { c.resume(throwing: failure); return }
                 guard output != nil, !finished else { c.resume(throwing: NetError.closed); return }
+                // One write at a time: replacing a write in flight would leave its caller waiting forever.
+                guard pendingWrite == nil else {
+                    c.resume(throwing: NetError.protocolError("two writes on one connection"))
+                    return
+                }
                 pendingWrite = (data, 0, c)
                 pumpWrite()
             }
@@ -217,6 +271,9 @@ final class StartTLSTransport: NSObject, ByteTransport, StreamDelegate, @uncheck
                     c.resume(throwing: failure)
                 } else if atEnd || finished {
                     c.resume(throwing: NetError.closed)
+                } else if pendingRead != nil {
+                    // One read at a time, for the same reason as writes.
+                    c.resume(throwing: NetError.protocolError("two reads on one connection"))
                 } else {
                     pendingRead = c
                 }
@@ -299,7 +356,7 @@ final class StartTLSTransport: NSObject, ByteTransport, StreamDelegate, @uncheck
         case .endEncountered:
             atEnd = true
             if let c = pendingRead, buffer.isEmpty { pendingRead = nil; c.resume(throwing: NetError.closed) }
-            closedHandler?()
+            closedHandler.call()
         default:
             break
         }
@@ -309,6 +366,9 @@ final class StartTLSTransport: NSObject, ByteTransport, StreamDelegate, @uncheck
         guard !finished else { return }
         failure = failure ?? error
         finished = true
+        threadLock.lock()
+        stopped = true
+        threadLock.unlock()
         for s in [input, output].compactMap({ $0 }) as [Stream] {
             s.delegate = nil
             s.close()
@@ -317,7 +377,7 @@ final class StartTLSTransport: NSObject, ByteTransport, StreamDelegate, @uncheck
         if let c = openCont { openCont = nil; c.resume(throwing: error) }
         if let c = pendingRead { pendingRead = nil; c.resume(throwing: error) }
         if let w = pendingWrite { pendingWrite = nil; w.cont.resume(throwing: error) }
-        closedHandler?()
+        closedHandler.call()
         if let rl = runLoop { CFRunLoopStop(rl) }
     }
 }

@@ -48,7 +48,7 @@ struct SearchQuery: Equatable, Codable {
             // "from:" followed by a separate value token.
             if token.hasSuffix(":"), token.count > 1,
                knownOperators.contains(token.dropLast().lowercased()),
-               i + 1 < tokens.count, !tokens[i + 1].contains(":") || tokens[i + 1].hasPrefix("\"") {
+               i + 1 < tokens.count, tokens[i + 1].hasPrefix("\"") || !startsWithOperator(Array(tokens[i + 1]), at: 0) {
                 token += tokens[i + 1]
                 i += 1
             }
@@ -90,13 +90,16 @@ struct SearchQuery: Equatable, Codable {
         return q
     }
 
+    /// Splits at whitespace outside quotes. A comma directly followed by another operator also ends a
+    /// token ("from:divya,to:bob"), so the second operator is not swallowed into the first one's value.
     private static func tokenize(_ s: String) -> [String] {
+        let chars = Array(s)
         var out: [String] = []
         var cur = ""
         var inQuote = false
-        for ch in s {
+        for (i, ch) in chars.enumerated() {
             if ch == "\"" { inQuote.toggle(); cur.append(ch); continue }
-            if ch.isWhitespace && !inQuote {
+            if !inQuote, ch.isWhitespace || (ch == "," && startsWithOperator(chars, at: i + 1)) {
                 if !cur.isEmpty { out.append(cur); cur = "" }
             } else {
                 cur.append(ch)
@@ -106,11 +109,23 @@ struct SearchQuery: Equatable, Codable {
         return out
     }
 
+    /// Whether a known operator and its colon ("from:") start at this position.
+    private static func startsWithOperator(_ chars: [Character], at start: Int) -> Bool {
+        var j = start
+        while j < chars.count, chars[j].isLetter || chars[j] == "_" || chars[j].isNumber { j += 1 }
+        guard j > start, j < chars.count, chars[j] == ":" else { return false }
+        return knownOperators.contains(String(chars[start..<j]).lowercased())
+    }
+
     private static func unquote(_ s: String) -> String {
         s.trimmingCharacters(in: CharacterSet(charactersIn: "\"")).trimmingCharacters(in: .whitespaces)
     }
 
-    private static func quoteIfNeeded(_ s: String) -> String { s.contains(" ") ? "\"\(s)\"" : s }
+    /// Gmail's search syntax has no escape for a quote inside a quoted term, so quotes are dropped.
+    private static func quoteIfNeeded(_ s: String) -> String {
+        let s = s.replacingOccurrences(of: "\"", with: "")
+        return s.contains(" ") ? "\"\(s)\"" : s
+    }
 
     /// "7d" → 7, "2m" → 60, "1y" → 365. Huge values clamp instead of trapping.
     static func days(_ s: String) -> Int? {

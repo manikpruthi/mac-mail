@@ -13,7 +13,8 @@ struct PreparedHTML {
 }
 
 enum HTMLPrep {
-    private static let imgTag = try! NSRegularExpression(pattern: "<(?:img|image|input)\\b[^>]*>", options: [.caseInsensitive])
+    /// Tags that load an image: <img>, SVG <image>, and <input type=image>.
+    private static let imageTagNames: Set<String> = ["img", "image", "input"]
     // Attributes may follow "/" as well as whitespace (<img/src=x>, <img width=1/src=…>) and be unquoted.
     private static let srcAttr = try! NSRegularExpression(
         pattern: "(?:\\s|/)src\\s*=\\s*(?:\"([^\"]*)\"|'([^']*)'|([^\\s>]+))", options: [.caseInsensitive])
@@ -88,7 +89,8 @@ enum HTMLPrep {
         s = replace(cssImport, in: s) { _, _ in "" }
 
         var nextID = 0
-        s = replace(imgTag, in: s) { tag, _ in
+        s = mapTags(s, escapeUnterminated: false) { tag, name -> String? in
+            guard imageTagNames.contains(name) else { return nil }
             var t = tag
             // Dimensions from attributes and inline CSS (width/height in px) — for tracking-pixel detection.
             let known = Array(pixelDims(t).values)
@@ -278,6 +280,115 @@ enum HTMLPrep {
         """
     }
 
+    /// Calls `f` with every start tag and its lowercased name, and replaces the tag with what `f`
+    /// returns (nil keeps it). A tag ends where a browser ends it: at the first ">" that is not inside
+    /// a quoted attribute value. Ending it at the first ">" of any kind, as a `<[^>]*>` pattern does,
+    /// shows the sanitiser only the first half of `<a href="x>" onclick="…">`, while the recipient's
+    /// browser reads the whole tag, handler included.
+    ///
+    /// A tag that never ends (an unclosed quote, or no ">" at all) is a tag to no browser either. With
+    /// `escapeUnterminated` its "<" becomes text, so the fragment can't join up with what follows it in
+    /// mail that is sent on; without it (display only) the tag ends at the next ">" as it always did.
+    private static func mapTags(_ s: String, escapeUnterminated: Bool, _ f: (String, String) -> String?) -> String {
+        let u = Array(s.utf16)
+        let n = u.count
+        var out = [UInt16]()
+        out.reserveCapacity(n)
+        func isLetter(_ c: UInt16) -> Bool { (c >= 65 && c <= 90) || (c >= 97 && c <= 122) }
+        var i = 0
+        while i < n {
+            guard u[i] == 0x3C, i + 1 < n, isLetter(u[i + 1]) else {
+                out.append(u[i])
+                i += 1
+                continue
+            }
+            var j = i + 1
+            var quote: UInt16 = 0
+            var lastSolid: UInt16 = 0   // last character that wasn't whitespace
+            var end = -1
+            while j < n {
+                let c = u[j]
+                if quote != 0 {
+                    if c == quote { quote = 0 }
+                } else if (c == 0x22 || c == 0x27) && lastSolid == 0x3D {
+                    quote = c       // a quote opens a value only straight after "="
+                } else if c == 0x3E {
+                    end = j
+                    break
+                }
+                if c != 0x20 && c != 0x09 && c != 0x0A && c != 0x0D && c != 0x0C { lastSolid = c }
+                j += 1
+            }
+            if end < 0 {
+                if escapeUnterminated {
+                    out.append(contentsOf: Array("&lt;".utf16))
+                    i += 1
+                    continue
+                }
+                guard let gt = u[i...].firstIndex(of: 0x3E) else {
+                    out.append(contentsOf: u[i...])
+                    break
+                }
+                end = gt
+            }
+            var k = i + 1
+            while k < end, isLetter(u[k]) || (u[k] >= 48 && u[k] <= 57) { k += 1 }
+            let name = String(decoding: u[(i + 1)..<k], as: UTF16.self).lowercased()
+            if let replacement = f(String(decoding: u[i...end], as: UTF16.self), name) {
+                out.append(contentsOf: replacement.utf16)
+            } else {
+                out.append(contentsOf: u[i...end])
+            }
+            i = end + 1
+        }
+        return String(decoding: out, as: UTF16.self)
+    }
+
+    private static let numericEntity = try! NSRegularExpression(pattern: "&#(?:[xX]([0-9a-fA-F]{1,8})|([0-9]{1,10}));?")
+    private static let spacingEntity = try! NSRegularExpression(pattern: "&(colon|tab|newline);?", options: [.caseInsensitive])
+    /// Link schemes that are allowed to leave the app inside quoted mail.
+    private static let safeSchemes: Set<String> = ["http", "https", "mailto", "tel", "sms", "ftp", "ftps", "cid", "webcal", "callto", "geo"]
+
+    /// HTML for AppKit's importer (reopening a draft), which fetches whatever the markup refers to:
+    /// active content, remote images, remote stylesheets and CSS/background URLs are taken out. Inline
+    /// (cid:, data:) images stay.
+    static func withoutRemoteContent(_ html: String) -> String {
+        var s = stripActive(html)
+        s = replace(voidActive, in: s) { _, _ in "" }
+        s = replace(srcsetAttr, in: s) { _, _ in "" }
+        s = replace(posterAttr, in: s) { _, _ in "" }
+        s = replace(cssImport, in: s) { _, _ in "" }
+        s = replace(bgAttr, in: s) { _, _ in "" }
+        s = replace(cssURL, in: s) { whole, m in
+            MIME.decodeEntities(m[2]).trimmingCharacters(in: .whitespaces).lowercased().hasPrefix("data:") ? whole : "none"
+        }
+        return mapTags(s, escapeUnterminated: false) { tag, name -> String? in
+            guard imageTagNames.contains(name) else { return nil }
+            let src = MIME.decodeEntities(attrValue(tag, srcAttr) ?? attrValue(tag, hrefAttr) ?? "")
+                .trimmingCharacters(in: .whitespaces).lowercased()
+            return src.isEmpty || src.hasPrefix("cid:") || src.hasPrefix("data:") ? nil : "[image]"
+        }
+    }
+
+    /// Whether a link value is safe to send on. The value is read the way a browser reads it (entities
+    /// decoded, with or without their semicolon; tabs, newlines and other controls dropped), and then
+    /// only an allowed scheme or a schemeless (relative) link passes. Blocking a list of bad schemes
+    /// instead misses every spelling the list didn't think of (`javascript&colon;`, `java&Tab;script:`).
+    static func isSafeLink(_ raw: String) -> Bool {
+        var v = MIME.decodeEntities(raw)
+        v = replace(numericEntity, in: v) { whole, m in
+            let code = !m[1].isEmpty ? UInt32(m[1], radix: 16) : UInt32(m[2])
+            return code.flatMap { Unicode.Scalar($0) }.map { String(Character($0)) } ?? whole
+        }
+        v = replace(spacingEntity, in: v) { _, m in m[1].lowercased() == "colon" ? ":" : " " }
+        v = String(String.UnicodeScalarView(v.unicodeScalars.filter { $0.value > 0x20 && $0.value != 0x7f })).lowercased()
+        // The part a scheme could be in: everything before the first path, query or fragment character.
+        let head = v.prefix { !"/?#".contains($0) }
+        if let colon = head.firstIndex(of: ":") { return safeSchemes.contains(String(head[..<colon])) }
+        // No scheme. An entity that is still unresolved here could spell one in the recipient's client.
+        return !head.contains("&")
+    }
+
     /// Regex replace with access to the whole match and its capture groups.
     private static func replace(_ re: NSRegularExpression, in s: String, _ f: (String, [String]) -> String) -> String {
         let ns = s as NSString
@@ -352,23 +463,20 @@ enum HTMLPrep {
         s = replace(srcsetAttr, in: s) { _, _ in "" }
         s = replace(posterAttr, in: s) { _, _ in "" }
         s = replace(cssImport, in: s) { _, _ in "" }
-        s = replace(imgTag, in: s) { tag, _ in
-            if isTrackingPixel(tag) { return "" }
-            let src = MIME.decodeEntities(attrValue(tag, srcAttr) ?? attrValue(tag, hrefAttr) ?? "")
-                .trimmingCharacters(in: .whitespaces).lowercased()
-            return src.hasPrefix("https://") ? tag : ""
-        }
-        s = replace(openTag, in: s) { tag, _ in
+        // One pass over whole tags (see mapTags): images first, then handlers and links on what is left.
+        s = mapTags(s, escapeUnterminated: true) { tag, name -> String? in
+            if imageTagNames.contains(name) {
+                if isTrackingPixel(tag) { return "" }
+                let src = MIME.decodeEntities(attrValue(tag, srcAttr) ?? attrValue(tag, hrefAttr) ?? "")
+                    .trimmingCharacters(in: .whitespaces).lowercased()
+                guard src.hasPrefix("https://") else { return "" }
+            }
             var t = tag
             t = onHandler.stringByReplacingMatches(in: t, range: NSRange(location: 0, length: (t as NSString).length), withTemplate: "")
             t = replace(urlAttr, in: t) { attr, m in
                 var value = ""
                 for g in 2...4 where m.count > g && !m[g].isEmpty { value = m[g]; break }
-                let v = MIME.decodeEntities(value).filter { !$0.isWhitespace && !$0.isNewline }.lowercased()
-                if v.hasPrefix("javascript:") || v.hasPrefix("vbscript:") || v.hasPrefix("data:") {
-                    return " \(m.count > 1 ? m[1] : "href")=\"#\""
-                }
-                return attr
+                return isSafeLink(value) ? attr : "\(m.count > 1 ? m[1] : "href")=\"#\""
             }
             return t
         }
@@ -376,11 +484,12 @@ enum HTMLPrep {
     }
 
     private static let styleBlock = try! NSRegularExpression(pattern: "<style\\b[^>]*>[\\s\\S]*?</style\\s*>", options: [.caseInsensitive])
-    private static let openTag = try! NSRegularExpression(pattern: "<[a-zA-Z][^>]*>", options: [])
+    // An attribute may follow whitespace, "/" or the closing quote of the previous value
+    // (<a title="x"onclick=…> is accepted by browsers), so all three count as "before an attribute".
     private static let onHandler = try! NSRegularExpression(
-        pattern: "(?:\\s|/)on[a-z]+\\s*=\\s*(?:\"[^\"]*\"|'[^']*'|[^\\s>]+)", options: [.caseInsensitive])
+        pattern: "(?<=[\\s/\"'])on[a-z]+\\s*=\\s*(?:\"[^\"]*\"|'[^']*'|[^\\s>]+)", options: [.caseInsensitive])
     private static let urlAttr = try! NSRegularExpression(
-        pattern: "\\s(href|src|action|formaction|background|xlink:href)\\s*=\\s*(?:\"([^\"]*)\"|'([^']*)'|([^\\s>]+))",
+        pattern: "(?<=[\\s/\"'])(href|src|action|formaction|background|xlink:href)\\s*=\\s*(?:\"([^\"]*)\"|'([^']*)'|([^\\s>]+))",
         options: [.caseInsensitive])
     private static let bodyOpen = try! NSRegularExpression(pattern: "<body\\b[^>]*>", options: [.caseInsensitive])
     private static let bodyClose = try! NSRegularExpression(pattern: "</body\\s*>", options: [.caseInsensitive])

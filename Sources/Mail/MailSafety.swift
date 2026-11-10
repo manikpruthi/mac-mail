@@ -10,6 +10,9 @@ enum MailSafety {
         guard s.firstIndex(of: "@") != nil, s.firstIndex(of: "@") == s.lastIndex(of: "@") else { return false }
         let parts = s.split(separator: "@", omittingEmptySubsequences: false)
         guard parts.count == 2, !parts[0].isEmpty, !parts[1].isEmpty else { return false }
+        // Dots separate atoms and labels: none may lead, trail or repeat ("a..b@x.com", "a@x..com").
+        // A domain without a dot ("user@localhost") is valid syntax and stays accepted.
+        for part in parts where part.hasPrefix(".") || part.hasSuffix(".") || part.contains("..") { return false }
         for ch in s.utf8 {
             switch ch {
             case 33...126: // printable ASCII

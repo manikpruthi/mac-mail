@@ -49,7 +49,12 @@ enum Keychain {
         return String(data: data, encoding: .utf8)
     }
 
-    static func delete(_ accountID: String) {
-        SecItemDelete(base(accountID) as CFDictionary)
+    /// Removes the password. Returns the failure when macOS refused (a missing item is not one), so the
+    /// caller can record that a credential may have been left behind.
+    @discardableResult
+    static func delete(_ accountID: String) -> KeychainError? {
+        let status = SecItemDelete(base(accountID) as CFDictionary)
+        guard status != errSecSuccess, status != errSecItemNotFound else { return nil }
+        return KeychainError(status: status, operation: "remove")
     }
 }

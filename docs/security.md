@@ -14,8 +14,16 @@
 - **SMTP**: envelope addresses must be strict addr-specs; per-command idle timeouts.
 - **HTML display**: active elements stripped, remote loads rewritten to `lm://`, content rule list + CSP,
   tracking pixels removed, http upgraded to https, private-network addresses never contacted.
-- **Quoted HTML (replies/forwards)**: stricter — no `<style>`/`<link>`, no `on*` handlers, no
-  `javascript:`/`vbscript:`/`data:` links, https images only.
+- **Quoted HTML (replies/forwards)**: stricter — no `<style>`/`<link>`, no `on*` handlers, links only
+  with an allow-listed scheme (decided after decoding entities the way a browser does), https images only.
+  Tags are scanned quote-aware (`HTMLPrep.mapTags`), so `<a href="x>" onclick=…>` is judged as one tag;
+  an unterminated tag is escaped to text.
+- **Reopened drafts**: remote images, stylesheets and CSS URLs are removed before AppKit's HTML importer
+  sees the draft, so the importer fetches nothing.
+- **Address headers**: separators inside quoted names, comments and encoded words never split an
+  address (no hidden Reply All recipient); group syntax yields no address.
+- **Known gap**: the private-address check for remote images is a lookup before the download, not a
+  pinned connection (DNS rebinding between the two is not caught).
 - **.eml files**: parsed with size (64 MB), depth (20) and part-count (500) limits; rendered with remote
   images off until asked for; inline images come from the file.
 - **Filenames** from senders are sanitised (`BodyPart.safeFilename`).

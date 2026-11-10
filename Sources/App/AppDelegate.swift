@@ -89,6 +89,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
                 self?.idleWork?.cancel()
                 self?.mainWindow?.preview.restoreWebViewIfNeeded()
                 PreviewViewController.restoreWebViews(except: self?.mainWindow?.preview)
+                EMLWindowController.restoreWebViews()
                 ComposeWindowController.restoreQuoteWebViews()
                 self?.mainWindow?.appBecameActive()
             }
@@ -110,6 +111,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             MainActor.assumeIsolated {
                 self?.mainWindow?.preview.restoreWebViewIfNeeded()
                 PreviewViewController.restoreWebViews(except: self?.mainWindow?.preview)
+                EMLWindowController.restoreWebViews()
             }
         }
         memoryPressure.setEventHandler { [weak self] in
@@ -117,6 +119,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
                 if !NSApp.isActive {
                     self?.mainWindow?.preview.releaseWebView()
                     PreviewViewController.releaseWebViews(except: self?.mainWindow?.preview)
+                    EMLWindowController.releaseWebViews()
                     ComposeWindowController.releaseQuoteWebViews()
                 }
                 Memory.relieve()
@@ -134,6 +137,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             guard !NSApp.isActive || self?.mainWindow?.window?.isMiniaturized == true else { return }
             self?.mainWindow?.preview.releaseWebView()
             PreviewViewController.releaseWebViews(except: self?.mainWindow?.preview)
+            EMLWindowController.releaseWebViews()
             ComposeWindowController.releaseQuoteWebViews()
             Memory.relieve()
         }
@@ -163,8 +167,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             a.addButton(withTitle: "Quit Anyway")
             if a.runModal() == .alertFirstButtonReturn {
                 Task {
-                    while MailService.shared.hasPendingSends { try? await Task.sleep(nanoseconds: 300_000_000) }
-                    try? await Task.sleep(nanoseconds: 1_500_000_000)
+                    // Waits at most a minute, then asks again: a send stuck on a silent server must not
+                    // leave a windowless app that can only be force-quit.
+                    let deadline = Date().addingTimeInterval(60)
+                    while MailService.shared.hasPendingSends, Date() < deadline {
+                        try? await Task.sleep(nanoseconds: 300_000_000)
+                    }
+                    if !MailService.shared.hasPendingSends { try? await Task.sleep(nanoseconds: 1_500_000_000) }
+                    // Still sending: this runs the question above again (Wait / Quit Anyway).
                     NSApp.terminate(nil)
                 }
                 return .terminateCancel

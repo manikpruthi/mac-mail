@@ -69,7 +69,45 @@ final class Store {
         if db.userVersion < 4 { try migrate_3_to_4() }
         if db.userVersion < 5 { try migrate_4_to_5() }
         try upgradeHeaderIndex()
+        try installCurrentTriggers()
         db.run("PRAGMA user_version=5")
+    }
+
+    private static let headerUpdateTrigger = """
+        CREATE TRIGGER msg_au AFTER UPDATE OF subject, snippet, from_name, from_addr, to_list, cc_list ON messages BEGIN
+            INSERT INTO fts(fts, rowid, subject, from_name, from_addr, to_list, cc_list, snippet)
+            VALUES ('delete', old.id, old.subject, old.from_name, old.from_addr, old.to_list, old.cc_list, old.snippet);
+            INSERT INTO fts(rowid, subject, from_name, from_addr, to_list, cc_list, snippet)
+            VALUES (new.id, new.subject, new.from_name, new.from_addr, new.to_list, new.cc_list, new.snippet);
+        END;
+        """
+
+    /// Triggers that must exist in their current form whatever path the database took here. The
+    /// migrations above commit one by one and user_version is written last, so a crash in between
+    /// re-runs a step on the next launch; migrate_4_to_5 then re-creates the header trigger in its old
+    /// shape (without Cc) after upgradeHeaderIndex already ran. Checked by the trigger's own text, so a
+    /// healthy database is only read here, never rewritten.
+    private func installCurrentTriggers() throws {
+        var updateSQL = ""
+        db.query("SELECT sql FROM sqlite_master WHERE type='trigger' AND name='msg_au'") { updateSQL = $0.text(0) }
+        if !updateSQL.contains("cc_list") {
+            try db.transactionChecked {
+                try db.exec("DROP TRIGGER IF EXISTS msg_au;\n" + Self.headerUpdateTrigger)
+                try db.exec("INSERT INTO fts(fts) VALUES('rebuild')")
+            }
+        }
+        // Autocomplete follows a corrected sender: without this a re-synced name never reached the
+        // contacts table, and a changed address kept crediting the old one.
+        try db.exec("""
+            CREATE TRIGGER IF NOT EXISTS msg_contacts_au AFTER UPDATE OF from_name, from_addr ON messages
+            WHEN old.from_addr != new.from_addr OR old.from_name != new.from_name BEGIN
+                UPDATE contacts SET count=count-1 WHERE email=old.from_addr AND old.from_addr != new.from_addr;
+                DELETE FROM contacts WHERE email=old.from_addr AND count<=0;
+                INSERT INTO contacts(email, name, count) VALUES (new.from_addr, new.from_name, 1)
+                ON CONFLICT(email) DO UPDATE SET
+                    count=count + (CASE WHEN old.from_addr != new.from_addr THEN 1 ELSE 0 END), name=excluded.name;
+            END;
+            """)
     }
 
     /// The header index gains Cc (W-02), so `from:`/`to:`/`cc:`/`subject:` filters are answered by the index
@@ -95,12 +133,8 @@ final class Store {
                     INSERT INTO fts(fts, rowid, subject, from_name, from_addr, to_list, cc_list, snippet)
                     VALUES ('delete', old.id, old.subject, old.from_name, old.from_addr, old.to_list, old.cc_list, old.snippet);
                 END;
-                CREATE TRIGGER msg_au AFTER UPDATE OF subject, snippet, from_name, from_addr, to_list, cc_list ON messages BEGIN
-                    INSERT INTO fts(fts, rowid, subject, from_name, from_addr, to_list, cc_list, snippet)
-                    VALUES ('delete', old.id, old.subject, old.from_name, old.from_addr, old.to_list, old.cc_list, old.snippet);
-                    INSERT INTO fts(rowid, subject, from_name, from_addr, to_list, cc_list, snippet)
-                    VALUES (new.id, new.subject, new.from_name, new.from_addr, new.to_list, new.cc_list, new.snippet);
-                END;
+                """ + Self.headerUpdateTrigger + """
+
                 INSERT INTO fts(fts) VALUES('rebuild');
                 """)
         }
@@ -175,8 +209,16 @@ final class Store {
     nonisolated static func indexText(html: String?, text: String?) -> String {
         var body = text ?? ""
         if body.isEmpty, let html { body = MIME.plainText(fromHTML: html, limit: 65_536) }
-        if body.utf8.count > 65_536 { body = String(body.prefix(65_536)) }
-        return body
+        return utf8Prefix(body, 65_536)
+    }
+
+    /// The longest prefix of `s` that fits in `bytes` UTF-8 bytes, cut on a character boundary. The
+    /// index cap is in bytes: a character count would let CJK or emoji text run to several times it.
+    nonisolated static func utf8Prefix(_ s: String, _ bytes: Int) -> String {
+        guard s.utf8.count > bytes else { return s }
+        var cut = s.utf8.index(s.utf8.startIndex, offsetBy: bytes)
+        while cut > s.startIndex, String.Index(cut, within: s) == nil { cut = s.utf8.index(before: cut) }
+        return String(s[..<cut])
     }
 
     /// v1 → v2: pending ops bound to folder id + UIDVALIDITY, body full-text index, body-cache index, contacts table.
@@ -712,7 +754,8 @@ final class Store {
         }
         var oldBodies: [Int64] = []
         db.query("""
-            SELECT message_id FROM (SELECT message_id, SUM(length(COALESCE(html,'')) + length(COALESCE(text,'')))
+            SELECT message_id FROM (SELECT message_id,
+                SUM(length(CAST(COALESCE(html,'') AS BLOB)) + length(CAST(COALESCE(text,'') AS BLOB)))
                 OVER (ORDER BY fetched DESC) AS total FROM bodies) WHERE total > ?
             """, [bodyCacheBytes]) { oldBodies.append($0.int64(0)) }
         for chunk in oldBodies.chunked(500) {
@@ -773,19 +816,50 @@ final class Store {
         return snap
     }
 
-    /// Re-inserts snapshotted rows (same ids, so the FTS/contacts triggers and body index come back too).
-    func restore(_ snap: Snapshot) {
+    /// Re-inserts snapshotted rows; the FTS/contacts triggers and the body index come back with them.
+    /// A row keeps its old id when that id is still free. It may not be: ids are plain rowids, and mail
+    /// that arrived during the Undo window can have been given the ids the deleted rows just freed.
+    /// Such a row is inserted under a new id and its body follows it there, so a restored row is never
+    /// dropped and a restored body never lands on somebody else's message.
+    /// Returns false when the cache refused the write (nothing was restored).
+    @discardableResult
+    func restore(_ snap: Snapshot) -> Bool {
         db.transaction {
+            // Old row id → the id the message has now. Messages that could not be put back are absent.
+            var placed: [Int64: Int64] = [:]
             for r in snap.messages {
-                let cols = r.columns.joined(separator: ",")
-                let marks = Array(repeating: "?", count: r.columns.count).joined(separator: ",")
-                db.run("INSERT OR IGNORE INTO messages(\(cols)) VALUES (\(marks))", r.values)
+                guard let idIdx = r.columns.firstIndex(of: "id"), let oldID = r.values[idIdx] as? Int64,
+                      let fIdx = r.columns.firstIndex(of: "folder_id"), let folderID = r.values[fIdx] as? Int64,
+                      let uIdx = r.columns.firstIndex(of: "uid"), let uid = r.values[uIdx] as? Int64 else { continue }
+                // Already back (a sync fetched it again): keep that row and give it the body.
+                if let existing = db.scalarInt("SELECT id FROM messages WHERE folder_id=? AND uid=?", [folderID, uid]) {
+                    placed[oldID] = existing
+                    continue
+                }
+                var columns = r.columns, values = r.values
+                if db.scalarInt("SELECT 1 FROM messages WHERE id=?", [oldID]) != nil {
+                    columns.remove(at: idIdx)
+                    values.remove(at: idIdx)
+                }
+                let cols = columns.joined(separator: ",")
+                let marks = Array(repeating: "?", count: columns.count).joined(separator: ",")
+                // A failure here (the folder was deleted meanwhile) skips this one message only.
+                var stmtOK = false
+                do { try db.runChecked("INSERT INTO messages(\(cols)) VALUES (\(marks))", values); stmtOK = true } catch {}
+                if stmtOK { placed[oldID] = db.lastInsertID } else { db.clearFailure() }
             }
             for r in snap.bodies {
+                guard let midIdx = r.columns.firstIndex(of: "message_id"), let oldID = r.values[midIdx] as? Int64,
+                      let newID = placed[oldID] else { continue }
+                var values = r.values
+                values[midIdx] = newID
                 let cols = r.columns.joined(separator: ",")
                 let marks = Array(repeating: "?", count: r.columns.count).joined(separator: ",")
-                db.run("INSERT OR IGNORE INTO bodies(\(cols)) VALUES (\(marks))", r.values)
-                if let idIdx = r.columns.firstIndex(of: "message_id"), let id = r.values[idIdx] as? Int64 {
+                db.run("INSERT OR IGNORE INTO bodies(\(cols)) VALUES (\(marks))", values)
+                // Only index the body that is really stored for the row (an existing one wins).
+                guard db.changes > 0 else { continue }
+                do {
+                    let id = newID
                     let html = r.columns.firstIndex(of: "html").flatMap { r.values[$0] as? String }
                     let text = r.columns.firstIndex(of: "text").flatMap { r.values[$0] as? String }
                     let body = Self.indexText(html: html, text: text)
@@ -975,6 +1049,15 @@ final class Store {
     func pref(_ key: String) -> String? {
         var out: String?
         db.query("SELECT value FROM prefs WHERE key=?", [key]) { out = $0.string(0) }
+        return out
+    }
+
+    /// Every stored preference whose key starts with `prefix` (the Undo journal).
+    func prefs(prefix: String) -> [(key: String, value: String)] {
+        var out: [(key: String, value: String)] = []
+        db.query("SELECT key, value FROM prefs WHERE substr(key, 1, ?) = ? ORDER BY key", [prefix.count, prefix]) {
+            out.append(($0.text(0), $0.text(1)))
+        }
         return out
     }
 

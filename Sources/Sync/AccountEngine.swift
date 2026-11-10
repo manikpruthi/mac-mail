@@ -26,7 +26,6 @@ final class AccountEngine {
     private var idleTask: Task<Void, Never>?
     private var startupTasks: [Task<Void, Never>] = []
     private var flushing = false
-    private var flushPending = false
     private(set) var isGmail: Bool
     private(set) var lastError: String?
     /// Classification of `lastError` (credentials vs network vs server refusal); the string stays as the human form.
@@ -66,6 +65,7 @@ final class AccountEngine {
 
     /// Drops the cached password and all connections (after "Sign in again" saved a new password — F-04).
     func resetConnections() {
+        guard !stopped else { return }
         cachedPassword = nil
         passwordTask = nil
         idleTask?.cancel()
@@ -80,12 +80,18 @@ final class AccountEngine {
         lastErrorKind = nil
         NotificationCenter.default.post(name: .mailStatusChanged, object: self)
         guard !isDemo else { return }
-        Task {
+        startupTasks.append(Task {
             await refreshFolders()
+            if Task.isCancelled { return }
             if let inbox = store.folder(account: account.id, role: .inbox) { await sync(folderID: inbox.id) }
             startIdle()
-        }
+        })
     }
+
+    /// Set by shutdown() (quit, or the account was removed). Background tasks that were already
+    /// running check it, so none of them can reconnect, write this account's folders back into the
+    /// cache or restart IDLE afterwards.
+    private var stopped = false
 
     // MARK: Connections
 
@@ -94,6 +100,7 @@ final class AccountEngine {
     private var connectionEpoch = 0
 
     func client(_ lane: Lane) async throws -> IMAPClient {
+        guard !stopped else { throw CancellationError() }
         let epoch = connectionEpoch
         if let c = clients[lane] {
             let alive = await c.isConnected
@@ -155,6 +162,7 @@ final class AccountEngine {
     /// (macOS verifies the app before releasing the item), which would freeze the window.
     func appPassword() async throws -> String {
         if let p = cachedPassword { return p }
+        let epoch = connectionEpoch
         let provide = passwordProvider
         let task = passwordTask ?? {
             let id = account.id
@@ -172,16 +180,23 @@ final class AccountEngine {
                 passwordTask = nil
                 throw NetError.auth("no App Password saved for \(account.email). Open Settings → Accounts.")
             }
+            // A read that was in flight across a reset may hold the password from before it: read again
+            // instead of caching it.
+            guard epoch == connectionEpoch else {
+                if passwordTask == task { passwordTask = nil }
+                return try await appPassword()
+            }
             cachedPassword = p
             return p
         } catch {
             // Never cache a failed read: a transient Keychain error must be retryable, not permanent.
-            passwordTask = nil
+            if passwordTask == task { passwordTask = nil }
             throw error
         }
     }
 
     func shutdown() {
+        stopped = true
         for t in startupTasks { t.cancel() }
         startupTasks.removeAll()
         idleTask?.cancel()
@@ -223,7 +238,7 @@ final class AccountEngine {
     // MARK: Start-up
 
     func start() {
-        guard !isDemo else { return }
+        guard !isDemo, !stopped else { return }
         // The click connection opens first and in parallel, so a message you open right after launch
         // isn't stuck behind the startup sync.
         startupTasks.append(Task { await prewarmFetch() })
@@ -323,13 +338,21 @@ final class AccountEngine {
     /// instead of UIDs silently resolving to different messages.
     private func verifySelection(_ info: SelectInfo, folder: Folder) throws {
         guard folder.uidValidity != 0, info.uidValidity != 0, info.uidValidity != folder.uidValidity else { return }
-        store.resetFolder(folder.id)
+        resetFolderCache(folder.id)
         throw NetError.server("\"\(folder.name)\" changed on the server and was reloaded. Try again.")
+    }
+
+    /// Drops a folder's cached rows and queued actions after its UIDVALIDITY changed. The UIDs hidden for
+    /// an Undo window belong to the old numbering too: kept, they would hide whichever new messages
+    /// happen to carry the same numbers.
+    private func resetFolderCache(_ folderID: Int64) {
+        store.resetFolder(folderID)
+        undoHidden[folderID] = nil
     }
 
     /// Delta sync of one folder: new mail since the last UIDNEXT, flag changes since the last MODSEQ, and removals.
     func sync(folderID: Int64, prefetch: Bool = true) async {
-        guard !isDemo, let folder = store.folder(folderID), folder.selectable else { return }
+        guard !isDemo, !stopped, let folder = store.folder(folderID), folder.selectable else { return }
         // A request for a folder already syncing is coalesced, not dropped: it re-runs right after.
         guard !syncing.contains(folderID) else { syncPending.insert(folderID); return }
         syncing.insert(folderID)
@@ -346,7 +369,7 @@ final class AccountEngine {
             guard let info = try await c.select(folder.path, readOnly: false) else { return }
             var state = folder
             if state.uidValidity != 0 && info.uidValidity != 0 && state.uidValidity != info.uidValidity {
-                store.resetFolder(folderID)
+                resetFolderCache(folderID)
                 state.uidNext = 0
                 state.modseq = 0
             }
@@ -392,7 +415,7 @@ final class AccountEngine {
                                                        modseq: state.modseq)
                 }
                 var flagsOK = true
-                if let minUID = store.minUID(folderID: folderID) {
+                if store.minUID(folderID: folderID) != nil {
                     // Flag changes.
                     do {
                         if await c.hasCondstore, state.modseq > 0 {
@@ -409,12 +432,15 @@ final class AccountEngine {
                             // look at the newest 500 cached UIDs; every 10th sweeps the whole cached range (O-11).
                             let n = (flagSweepCounter[folderID] ?? 0) + 1
                             flagSweepCounter[folderID] = n % 10
-                            var from = minUID
-                            if n % 10 != 1 {
-                                let recent = store.localUIDs(folderID: folderID).sorted(by: >).prefix(500)
-                                from = max(minUID, recent.last ?? minUID)
+                            // Only the cached UIDs are asked about, 1,000 per command like the removals
+                            // check below: `from:*` on a big folder answered with more untagged lines
+                            // than a reply may hold, which dropped the connection on every sweep.
+                            var wanted = store.localUIDs(folderID: folderID).sorted(by: >)
+                            if n % 10 != 1 { wanted = Array(wanted.prefix(500)) }
+                            var all: [FetchResult] = []
+                            for chunk in wanted.sorted().chunked(1000) {
+                                all += try await c.fetch(imapUIDSet(chunk), items: "(UID FLAGS)")
                             }
-                            let all = try await c.fetch("\(from):*", items: "(UID FLAGS)")
                             let pending = pendingFlagUIDs(folderID: folderID, folder: folder)
                             flagChangedUIDs += try store.updateFlagsChecked(folderID: folderID, all.compactMap { r in
                                 guard let uid = r.uid, !pending.contains(uid) else { return nil }
@@ -627,7 +653,7 @@ final class AccountEngine {
     // MARK: Push (IDLE)
 
     func startIdle() {
-        guard idleTask == nil, !isDemo else { return }
+        guard idleTask == nil, !isDemo, !stopped else { return }
         idleTask = Task { [weak self] in
             while !Task.isCancelled {
                 guard let self else { return }
@@ -683,7 +709,10 @@ final class AccountEngine {
                 return try await c.fetchParts(uid: d.uid, parts: [h, t].compactMap { $0 })
             }
             let r = try await c.fetch("\(d.uid)", items: "(UID BODY.PEEK[TEXT])")
-            return ["TEXT": r.first?.items["BODY[TEXT]"]?.data ?? Data()]
+            // A reply without the item is "nothing arrived", not an empty body: returning empty data here
+            // cached a blank message for good.
+            guard let raw = r.first(where: { $0.uid == d.uid })?.items["BODY[TEXT]"]?.data else { return [:] }
+            return ["TEXT": raw]
         }
         let hc = h?.charset, tc = t?.charset
         let hp = h?.partID, tp = t?.partID
@@ -739,7 +768,9 @@ final class AccountEngine {
         let clean = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !clean.isEmpty else { throw NetError.server("Enter a folder name.") }
         let delim = parent?.delimiter ?? delimiter()
-        guard !clean.contains(delim) else { throw NetError.server("Folder names can't contain \"\(delim)\".") }
+        // An empty delimiter is a flat namespace (LIST answered NIL): no nesting, and no reserved character.
+        if parent != nil, delim.isEmpty { throw NetError.server("This mail server doesn't support folders inside folders.") }
+        guard delim.isEmpty || !clean.contains(delim) else { throw NetError.server("Folder names can't contain \"\(delim)\".") }
         let path = parent.map { $0.path + delim + clean } ?? clean
         try await syncGate.run {
             let c = try await client(.sync)
@@ -754,12 +785,13 @@ final class AccountEngine {
     func renameFolder(_ folder: Folder, to name: String) async throws {
         guard folder.role == .none else { throw NetError.server("System folders can't be renamed.") }
         let clean = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !clean.isEmpty, !clean.contains(folder.delimiter) else { throw NetError.server("Enter a valid folder name.") }
+        let delim = folder.delimiter
+        guard !clean.isEmpty, delim.isEmpty || !clean.contains(delim) else { throw NetError.server("Enter a valid folder name.") }
         // Queued actions name the folder by its current path; they are sent before it changes.
         try await settleOps(for: folder)
-        var comps = folder.path.components(separatedBy: folder.delimiter)
+        var comps = delim.isEmpty ? [folder.path] : folder.path.components(separatedBy: delim)
         comps[comps.count - 1] = clean
-        let newPath = comps.joined(separator: folder.delimiter)
+        let newPath = comps.joined(separator: delim)
         try await syncGate.run {
             let c = try await client(.sync)
             try await c.renameMailbox(folder.path, to: newPath)
@@ -817,13 +849,23 @@ final class AccountEngine {
     /// Sends the queued actions and waits until none concern this folder (as source or as the
     /// destination of a move). Throws when they can't be sent right now.
     private func settleOps(for folder: Folder) async throws {
+        // Only failures from here on count: one reported earlier already put its messages back on screen.
+        unsettledSources.remove(folder.id)
         for _ in 0..<40 {
             await flushOps()
             let waiting = store.ops(account: account.id).contains { op in
                 op.folderID == folder.id || (op.folderID == 0 && op.folderPath == folder.path)
                     || (op.kind == "move" && op.arg == folder.path)
             }
-            if !waiting { return }
+            if !waiting {
+                // "Nothing waiting" is not "everything left": a move or delete the server refused for good
+                // (or one that couldn't even be queued) is gone from the queue while its message is still
+                // in the folder. Deleting or emptying the folder now would destroy it (H-12).
+                guard unsettledSources.remove(folder.id) == nil else {
+                    throw NetError.server("A message couldn't be moved out of \"\(folder.name)\", so the folder was left as it is. Check the folder and try again.")
+                }
+                return
+            }
             // Our own flush gave up (offline, or the server refused): don't wait for it.
             if !flushing { break }
             try await Task.sleep(nanoseconds: 250_000_000)
@@ -914,20 +956,44 @@ final class AccountEngine {
 
     // MARK: Actions (optimistic locally, queued for the server)
 
-    func queue(_ op: PendingOpKind, rows: [MessageRow]) {
+    /// Folders a move or delete could not leave: the server refused it for good, or it could not be
+    /// queued. settleOps reads this before a folder is deleted or emptied (H-12).
+    private var unsettledSources: Set<Int64> = []
+
+    /// `validity` is each source folder's UIDVALIDITY when the rows were read (an action that waited out
+    /// its Undo window passes it): the queued UIDs belong to that numbering, not to whatever the folder
+    /// has by now, so a folder renumbered in between makes the action stale instead of misdirected.
+    func queue(_ op: PendingOpKind, rows: [MessageRow], validity: [Int64: UInt32] = [:]) {
         let (kind, arg) = op.stored
         // The demo mailbox has no server: local changes are the whole action, nothing waits to be sent.
-        if isDemo { return }
+        if isDemo || stopped { return }
         let byFolder = Dictionary(grouping: rows, by: { $0.folderID })
         for (fid, list) in byFolder {
-            guard let f = store.folder(fid) else { continue }
+            guard let f = store.folder(fid) else {
+                // The folder left the cache (deleted, or pruned after the server stopped listing it):
+                // its messages went with it, so there is nothing to act on. Said, not swallowed.
+                report(NetError.server("An action couldn't be sent because its folder is no longer on the server."))
+                continue
+            }
+            let recorded = validity[fid].flatMap { $0 != 0 ? $0 : nil } ?? f.uidValidity
             let queued = store.addOp(account: account.id, kind: kind, folderPath: f.path, uids: list.map { $0.uid }, arg: arg,
-                                     folderID: f.id, uidvalidity: f.uidValidity)
-            // The local change already happened; say so instead of letting the server action vanish (C-10).
-            if !queued { report(NetError.server("A queued action couldn't be saved to disk and won't reach the server.")) }
+                                     folderID: f.id, uidvalidity: recorded)
+            if !queued {
+                // The local change already happened; say so instead of letting the server action vanish
+                // (C-10), and bring back rows that were removed for an action that will never be sent.
+                report(NetError.server("A queued action couldn't be saved to disk and won't reach the server."))
+                if op.needsRefetchOnRefusal {
+                    unsettledSources.insert(f.id)
+                    let uids = list.map { $0.uid }
+                    Task { _ = await self.refetchHeaders(folder: f, uids: uids) }
+                }
+            }
         }
         Task { await flushOps() }
     }
+
+    /// Thrown inside flushOps when the server's UIDVALIDITY is not the one an action was queued under.
+    private struct StaleOp: Error {}
 
     /// Classified server refusals: LIMIT/INUSE/rate-limit style NOs are worth retrying;
     /// anything else (message gone, folder missing, no permission) is final.
@@ -941,21 +1007,28 @@ final class AccountEngine {
     /// actions queued mid-flush are picked up instead of lost. Temporary refusals retry with backoff;
     /// a final refusal of a move/delete re-fetches the source headers so the messages reappear locally.
     func flushOps() async {
-        guard !isDemo else { return }
-        guard !flushing else { flushPending = true; return }
+        guard !isDemo, !stopped else { return }
+        // A second caller just returns: the loop below re-reads the queue until it is empty, so whatever
+        // was queued meanwhile is picked up by the flush already running.
+        guard !flushing else { return }
         flushing = true
         defer { flushing = false }
         var attempts: [Int64: Int] = [:]
-        while true {
-            flushPending = false
-            guard let op = store.ops(account: account.id).first else {
-                if flushPending { continue } else { break }
-            }
+        // Ops left queued by this flush (their folder can't be selected right now); retried next time.
+        var skipped = Set<Int64>()
+        while !stopped {
+            guard let op = store.ops(account: account.id).first(where: { !skipped.contains($0.id) }) else { break }
             // Resolve by folder id first: a queued action must follow its folder across a rename (C-28).
             // Ops queued by older builds have no id and still rely on the path they recorded.
             let byID = op.folderID != 0 ? store.folder(op.folderID) : nil
-            guard let f = byID ?? store.folder(account: account.id, path: op.folderPath), f.selectable else {
+            guard let f = byID ?? store.folder(account: account.id, path: op.folderPath) else {
                 store.removeOp(op.id) // Folder is gone; its ops were already reset with it.
+                continue
+            }
+            guard f.selectable else {
+                // The folder still exists but can't be opened right now (\Noselect): the action stays
+                // queued. Dropping it would leave rows removed here that the server still has.
+                skipped.insert(op.id)
                 continue
             }
             if op.uidvalidity != 0, f.uidValidity != 0, op.uidvalidity != f.uidValidity {
@@ -969,7 +1042,11 @@ final class AccountEngine {
             do {
                 try await syncGate.run {
                     let c = try await client(.sync)
-                    try self.verifySelection(try await c.ensureSelected(f.path, readOnly: false), folder: f)
+                    let info = try await c.ensureSelected(f.path, readOnly: false)
+                    try self.verifySelection(info, folder: f)
+                    // Checked against the server, not only the cache: right after a reset the cached
+                    // value is 0 and would let UIDs from the old numbering through.
+                    if op.uidvalidity != 0, info.uidValidity != 0, op.uidvalidity != info.uidValidity { throw StaleOp() }
                     switch opKind {
                     case .flag(let set, let flag): try await c.store(op.uids, "\(set ? "+" : "-")FLAGS.SILENT (\(flag))")
                     case .move(let dest): try await c.move(op.uids, to: dest)
@@ -978,12 +1055,20 @@ final class AccountEngine {
                 }
                 store.removeOp(op.id)
                 attempts[op.id] = nil
+            } catch is StaleOp {
+                // The folder was renumbered: these UIDs name other messages now. The next sync of the
+                // folder lists what it really holds.
+                store.removeOp(op.id)
+                continue
             } catch let e as NetError {
                 if case .server(let m) = e, !Self.isTemporaryRefusal(m) {
                     // The server refused it for good; don't retry forever.
                     store.removeOp(op.id)
                     report(e)
-                    if opKind.needsRefetchOnRefusal { await refetchHeaders(folder: f, uids: op.uids) }
+                    if opKind.needsRefetchOnRefusal {
+                        unsettledSources.insert(f.id)
+                        await refetchHeaders(folder: f, uids: op.uids)
+                    }
                     continue
                 }
                 report(e)
@@ -994,7 +1079,10 @@ final class AccountEngine {
                 if n >= 3 {
                     // Temporary refusal that won't clear: give up and undo the optimistic local delete.
                     store.removeOp(op.id)
-                    if opKind.needsRefetchOnRefusal { await refetchHeaders(folder: f, uids: op.uids) }
+                    if opKind.needsRefetchOnRefusal {
+                        unsettledSources.insert(f.id)
+                        await refetchHeaders(folder: f, uids: op.uids)
+                    }
                 } else {
                     attempts[op.id] = n
                     try? await Task.sleep(nanoseconds: UInt64(2_000_000_000 << (n - 1)))
@@ -1008,8 +1096,9 @@ final class AccountEngine {
 
     /// A move/delete was refused after the local rows were already removed: re-fetch the headers so the
     /// messages reappear instead of vanishing until the next full resync.
-    private func refetchHeaders(folder: Folder, uids: [UInt32]) async {
-        guard !uids.isEmpty else { return }
+    @discardableResult
+    func refetchHeaders(folder: Folder, uids: [UInt32]) async -> Bool {
+        guard !uids.isEmpty else { return true }
         do {
             let headers = try await syncGate.run { () async throws -> [ParsedHeader] in
                 let c = try await client(.sync)
@@ -1018,8 +1107,10 @@ final class AccountEngine {
             }
             try store.insertChecked(folderID: folder.id, headers)
             NotificationCenter.default.postMailDataChanged(.folder(folder.id))
+            return true
         } catch {
             report(error)
+            return false
         }
     }
 
@@ -1065,12 +1156,16 @@ final class AccountEngine {
         let data = try await Task.detached(priority: .userInitiated) { try MessageBuilder.build(message) }.value
         try await SMTPClient.send(endpoint, from: account.email, recipients: message.allRecipients, message: data,
                                   progress: progress)
-        if !isGmail, let sent = store.folder(account: account.id, role: .sent) {
+        await fileSentCopy(data)
+    }
+
+    /// After SMTP accepted a message: files the copy in Sent where the server doesn't do it itself, and
+    /// refreshes Sent. Used by the direct send and by the outbox, so both report a copy that couldn't be filed.
+    func fileSentCopy(_ data: Data) async {
+        guard let sent = store.folder(account: account.id, role: .sent) else { return }
+        if !isGmail {
             do {
-                try await syncGate.run {
-                    let c = try await client(.sync)
-                    try await c.append(sent.path, flags: "\\Seen", message: data)
-                }
+                try await appendCopy(data, to: sent)
             } catch {
                 // The message went out; failing to file the copy must not read as a failed send.
                 report(NetError.server("The message was sent, but filing it in \"\(sent.name)\" failed: "
@@ -1078,8 +1173,9 @@ final class AccountEngine {
             }
         }
         // Gmail (and other servers) need a moment to file the sent copy before the Sent sync runs.
-        if let sent = store.folder(account: account.id, role: .sent) {
-            Task { try? await Task.sleep(nanoseconds: 3_000_000_000); await self.sync(folderID: sent.id) }
+        Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 3_000_000_000)
+            await self?.sync(folderID: sent.id)
         }
     }
 }

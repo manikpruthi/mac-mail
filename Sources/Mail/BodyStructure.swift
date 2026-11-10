@@ -64,6 +64,9 @@ struct BodyPart: Codable, Equatable {
         if v.count > 3, let cid = v[3].text { part.contentID = cid.trimmingCharacters(in: CharacterSet(charactersIn: "<> ")) }
         if v.count > 5, let enc = v[5].text { part.encoding = enc.lowercased() }
         if v.count > 6, let size = v[6].number { part.size = Int(clamping: min(size, UInt64(1 << 30))) }
+        // Index of the first extension field (md5); the disposition follows it. After the seven basic
+        // fields, text parts carry a line count (index 7), and message/rfc822 parts carry an envelope,
+        // a body structure and a line count (7, 8, 9) — RFC 3501 §7.4.2 — so md5 is at 7, 8 or 10.
         var extStart = 7
         if part.type == "text" { extStart = 8 }
         if part.type == "message" && part.subtype == "rfc822" { extStart = 10 }

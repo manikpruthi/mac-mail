@@ -53,7 +53,7 @@ enum SMTPClient {
                     throw fired.didFire ? NetError.timeout : error
                 }
                 lines += 1
-                totalBytes += line.utf8.count + 1
+                totalBytes += line.utf8.count + 2 // the line's CRLF
                 // Both a line-count and a total-size cap: a broken server must not grow the reply forever.
                 guard lines < 1000, totalBytes <= 64 * 1024 else { throw NetError.protocolError("reply too long") }
                 text += line + "\n"
@@ -139,7 +139,8 @@ enum SMTPClient {
         let session = try await open(e, progress: progress)
         defer { Task { await session.s.close() } }
         _ = try await session.expect(250...250, after: "MAIL FROM:<\(from)>")
-        for r in recipients { _ = try await session.expect(250...251, after: "RCPT TO:<\(r)>") }
+        // 251 (will forward) and 252 (can't verify, will try delivery) are both acceptances.
+        for r in recipients { _ = try await session.expect(250...252, after: "RCPT TO:<\(r)>") }
         _ = try await session.expect(354...354, after: "DATA")
         let payload = dotStuffed(message)
         // Uploaded in slices, so progress is reported and a stalled uplink trips the idle watchdog

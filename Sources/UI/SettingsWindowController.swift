@@ -176,9 +176,23 @@ final class SettingsWindowController: NSWindowController, NSTableViewDataSource,
     @objc private func reloadAccounts() {
         // An account added, edited or removed elsewhere must not silently drop text typed here.
         commitDetails(for: loadedAccountID)
-        table.reloadData()
-        if table.selectedRow < 0 && !MailService.shared.accounts.isEmpty { table.selectRowIndexes([0], byExtendingSelection: false) }
+        reloadKeepingSelection()
         loadDetails()
+    }
+
+    /// Reloads the accounts table and selects the account that was selected before, by id: rows shift
+    /// when an account is added or removed, and the pane must not jump to a different account.
+    private func reloadKeepingSelection() {
+        let keep = selectedAccount?.id ?? loadedAccountID
+        table.reloadData()
+        let list = MailService.shared.accounts
+        if let i = list.firstIndex(where: { $0.id == keep }) {
+            table.selectRowIndexes([i], byExtendingSelection: false)
+        } else if !list.isEmpty {
+            table.selectRowIndexes([0], byExtendingSelection: false)
+        } else {
+            table.deselectAll(nil)
+        }
     }
 
     private var selectedAccount: Account? {
@@ -336,7 +350,7 @@ final class SettingsWindowController: NSWindowController, NSTableViewDataSource,
     @objc private func makeDefault() {
         guard let a = selectedAccount else { return }
         Prefs.defaultAccountID = a.id
-        table.reloadData()
+        reloadKeepingSelection()
     }
 
     func numberOfRows(in tableView: NSTableView) -> Int { MailService.shared.accounts.count }
@@ -513,7 +527,14 @@ final class SettingsWindowController: NSWindowController, NSTableViewDataSource,
             guard r == .OK, let url = panel.url else { return }
             // Reading the log and writing the copy are file I/O; they never run on the main thread.
             DispatchQueue.global(qos: .utility).async {
-                try? DiagnosticsLog.export(to: url)
+                do { try DiagnosticsLog.export(to: url) } catch {
+                    // A report that wasn't written must not look like one that was.
+                    DispatchQueue.main.async {
+                        let a = NSAlert(error: error)
+                        a.messageText = "Couldn't export the diagnostics log"
+                        a.present(in: w)
+                    }
+                }
             }
         }
     }

@@ -285,10 +285,12 @@ final class PreviewViewController: NSViewController, WKNavigationDelegate, WKUID
     /// Fetches the message text and renders it. `fetchingID` stops a second fetch for the same message,
     /// since both show() and restoreWebViewIfNeeded() come through here (F-03).
     private func fetchBody(for d: MessageDetail) {
-        guard fetchingID != d.id else { return }
-        fetchingID = d.id
+        // Cleared on every selection, also when this message's fetch is already running: coming back
+        // to it from another message would otherwise leave that other message's text under this header.
         ensureWebView().loadHTMLString("", baseURL: nil)
         spinner.startAnimation(nil)
+        guard fetchingID != d.id else { return }
+        fetchingID = d.id
         let id = d.id
         Task {
             defer { if fetchingID == id { fetchingID = nil } }
@@ -597,7 +599,9 @@ final class PreviewViewController: NSViewController, WKNavigationDelegate, WKUID
         config.mediaTypesRequiringUserActionForPlayback = .all
         config.allowsAirPlayForMediaPlayback = false
         if #available(macOS 14.0, *) { config.preferences.isTextInteractionEnabled = true }
-        // Click-to-load for held-back images. Runs in the app's own script world; the email's scripts stay disabled.
+        // Click-to-load for held-back images. Runs in the app's own script world (WKContentWorld.defaultClient
+        // is the client's isolated world, separate from .page where a page's scripts live); the email's
+        // scripts stay disabled.
         let js = """
         document.addEventListener('click', function(e){
           var t = e.target;
@@ -616,7 +620,7 @@ final class PreviewViewController: NSViewController, WKNavigationDelegate, WKUID
         let w = WKWebView(frame: .zero, configuration: config)
         w.navigationDelegate = self
         w.uiDelegate = self
-        w.setValue(false, forKey: "drawsBackground")
+        w.makeBackgroundTransparent()
         w.allowsMagnification = true
         w.pageZoom = readingZoom
         w.translatesAutoresizingMaskIntoConstraints = false

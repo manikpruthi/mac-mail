@@ -423,6 +423,55 @@ MainActor.assumeIsolated {
         store.restore(snap.removing(ids: [id + 1_000_000]))
         check("split undo keeps the rest", store.rows(ids: [id]).count == 1 && store.body(id) != nil)
     }
+    // NB-40: ids are plain rowids, so mail that arrives during an Undo window can take the id a deleted
+    // row just freed. The restored row must come back under a new id, with its own body.
+    do {
+        var newest = fixed
+        newest.uid = 9001
+        newest.subject = "Reused id original"
+        store.insert(folderID: inbox.id, [newest])
+        if let oldID = store.messageID(folderID: inbox.id, uid: 9001) {
+            store.saveBody(oldID, html: nil, text: "original body zebra")
+            let snap = store.snapshot(ids: [oldID])
+            store.deleteMessages(ids: [oldID])
+            var arrival = fixed
+            arrival.uid = 9002
+            arrival.subject = "Arrived during undo"
+            store.insert(folderID: inbox.id, [arrival])
+            let arrivalID = store.messageID(folderID: inbox.id, uid: 9002)
+            check("freed row id is reused by new mail", arrivalID == oldID)
+            check("restore reports success", store.restore(snap))
+            let restoredID = store.messageID(folderID: inbox.id, uid: 9001)
+            check("restored row survives an id collision", restoredID != nil && restoredID != arrivalID)
+            check("restored body follows its own message", restoredID.flatMap { store.body($0)?.text } == "original body zebra"
+                  && arrivalID.flatMap { store.body($0) } == nil)
+            check("restored body is searchable under the new id",
+                  store.search(SearchQuery.parse("zebra")).map { $0.uid } == [9001])
+            store.deleteMessages(folderID: inbox.id, uids: [9001, 9002])
+        } else { check("restore test row inserted", false) }
+    }
+    // NB-59: a corrected sender name reaches autocomplete; a changed address moves the count.
+    do {
+        var a = fixed
+        a.uid = 9101
+        a.from = EmailAddress(name: "Old Name", email: "renamed@example.com")
+        store.insert(folderID: inbox.id, [a])
+        a.from = EmailAddress(name: "New Name", email: "renamed@example.com")
+        store.insert(folderID: inbox.id, [a])
+        check("contacts follow a corrected name", store.contacts(matching: "renamed@").first?.name == "New Name")
+        a.from = EmailAddress(name: "New Name", email: "moved@example.com")
+        store.insert(folderID: inbox.id, [a])
+        check("contacts follow a changed address", store.contacts(matching: "renamed@").isEmpty
+              && store.contacts(matching: "moved@").count == 1)
+        store.deleteMessages(folderID: inbox.id, uids: [9101])
+        check("contact leaves with its last message", store.contacts(matching: "moved@").isEmpty)
+    }
+    check("undo journal prefs listed by prefix", {
+        store.setPref("undo.A", "1"); store.setPref("undo.B", "2"); store.setPref("other", "3")
+        let keys = store.prefs(prefix: "undo.").map { $0.key }
+        store.setPref("undo.A", nil); store.setPref("undo.B", nil); store.setPref("other", nil)
+        return keys == ["undo.A", "undo.B"]
+    }())
     // B-14: deleting an account leaves no FTS rows or contacts behind.
     store.deleteAccount("acc")
     let ftsLeft = store.db.scalarInt("SELECT COUNT(*) FROM fts") ?? -1
@@ -874,10 +923,18 @@ final class FakeIMAP: ByteTransport, @unchecked Sendable {
     /// Conditional STOREs report these UIDs as [MODIFIED] and flag them as another client would have.
     var modifiedOnStore: Set<UInt32> = []
     var untaggedBeforeIdle = false
+    var greeting = "* OK ready"
+    /// UIDs another client un-flags right after our STORE flagged them (H-09).
+    var unflagAfterStore: Set<UInt32> = []
     private(set) var commands: [String] = []
+    /// Literal uploads (APPEND): the octets received, and whether the command line ended with exactly
+    /// one CRLF after them.
+    private(set) var literals: [Data] = []
+    private(set) var literalFramingOK = true
+    private var pendingLiteral: (tag: String, size: Int)?
 
     func setClosedHandler(_ handler: @escaping @Sendable () -> Void) {}
-    func open() async throws { push("* OK ready\r\n") }
+    func open() async throws { push(greeting + "\r\n") }
     func startTLS() async throws {}
     func discardBuffered() {}
     func close() {
@@ -902,18 +959,40 @@ final class FakeIMAP: ByteTransport, @unchecked Sendable {
     }
 
     func send(_ data: Data) async throws {
-        for l in takeLines(data) { push(answer(l)) }
+        for reply in take(data) { push(reply) }
     }
 
-    private func takeLines(_ data: Data) -> [String] {
+    /// Consumes what arrived: command lines, and after a line ending in "{n}" exactly n literal octets
+    /// followed by the CRLF that ends the command (RFC 3501 §4.3).
+    private func take(_ data: Data) -> [String] {
         lock.lock(); defer { lock.unlock() }
         inbox.append(data)
-        var lines: [String] = []
-        while let r = inbox.range(of: Data("\r\n".utf8)) {
-            lines.append(String(decoding: inbox.subdata(in: inbox.startIndex..<r.lowerBound), as: UTF8.self))
+        var replies: [String] = []
+        while true {
+            if let p = pendingLiteral {
+                guard inbox.count >= p.size + 2 else { break }
+                literals.append(inbox.subdata(in: inbox.startIndex..<inbox.startIndex + p.size))
+                inbox.removeSubrange(inbox.startIndex..<inbox.startIndex + p.size)
+                if inbox.prefix(2) != Data("\r\n".utf8) { literalFramingOK = false }
+                inbox.removeSubrange(inbox.startIndex..<inbox.startIndex + 2)
+                pendingLiteral = nil
+                replies.append("\(p.tag) OK [APPENDUID 7 55] done\r\n")
+                continue
+            }
+            guard let r = inbox.range(of: Data("\r\n".utf8)) else { break }
+            let line = String(decoding: inbox.subdata(in: inbox.startIndex..<r.lowerBound), as: UTF8.self)
             inbox.removeSubrange(inbox.startIndex..<r.upperBound)
+            if line.hasSuffix("}"), let open = line.lastIndex(of: "{"), let n = Int(line[line.index(after: open)...].dropLast()) {
+                commands.append(String(line[(line.firstIndex(of: " ") ?? line.startIndex)...].dropFirst()))
+                pendingLiteral = (String(line.prefix { $0 != " " }), n)
+                replies.append("+ go ahead\r\n")
+                continue
+            }
+            // An empty line is not a command: a client that sends one after a literal is out of step.
+            if line.isEmpty { literalFramingOK = false; continue }
+            replies.append(answer(line))
         }
-        return lines
+        return replies
     }
 
     private func uids(_ set: String) -> [UInt32] {
@@ -937,6 +1016,7 @@ final class FakeIMAP: ByteTransport, @unchecked Sendable {
         var out = ""
         var code = ""
         if cmd.hasPrefix("LOGIN") { code = "[CAPABILITY \(capabilities)] " }
+        else if cmd == "CAPABILITY" { out += "* CAPABILITY \(capabilities)\r\n" }
         else if cmd.hasPrefix("SELECT") || cmd.hasPrefix("EXAMINE") {
             let name = words[1].trimmingCharacters(in: CharacterSet(charactersIn: "\""))
             if refuseSelect.contains(name) { return "\(tag) NO no such mailbox\r\n" }
@@ -948,7 +1028,10 @@ final class FakeIMAP: ByteTransport, @unchecked Sendable {
         } else if cmd == "UID SEARCH DELETED" {
             out += "* SEARCH " + deleted.filter { $0.value }.keys.sorted().map(String.init).joined(separator: " ") + "\r\n"
         } else if cmd.hasPrefix("UID SEARCH UID ") {
-            let hits = uids(words[3]).filter { !cmd.hasSuffix("DELETED") || deleted[$0] == true }
+            let hits = uids(words[3]).filter {
+                if cmd.hasSuffix("UNDELETED") { return deleted[$0] != true }
+                return !cmd.hasSuffix("DELETED") || deleted[$0] == true
+            }
             out += "* SEARCH " + hits.map(String.init).joined(separator: " ") + "\r\n"
         } else if cmd.hasPrefix("UID FETCH ") {
             for (i, u) in uids(words[2]).enumerated() {
@@ -960,6 +1043,7 @@ final class FakeIMAP: ByteTransport, @unchecked Sendable {
             for u in uids(words[2]) {
                 if conditional, modifiedOnStore.contains(u) { refused.append(u); deleted[u] = true; continue }
                 deleted[u] = cmd.contains("+FLAGS")
+                if cmd.contains("+FLAGS"), unflagAfterStore.contains(u) { deleted[u] = false }
             }
             if !refused.isEmpty { code = "[MODIFIED \(refused.map(String.init).joined(separator: ","))] " }
         } else if cmd.hasPrefix("UID EXPUNGE ") {
@@ -1079,14 +1163,172 @@ runAsync {
         out.append(("expunge spares another client's pending deletion", refused && s.deleted == [1: false, 2: true, 3: false]))
     } catch { out.append(("expunge spares another client's pending deletion", false)) }
 
+    // H-09: a message un-flagged by another client after our STORE must not be reported as emptied.
+    (c, s) = fakeClient { $0.capabilities = "IMAP4rev1 UIDPLUS"; $0.unflagAfterStore = [3] }
+    ok = await emptied(c)
+    out.append(("un-flag after STORE stops the emptying", !ok && !s.commands.contains { $0.hasPrefix("UID EXPUNGE") }
+                && s.deleted == [1: false, 2: true, 3: false]))
+
+    // APPEND: the literal's octets, then exactly one CRLF ending the command; APPENDUID is returned.
+    (c, s) = fakeClient()
+    do {
+        try await c.connect()
+        let message = Data("Subject: x\r\n\r\nline one\r\n.\r\nlast".utf8)
+        let uid = try await c.append("Drafts", flags: "\\Draft", message: message)
+        let after = try await c.uidSearch("ALL")
+        out.append(("APPEND sends the literal and one closing CRLF", s.literals == [message] && s.literalFramingOK))
+        out.append(("APPEND returns APPENDUID and stays in step", uid == 55 && after == [1, 2, 3]))
+    } catch { out.append(("APPEND sends the literal and one closing CRLF", false)) }
+
+    // PREAUTH: already signed in, so no LOGIN is sent and capabilities are asked for.
+    (c, s) = fakeClient { $0.greeting = "* PREAUTH welcome back" }
+    do {
+        try await c.connect()
+        let caps = await c.hasIdle
+        out.append(("PREAUTH skips LOGIN", !s.commands.contains { $0.hasPrefix("LOGIN") } && caps))
+    } catch { out.append(("PREAUTH skips LOGIN", false)) }
+
+    // MOVE-less server without UIDPLUS: another client's pending deletion refuses the move before the
+    // COPY, so a retry can't leave a second copy in the destination.
+    (c, s) = fakeClient { $0.capabilities = "IMAP4rev1" }
+    do {
+        try await c.connect(); try await c.select("Trash")
+        var refused = false
+        do { try await c.move([1], to: "Archive") } catch { refused = true }
+        out.append(("blocked move copies nothing", refused && !s.commands.contains { $0.hasPrefix("UID COPY") }
+                    && s.deleted == [1: false, 2: true, 3: false]))
+    } catch { out.append(("blocked move copies nothing", false)) }
+
     out.append(("MODIFIED code parsed", IMAPClient.modifiedUIDs("MODIFIED 7,9:11") == [7, 9, 10, 11]
-                && IMAPClient.modifiedUIDs("READ-WRITE").isEmpty))
+                && IMAPClient.modifiedUIDs("READ-WRITE") == []
+                && IMAPClient.modifiedUIDs("MODIFIED 1:4000000000") == nil && IMAPClient.modifiedUIDs("MODIFIED 7,x") == nil))
     return out
 }
 
 // A flag-only FETCH that lands inside a header fetch is not a message row.
 let strayFetch = FetchResult.from(IMAPParser.parse(parts(["* 5 FETCH (UID 99 FLAGS (\\Seen))"])))
 check("unsolicited flag FETCH is not stored as a header", strayFetch != nil && IMAPClient.parseHeader(strayFetch!, gmail: false) == nil)
+
+// NB-01: a hostile RFC822.SIZE must not trap.
+let hugeSize = FetchResult.from(IMAPParser.parse(parts(["* 1 FETCH (UID 5 RFC822.SIZE 18446744073709551615 BODY[HEADER.FIELDS (FROM)] {0}", ")"], literals: [""])))
+check("huge RFC822.SIZE clamps", hugeSize.flatMap { IMAPClient.parseHeader($0, gmail: false) }?.size == Int.max)
+
+// NB-38: a display name that needs several encoded words must not put an empty line into the headers.
+do {
+    let longName = String(repeating: "山田太郎", count: 12)
+    let m = OutgoingMessage(from: EmailAddress(name: longName, email: "m@example.com"),
+                            to: [EmailAddress(name: longName, email: "a@example.com"), EmailAddress(name: "Zoë " + longName, email: "b@example.com")],
+                            cc: [EmailAddress(name: longName, email: "c@example.com")], bcc: [], subject: longName + " " + longName,
+                            textBody: "BODYTEXT", htmlBody: "<p>BODYTEXT</p>", inReplyTo: nil, references: nil, attachments: [])
+    let raw = String(data: (try? MessageBuilder.build(m)) ?? Data(), encoding: .utf8) ?? ""
+    let headerBlock = raw.components(separatedBy: "\r\n\r\n").first ?? ""
+    check("long encoded names keep the header block whole", headerBlock.contains("MIME-Version: 1.0") && headerBlock.contains("Content-Type:")
+          && headerBlock.contains("Cc: "))
+    check("no header line over 78 bytes or blank", headerBlock.components(separatedBy: "\r\n").filter { !$0.hasPrefix("Content-Type:") }
+            .allSatisfy { !$0.trimmingCharacters(in: .whitespaces).isEmpty && $0.utf8.count <= 78 })
+    let parsed = MIME.parseHeaders(Data(headerBlock.utf8))
+    let to = MIME.parseAddresses(parsed["to"] ?? "")
+    check("long encoded names round-trip", to.map { $0.email } == ["a@example.com", "b@example.com"] && to.first?.name == longName
+          && to.last?.name == "Zoë " + longName && MIME.parseAddresses(parsed["from"] ?? "").first?.name == longName
+          && parsed["subject"] == longName + " " + longName)
+    check("foldHeader never folds twice", !MessageBuilder.foldHeader("To: " + String(repeating: "=?UTF-8?B?QUJD?=\r\n ", count: 9) + "<a@b.c>").contains("\r\n\r\n"))
+    var long = m
+    long.subject = String(repeating: "x", count: 1500)
+    let longRaw = String(data: (try? MessageBuilder.build(long)) ?? Data(), encoding: .utf8) ?? ""
+    check("space-less subject stays under the line limit", (longRaw.components(separatedBy: "\r\n\r\n").first ?? "")
+            .components(separatedBy: "\r\n").filter { !$0.hasPrefix("Content-Type:") }.allSatisfy { $0.utf8.count <= 78 }
+          && MIME.parseHeaders(Data(longRaw.utf8))["subject"] == long.subject)
+}
+
+// NB-39 / H-10 / NB-32: comments, encoded words and groups never split or invent an address.
+check("comment with separator stays one address", MIME.parseAddresses("me@mine.com (; note) <attacker@evil.com>").count == 1
+      && MIME.parseAddresses("Ann (Team; EU, sales) <ann@x.com>, b@y.com").map { $0.email } == ["ann@x.com", "b@y.com"])
+check("unclosed comment doesn't swallow the list", MIME.parseAddresses("a@x.com (oops, b@y.com").map { $0.email } == ["a@x.com", "b@y.com"]
+      && MIME.parseAddresses("a@x.com (oops").map { $0.email } == ["a@x.com"])
+check("encoded word with a literal comma stays one address",
+      MIME.parseAddresses(MIME.parseHeaders(Data("To: =?UTF-8?Q?M=C3=BCller,_Hans;_Dr?= <hans@x.de>, bob@y.com\r\n".utf8))["to"] ?? "").map { $0.email } == ["hans@x.de", "bob@y.com"]
+      && MIME.parseAddresses(MIME.parseHeaders(Data("To: =?UTF-8?Q?M=C3=BCller,_Hans;_Dr?= <hans@x.de>\r\n".utf8))["to"] ?? "").first?.name == "Müller, Hans; Dr")
+check("group syntax yields only real addresses", MIME.parseAddresses("undisclosed-recipients:;").isEmpty
+      && MIME.parseAddresses("Team: a@x.com, Bob <b@y.com>;, c@z.com").map { $0.email } == ["a@x.com", "b@y.com", "c@z.com"]
+      && MIME.parseAddresses("mailto:a@x.com").map { $0.email } == ["a@x.com"])
+check("name with parentheses round-trips", MIME.parseAddresses(EmailAddress(name: "Bob (Sales; EU)", email: "b@x.com").full) == [EmailAddress(name: "Bob (Sales; EU)", email: "b@x.com")])
+
+// NB-63: address syntax, unterminated parameter quotes, unclosed script text.
+check("addr rejects stray dots", !MailSafety.isValidAddrSpec("a..b@x.com") && !MailSafety.isValidAddrSpec(".a@x.com")
+      && !MailSafety.isValidAddrSpec("a@x..com") && !MailSafety.isValidAddrSpec("a@x.com.") && MailSafety.isValidAddrSpec("a.b@x.co")
+      && MailSafety.isValidAddrSpec("user@localhost"))
+let looseParams = EMLDocument.parseParams("multipart/mixed; name=\"broken; boundary=abc; charset=utf-8")
+check("unterminated quote keeps later parameters", looseParams.1["boundary"] == "abc" && looseParams.1["charset"] == "utf-8")
+check("quoted parameter still honoured", EMLDocument.parseParams("text/plain; name=\"a;b\"; charset=utf-8").1 == ["name": "a;b", "charset": "utf-8"])
+check("unclosed script is not snippet text", MIME.plainText(fromHTML: "<p>Hello</p><script>var secret = 1;") == "Hello")
+check("index cap is in bytes", Store.utf8Prefix(String(repeating: "日", count: 30_000), 65_536).utf8.count == 65_535
+      && Store.utf8Prefix("short", 65_536) == "short")
+
+// NB-50 / NB-36: operators after a comma, values with a colon, quotes in Gmail terms.
+let sqComma = SearchQuery.parse("from:divya,to:bob")
+check("comma before an operator splits", sqComma.from == ["divya"] && sqComma.to == ["bob"])
+let sqColon = SearchQuery.parse("from: a:b invoice")
+check("value with a colon is kept", sqColon.from == ["a:b"] && sqColon.words == ["invoice"])
+check("operator after a bare operator isn't swallowed", SearchQuery.parse("from: to:bob").to == ["bob"])
+check("plain comma stays in the value", SearchQuery.parse("subject:a,b").subject == ["a,b"])
+var sqQuote = SearchQuery()
+sqQuote.words = ["say \"hi\" now"]
+check("gmail raw has balanced quotes", sqQuote.gmailRaw == "\"say hi now\"")
+
+// NB-03 / NB-48 / NB-49: the quote sanitiser reads tags and links the way a browser does.
+do {
+    let smuggled = HTMLPrep.quoteSanitized(#"<a href="x>" onclick="steal()">a</a><a title="t"onmouseover="steal()"href="javascript:1">b</a>"#)
+    check("handler behind a quoted > is removed", !smuggled.contains("onclick") && !smuggled.contains("onmouseover")
+          && !smuggled.lowercased().contains("javascript") && smuggled.contains(#"href="x>""#))
+    let entities = HTMLPrep.quoteSanitized(#"<a href="javascript&colon;alert(1)">a</a><a href="java&Tab;script:alert(1)">b</a><a href="&#106avascript&#58alert(1)">c</a><a href="&#x6A;avascript:alert(1)">d</a><a href="https://ok.example/?a=1&b=2">e</a><a href="mailto:a@b.c">f</a><a href="/rel?x=1&amp;y=2">g</a>"#)
+    check("entity-spelled script links are neutralised", entities.components(separatedBy: "href=\"#\"").count == 5
+          && entities.contains("https://ok.example/?a=1&b=2") && entities.contains("mailto:a@b.c") && entities.contains("/rel?x=1&amp;y=2"))
+    check("link allowlist", HTMLPrep.isSafeLink("HTTPS://x.y") && HTMLPrep.isSafeLink("#top") && HTMLPrep.isSafeLink("page.html")
+          && !HTMLPrep.isSafeLink("data:text/html,x") && !HTMLPrep.isSafeLink(" vbscript:x") && !HTMLPrep.isSafeLink("j&unknown;x"))
+    let imgs = HTMLPrep.quoteSanitized(#"<img alt="a>b" src="https://ok.example/i.png"><img alt=">" src="http://bad.example/i.png"><p>kept</p>"#)
+    check("image with > in an attribute is judged whole", imgs.contains("https://ok.example/i.png") && !imgs.contains("bad.example")
+          && imgs.contains("<p>kept</p>") && !imgs.contains("src=\"http://"))
+    let open = HTMLPrep.quoteSanitized(#"<p>before</p><a href="never closed onclick=steal()"#)
+    check("unterminated tag becomes text", open.contains("<p>before</p>") && open.contains("&lt;a href") && !open.contains("<a "))
+    let shown = HTMLPrep.prepare(html: #"<img alt="x>y" src="https://img.example/a.png" width="300"><b>t</b>"#, text: nil)
+    check("display rewrites an image with > in an attribute", shown.remote.count == 1 && !shown.html.contains("https://img.example")
+          && shown.html.contains("<b>t</b>"))
+    let imported = HTMLPrep.withoutRemoteContent(#"<p style="background:url(https://t.example/b.png)">x<img src="https://t.example/a.png"><img src="cid:logo"><img src="data:image/gif;base64,AA=="></p><link rel="stylesheet" href="https://t.example/s.css">"#)
+    check("draft import carries no remote references", !imported.contains("t.example") && imported.contains("cid:logo")
+          && imported.contains("data:image/gif") && imported.contains("[image]"))
+}
+
+// NB-09: one unreadable account entry neither hides nor erases the others.
+do {
+    let good = Account.gmail(email: "keep@example.com", name: "Keep")
+    let goodJSON = String(data: (try? JSONEncoder().encode(good)) ?? Data(), encoding: .utf8) ?? "{}"
+    let mixed = Data("[\(goodJSON), {\"id\":\"future\",\"provider\":\"from-a-newer-build\",\"extra\":[1,2.5,null,true]}]".utf8)
+    let decoded = Prefs.decodeAccounts(mixed)
+    check("readable accounts survive an unreadable one", decoded.accounts == [good] && decoded.unreadable.count == 1)
+    var edited = good
+    edited.signature = "changed"
+    let saved = Prefs.encodeAccounts([edited], keeping: decoded.unreadable)
+    let again = Prefs.decodeAccounts(saved)
+    check("saving keeps the unreadable entry", again.accounts == [edited] && again.unreadable.count == 1
+          && String(data: again.unreadable[0], encoding: .utf8)?.contains("from-a-newer-build") == true)
+    check("garbage account data reads as empty", Prefs.decodeAccounts(Data("not json".utf8)).accounts.isEmpty)
+}
+
+// NB-05 / NB-24: a delivered outbox message is never offered for sending again.
+MainActor.assumeIsolated {
+    let dir = scratchDir("outbox-delivered")
+    let box = Outbox(directory: dir)
+    let msg = OutgoingMessage(from: EmailAddress(name: "", email: "m@example.com"), to: [EmailAddress(name: "", email: "z@example.com")],
+                              cc: [], bcc: [], subject: "s", textBody: "b", htmlBody: "b", inReplyTo: nil, references: nil, attachments: [])
+    try? box.add(msg, accountID: "acct", replyToID: nil, draftToDeleteID: nil, safetyDraftID: nil)
+    if let id = box.items.first?.id {
+        box.markDelivered(id)
+        check("delivered flag recorded", box.items.first?.wasDelivered == true)
+        // A crash here leaves the folder behind: the next launch finishes the delete instead of re-sending.
+        check("delivered item is cleaned up on relaunch", Outbox(directory: dir).items.isEmpty
+              && !FileManager.default.fileExists(atPath: dir.appendingPathComponent(id).path))
+    } else { check("outbox item added", false) }
+}
 
 print(failures == 0 ? "ALL PASS" : "\(failures) FAILED")
 exit(failures == 0 ? 0 : 1)

@@ -178,7 +178,7 @@ struct EmailAddress: Hashable, Codable {
     var full: String {
         guard !name.isEmpty else { return email }
         let risky = name.contains { c in
-            ",;\"<>@".contains(c) || c.unicodeScalars.contains { $0.value < 0x20 || $0.value == 0x7f }
+            ",;:\"<>@()".contains(c) || c.unicodeScalars.contains { $0.value < 0x20 || $0.value == 0x7f }
         }
         guard risky else { return "\(name) <\(email)>" }
         let escaped = name.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")

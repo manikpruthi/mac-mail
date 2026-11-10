@@ -61,19 +61,25 @@ final class MessageWindowController: NSWindowController, NSWindowDelegate, NSToo
         // Size last: setting the toolbar and constraints can re-fit the window to the content's fitting size.
         w.setContentSize(Self.defaultSize)
         preview.onEditDraft = { d in ComposeWindowController.open(.draft(d, MailService.shared.store.body(d.id))) }
+        // The pane shows its welcome view when the last account is removed; its button must work here too.
+        preview.onAddAccount = { (NSApp.delegate as? AppDelegate)?.mainWindow?.addAccount() }
         preview.show(messageID: messageID)
         let subject = MailService.shared.store.detail(messageID)?.subject ?? ""
         w.title = subject.isEmpty ? "(no subject)" : subject
         // Cascade from the last message window so several don't stack exactly.
-        if let last = Self.open.values.compactMap({ $0.window }).last {
+        if let last = Self.lastOpened, last.isVisible {
             w.setFrameTopLeftPoint(NSPoint(x: last.frame.minX + 24, y: last.frame.maxY - 24))
         } else {
             w.center()
         }
+        Self.lastOpened = w
         NotificationCenter.default.addObserver(self, selector: #selector(dataChanged(_:)), name: .mailDataChanged, object: nil)
     }
 
     required init?(coder: NSCoder) { fatalError() }
+
+    /// The message window opened most recently (a dictionary has no order to take "the last" from).
+    private static weak var lastOpened: NSWindow?
 
     // Reading-pane zoom (View menu) works wherever focus is in this window, not only inside the web view.
     @objc func zoomInReading(_ sender: Any?) { preview.zoomIn() }
@@ -139,8 +145,10 @@ final class MessageWindowController: NSWindowController, NSWindowDelegate, NSToo
 
     @objc func toggleRead(_ sender: Any?) {
         guard let r = row else { return }
-        MailService.shared.setFlag([r], flag: .seen, on: !r.flags.contains(.seen))
-        toast.show(r.flags.contains(.seen) ? "Marked as read" : "Marked as unread")
+        let markRead = !r.flags.contains(.seen)
+        // Only a change that happened is announced (a refused cache write beeps instead).
+        guard MailService.shared.setFlag([r], flag: .seen, on: markRead) else { return }
+        toast.show(markRead ? "Marked as read" : "Marked as unread")
     }
 
     @objc func toggleFlag(_ sender: Any?) {
@@ -188,6 +196,9 @@ final class MessageWindowController: NSWindowController, NSWindowDelegate, NSToo
     @objc func printMessage(_ sender: Any?) { preview.printMessage() }
     @objc func toggleLightBackground(_ sender: Any?) { preview.toggleLight() }
 
+    // Only asked about actions this controller implements: AppKit validates a menu item with the first
+    // responder that responds to its action, so commands that belong to the main window (New Message,
+    // Empty Trash, Sync Now…) are validated by their own targets, not here.
     func validateMenuItem(_ item: NSMenuItem) -> Bool { row != nil }
     func validateToolbarItem(_ item: NSToolbarItem) -> Bool { row != nil }
 

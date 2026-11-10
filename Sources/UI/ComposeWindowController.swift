@@ -89,6 +89,13 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
         w.cascadeTopLeft(from: NSPoint(x: w.frame.minX + CGFloat(Self.open.count * 22), y: w.frame.maxY - CGFloat(Self.open.count * 22)))
         dirty = false
         if case .restored = kind { dirty = true }
+        // Files handed to a new composer (dropped on the Dock icon, Share, Open With) are content the
+        // user chose: prefill attached them, and clearing the flag above would let the window close
+        // without a prompt or an autosave, dropping them silently.
+        if case .files(let urls) = kind, !urls.isEmpty {
+            dirty = true
+            scheduleAutosave()
+        }
     }
 
     // MARK: Autosave and crash recovery (F-06)
@@ -100,9 +107,12 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
         DispatchQueue.global(qos: .utility).async {
             let records = ComposerAutosave.all()
             DispatchQueue.main.async {
+                // With no account at all there is nothing to compose from; the records wait on disk.
+                guard !MailService.shared.accounts.isEmpty else { return }
                 for record in records {
-                    // Only into the account it was written for: a fallback would send from the wrong address (C-27).
-                    guard MailService.shared.account(record.accountID) != nil else { continue }
+                    // A record whose account was removed is still unsent mail: it reopens with no From
+                    // account chosen (selectAccount records the missing one), and Send and Save ask for
+                    // one instead of quietly using another address (C-27).
                     open(.restored(record))
                 }
             }
@@ -120,7 +130,10 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
     private func autosaveNow() {
         // While a draft's body or images are still loading the editor holds placeholder text, so saving then
         // would record a body that can never get its images back; pipelineEnded schedules the save instead.
-        guard dirty, !sentOrDiscarded, pipelineTasks == 0, !waitingForDraftBody, let account else { return }
+        // The account id comes from the From popup even when that account has just been removed: the
+        // record must keep being written, or everything typed from then on is lost with a crash.
+        guard dirty, !sentOrDiscarded, pipelineTasks == 0, !waitingForDraftBody,
+              let accountID = missingAccountID ?? selectedAccountID ?? MailService.shared.defaultAccount?.id else { return }
         commitEditing()
         // textView.attributedString() is the live text storage. Everything that reads it or its
         // attachments happens here; the autosave queue only encodes a private copy.
@@ -130,7 +143,7 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
         let base = ComposerAutosave(
             // While the original account is gone, record it rather than the fallback the From popup shows:
             // restoring into another account would silently send from the wrong address (C-27).
-            id: autosaveID, accountID: missingAccountID ?? account.id,
+            id: autosaveID, accountID: accountID,
             to: (toField.objectValue as? [String]) ?? [], cc: (ccField.objectValue as? [String]) ?? [],
             bcc: (bccField.objectValue as? [String]) ?? [], subject: subjectField.stringValue,
             bodyRTF: nil, attachments: attachments.map { $0.url.path }, inReplyTo: inReplyTo, references: references,
@@ -334,8 +347,11 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
 
     private var attachmentHeight: NSLayoutConstraint?
 
+    /// The account id the From popup holds; it may name an account that was removed since.
+    private var selectedAccountID: String? { fromPopup.selectedItem?.representedObject as? String }
+
     private var account: Account? {
-        guard let id = fromPopup.selectedItem?.representedObject as? String else { return MailService.shared.defaultAccount }
+        guard let id = selectedAccountID else { return MailService.shared.defaultAccount }
         return MailService.shared.account(id)
     }
 
@@ -443,6 +459,7 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
                 includeOriginal.isHidden = false
                 includeOriginal.state = r.includeOriginal ? .on : .off
             }
+            if !r.quotedHTML.isEmpty { showRestoredQuote(r.quotedText) }
             draftRow = r.draftRowID.flatMap { MailService.shared.store.rows(ids: [$0]).first }
             replyRow = r.replyRowID.flatMap { MailService.shared.store.rows(ids: [$0]).first }
             status.stringValue = missingAttachments.isEmpty
@@ -549,6 +566,9 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
         // One fetch only: a draft that really is empty opens empty instead of re-fetching forever (B-02).
         guard hasContent || fetched else {
             waitingForDraftBody = true
+            // Read-only until the body is here: the fetched text replaces the whole editor, so anything
+            // typed meanwhile would be wiped (and was never autosaved).
+            textView.isEditable = false
             status.stringValue = "Loading draft…"
             let id = d.id
             Task { [weak self] in
@@ -561,14 +581,22 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
                 } catch {
                     guard let self, !self.sentOrDiscarded else { return }
                     self.waitingForDraftBody = false
-                    self.status.stringValue = "Couldn't load the draft's body"
+                    // The editor stays read-only: typing into the empty editor and saving would replace
+                    // the real draft with whatever was typed.
+                    self.status.stringValue = "Couldn't load the draft's text. Close this window and open the draft again."
+                    self.status.textColor = .systemRed
                 }
             }
             return
         }
         waitingForDraftBody = false
+        textView.isEditable = true
         if let html = body?.html {
-            let (tokenized, cids) = InlineImage.tokenizeCIDImages(html)
+            // AppKit's HTML importer downloads whatever the markup points at, and a draft carries the
+            // quoted original with its remote images. Those are taken out first, so opening a draft
+            // never fetches anything the reading pane would have asked about. (The importer itself has
+            // to run on the main thread; AppKit does not support it anywhere else.)
+            let (tokenized, cids) = InlineImage.tokenizeCIDImages(HTMLPrep.withoutRemoteContent(html))
             if let data = tokenized.data(using: .utf8), let attr = NSAttributedString(html: data, documentAttributes: nil) {
                 textView.textStorage?.setAttributedString(attr)
             }
@@ -615,9 +643,13 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
         guard let storage = textView.textStorage else { return }
         let undo = textView.undoManager
         undo?.beginUndoGrouping()
+        // Images that couldn't be fetched and whose place in the text still exists. One the user deleted
+        // while it was downloading is not missing: they removed it.
+        var failed = 0
         for n in cids.indices {
             let r = (storage.string as NSString).range(of: InlineImage.token(n))
             guard r.location != NSNotFound else { continue }
+            if images[n] == nil { failed += 1 }
             let attributes = storage.attributes(at: r.location, effectiveRange: nil)
             let replacement = images[n].map { NSAttributedString(attachment: $0) }
                 ?? NSAttributedString(string: "[Image unavailable]", attributes: attributes)
@@ -627,8 +659,10 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
         }
         removeInlineTokens()
         undo?.endUndoGrouping()
-        let failed = cids.indices.filter { images[$0] == nil }.count
-        if failed > 0 { missingAttachments += Array(repeating: "Image in the message text", count: failed) }
+        if failed > 0 {
+            missingAttachments += Array(repeating: "Image in the message text", count: failed)
+            updateWarning()
+        }
     }
 
     /// Removes any token still left over, undoably.
@@ -673,7 +707,7 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
         let web = WKWebView(frame: .zero, configuration: config)
         web.navigationDelegate = self
         web.uiDelegate = self
-        web.setValue(false, forKey: "drawsBackground")
+        web.makeBackgroundTransparent()
         // Same image policy as the reading pane, including the per-sender choice (SEC-A10); Spam never auto-loads.
         let spam = d.folderRole == .spam
         let senderPref = MailService.shared.store.pref("img:" + d.from.email.lowercased())
@@ -745,6 +779,43 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
         split.adjustSubviews()
         if quotePane.isHidden, split.bounds.height > 0 { split.setPosition(split.bounds.height, ofDividerAt: 0) }
         dirty = true
+    }
+
+    /// The quote pane of a composer recovered from its autosave. The original message may be gone by
+    /// now, so the pane shows the saved plain text of what will be quoted instead of a rendered page.
+    private func showRestoredQuote(_ text: String) {
+        let label = NSTextField(labelWithString: "Original message (included when you send)")
+        label.font = .systemFont(ofSize: 11)
+        label.textColor = .secondaryLabelColor
+        let scroll = NSTextView.scrollableTextView()
+        scroll.drawsBackground = false
+        if let tv = scroll.documentView as? NSTextView {
+            tv.isEditable = false
+            tv.drawsBackground = false
+            tv.font = .systemFont(ofSize: 13)
+            tv.textColor = .secondaryLabelColor
+            tv.textContainerInset = NSSize(width: 10, height: 8)
+            tv.string = text
+        }
+        let sep = NSBox()
+        sep.boxType = .separator
+        for v in [sep, label, scroll] as [NSView] {
+            v.translatesAutoresizingMaskIntoConstraints = false
+            quotePane.addSubview(v)
+        }
+        NSLayoutConstraint.activate([
+            sep.topAnchor.constraint(equalTo: quotePane.topAnchor),
+            sep.leadingAnchor.constraint(equalTo: quotePane.leadingAnchor, constant: 14),
+            sep.trailingAnchor.constraint(equalTo: quotePane.trailingAnchor, constant: -14),
+            label.topAnchor.constraint(equalTo: sep.bottomAnchor, constant: 8),
+            label.leadingAnchor.constraint(equalTo: quotePane.leadingAnchor, constant: 16),
+            label.trailingAnchor.constraint(lessThanOrEqualTo: quotePane.trailingAnchor, constant: -16),
+            scroll.topAnchor.constraint(equalTo: label.bottomAnchor, constant: 6),
+            scroll.leadingAnchor.constraint(equalTo: quotePane.leadingAnchor),
+            scroll.trailingAnchor.constraint(equalTo: quotePane.trailingAnchor),
+            scroll.bottomAnchor.constraint(equalTo: quotePane.bottomAnchor),
+        ])
+        quotePane.isHidden = includeOriginal.state != .on
     }
 
     private func setQuote(_ d: MessageDetail, _ body: StoredBody?, header: String, blockquote: Bool = true) {
@@ -853,10 +924,29 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
     }
 
     /// Clears the red "attachments missing" status line once no missing attachment remains.
-    private func refreshMissingStatus() {
-        guard missingAttachments.isEmpty, status.textColor == .systemRed else { return }
-        status.stringValue = ""
-        status.textColor = .secondaryLabelColor
+    private func refreshMissingStatus() { updateWarning() }
+
+    /// Total size of the attached files, kept for the size warning.
+    private var attachmentTotal = 0
+
+    /// The red status line: every warning that applies, together. The size warning and the
+    /// missing-attachments warning used to overwrite each other.
+    private func updateWarning() {
+        var notes: [String] = []
+        if attachmentTotal > 25 * 1_048_576 {
+            notes.append("Attachments total \(MIME.formatSize(attachmentTotal)) — Gmail's limit is 25 MB.")
+        }
+        if !missingAttachments.isEmpty {
+            notes.append(missingAttachments.count == 1 ? "1 attachment is missing." : "\(missingAttachments.count) attachments are missing.")
+        }
+        if notes.isEmpty {
+            guard status.textColor == .systemRed else { return }
+            status.stringValue = ""
+            status.textColor = .secondaryLabelColor
+        } else {
+            status.stringValue = notes.joined(separator: " ")
+            status.textColor = .systemRed
+        }
     }
 
     /// Folders are zipped (with the system's ditto) and attached as one .zip.
@@ -874,7 +964,12 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
                 self?.status.stringValue = ""
                 self?.addAttachments([dest])
             } catch {
-                self?.status.stringValue = "Couldn't zip \(url.lastPathComponent)"
+                guard !Task.isCancelled, let self else { return }
+                // Recorded like an attachment that couldn't be fetched: Send asks before going without
+                // the folder, and a save doesn't replace a draft that still had it.
+                self.missingAttachments.append(url.lastPathComponent)
+                self.status.stringValue = "Couldn't zip \(url.lastPathComponent)"
+                self.status.textColor = .systemRed
             }
         }
         zipTasks.append(task)
@@ -900,13 +995,8 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
         }
         attachmentScroll.isHidden = attachments.isEmpty
         attachmentHeight?.constant = attachments.isEmpty ? 0 : 40
-        if total > 25 * 1_048_576 {
-            status.stringValue = "Attachments total \(MIME.formatSize(total)) — Gmail's limit is 25 MB."
-            status.textColor = .systemRed
-        } else if status.textColor == .systemRed, missingAttachments.isEmpty {
-            status.stringValue = ""
-            status.textColor = .secondaryLabelColor
-        }
+        attachmentTotal = total
+        updateWarning()
     }
 
     @objc private func removeAttachment(_ sender: NSButton) {
@@ -1119,7 +1209,9 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
                 }
                 self.sentOrDiscarded = false
                 // The autosave record must name the new draft, or a crash now would bring back a
-                // composer that no longer replaces it.
+                // composer that no longer replaces it. An unsent message is unsaved work whether or not
+                // it was edited since it was opened, so the record is written unconditionally.
+                self.dirty = true
                 self.autosaveNow()
                 self.status.stringValue = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
                 self.status.textColor = .systemRed
@@ -1249,6 +1341,9 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
                 if old != nil, !complete {
                     (NSApp.delegate as? AppDelegate)?.mainWindow?.showToast(
                         "Draft saved. The earlier draft was kept: some of its attachments couldn't be loaded.")
+                } else if old != nil, !hasContent {
+                    (NSApp.delegate as? AppDelegate)?.mainWindow?.showToast(
+                        "An empty draft was saved. The earlier draft was kept.")
                 } else if removedOld {
                     (NSApp.delegate as? AppDelegate)?.mainWindow?.showToast("Draft saved")
                 }
@@ -1467,7 +1562,8 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
     }
 
     @objc private func fromChanged() {
-        missingAccountID = nil
+        // Only a real account settles the question; a stale entry for a removed one does not.
+        if account != nil { missingAccountID = nil }
         dirty = true
         swapSignature()
         scheduleAutosave()
@@ -1511,8 +1607,11 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
     // MARK: Dragging addresses between To / Cc / Bcc (a move, like Outlook)
 
     private static let addressType = NSPasteboard.PasteboardType("com.manikpruthi.macmail.addresses")
-    /// The field a drag of address tokens started in, and what it carried.
-    private var dragSource: (field: NSTokenField, objects: [String])?
+    private static let dragIDType = NSPasteboard.PasteboardType("com.manikpruthi.macmail.address-drag")
+    /// The field a drag of address tokens started in, what it carried, and the id written to that
+    /// drag's pasteboard. The id ties a drop to its own drag: a drag that was cancelled leaves this set,
+    /// and a later, unrelated drop of the same addresses must not remove tokens from the old field.
+    private var dragSource: (field: NSTokenField, objects: [String], id: String)?
 
     func tokenField(_ tokenField: NSTokenField, writeRepresentedObjects objects: [Any], to pboard: NSPasteboard) -> Bool {
         let strings = objects.compactMap { $0 as? String }
@@ -1522,7 +1621,14 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
         pboard.setString(strings.joined(separator: ", "), forType: .string)
         // AppKit adds its own types to the drag pasteboard after this returns, so changeCount can't identify the
         // drag; the dragged addresses themselves do.
-        dragSource = pboard.name == .drag ? (tokenField, strings) : nil
+        if pboard.name == .drag {
+            let id = UUID().uuidString
+            pboard.addTypes([Self.dragIDType], owner: nil)
+            pboard.setString(id, forType: Self.dragIDType)
+            dragSource = (tokenField, strings, id)
+        } else {
+            dragSource = nil
+        }
         return true
     }
 
@@ -1530,8 +1636,9 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
         let objects = (pboard.propertyList(forType: Self.addressType) as? [String])
             ?? pboard.string(forType: .string).map { MIME.parseAddresses($0).map { $0.full } }
         guard let objects, !objects.isEmpty else { return nil }
-        if pboard.name == .drag, let src = dragSource, src.objects == objects, src.field !== tokenField {
+        if pboard.name == .drag, let src = dragSource, pboard.string(forType: Self.dragIDType) == src.id {
             dragSource = nil
+            guard src.objects == objects, src.field !== tokenField else { return objects }
             // After the drop finishes, take the tokens out of the field they were dragged from.
             DispatchQueue.main.async { [weak self] in self?.remove(src.objects, from: src.field) }
         }

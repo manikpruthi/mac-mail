@@ -101,7 +101,13 @@ struct EMLDocument {
     }
 
     /// "value; a=b; c="d;e"" → (value, [a: b, c: d;e]); quoted strings and backslash escapes honoured.
+    /// A quote that never closes would take every later parameter (boundary, charset) into its value, so
+    /// such a line is read again with its quotes ignored.
     static func parseParams(_ raw: String) -> (String, [String: String]) {
+        parseParams(raw, quotes: true)
+    }
+
+    private static func parseParams(_ raw: String, quotes: Bool) -> (String, [String: String]) {
         var fields: [String] = []
         var cur = ""
         var inQuote = false
@@ -109,10 +115,11 @@ struct EMLDocument {
         for ch in raw {
             if escaped { cur.append(ch); escaped = false; continue }
             if ch == "\\" && inQuote { escaped = true; continue }
-            if ch == "\"" { inQuote.toggle(); continue }
+            if ch == "\"" { if quotes { inQuote.toggle() }; continue }
             if ch == ";" && !inQuote { fields.append(cur); cur = ""; continue }
             cur.append(ch)
         }
+        if inQuote { return parseParams(raw, quotes: false) }
         fields.append(cur)
         let value = fields.first?.trimmingCharacters(in: .whitespaces) ?? ""
         var params: [String: String] = [:]
@@ -238,6 +245,13 @@ struct EMLDocument {
                                       "yyyy-MM-dd HH:mm:ss Z", "yyyy-MM-dd'T'HH:mm:ssZ",
                                       "EEE MMM d HH:mm:ss yyyy"]
     private static let isoDateParser = ISO8601DateFormatter()
+    /// One formatter per format, built once and never reconfigured (so they are safe to share).
+    private static let dateParsers: [DateFormatter] = dateFormats.map { format in
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.dateFormat = format
+        return f
+    }
 
     static func parseDate(_ raw: String) -> Date? {
         // Drop comments such as "(UTC)".
@@ -246,10 +260,7 @@ struct EMLDocument {
         s = s.trimmingCharacters(in: .whitespaces)
         // Collapse runs of whitespace (asctime dates pad single-digit days: "Sun Nov  9 …").
         while s.contains("  ") { s = s.replacingOccurrences(of: "  ", with: " ") }
-        let f = DateFormatter()
-        f.locale = Locale(identifier: "en_US_POSIX")
-        for format in dateFormats {
-            f.dateFormat = format
+        for f in dateParsers {
             if let d = f.date(from: s) { return d }
         }
         return isoDateParser.date(from: s)

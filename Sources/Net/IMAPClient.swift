@@ -72,8 +72,18 @@ actor IMAPClient {
         static let idleGrace: TimeInterval = 30
     }
 
+    /// Deliberately not cancellation-aware: a command that already waited its turn still runs, because
+    /// the multi-step writers (Empty Trash, the MOVE fallback) rely on their rollback commands going
+    /// out even when the task that started them was cancelled.
     private func lockCommands() async {
         if commandBusy { await withCheckedContinuation { commandWaiters.append($0) } } else { commandBusy = true }
+    }
+
+    /// Takes the command lock only when no command is in flight.
+    private func tryLockCommands() -> Bool {
+        if commandBusy { return false }
+        commandBusy = true
+        return true
     }
 
     private func unlockCommands() {
@@ -118,7 +128,13 @@ actor IMAPClient {
             guard greeting.status == "OK" || greeting.status == "PREAUTH" else {
                 throw NetError.protocolError(greeting.text)
             }
+            let preauthenticated = greeting.status == "PREAUTH"
             if security == .startTLS {
+                // STARTTLS is only valid before authentication (RFC 3501 §6.2.1): a server that greets
+                // with PREAUTH on a plain connection can never be upgraded, so it is refused.
+                guard !preauthenticated else {
+                    throw NetError.server("\(host) signs in before encryption starts on port \(port). Use SSL/TLS (usually port 993).")
+                }
                 // Fail closed: without STARTTLS the password would cross the network in the clear (F-01).
                 try await refreshCapabilities()
                 guard capabilities.contains("STARTTLS") else {
@@ -130,13 +146,17 @@ actor IMAPClient {
                 capabilities = []
                 try await refreshCapabilities()
             }
-            do {
-                _ = try await run("LOGIN \(username.imapQuoted) \(password.imapQuoted)", timeout: 30)
-            } catch NetError.server(let m) {
-                throw NetError.auth(m.isEmpty ? "the server rejected the email or App Password." : m)
-            }
-            if let code = lastTaggedCode, code.uppercased().hasPrefix("CAPABILITY ") {
-                capabilities = Set(code.split(separator: " ").dropFirst().map { $0.uppercased() })
+            // A PREAUTH greeting means the connection is already signed in; LOGIN there is an error
+            // (RFC 3501 §6.2), so it is skipped and the capabilities are asked for below.
+            if !preauthenticated {
+                do {
+                    _ = try await run("LOGIN \(username.imapQuoted) \(password.imapQuoted)", timeout: 30)
+                } catch NetError.server(let m) {
+                    throw NetError.auth(m.isEmpty ? "the server rejected the email or App Password." : m)
+                }
+                if let code = lastTaggedCode, code.uppercased().hasPrefix("CAPABILITY ") {
+                    capabilities = Set(code.split(separator: " ").dropFirst().map { $0.uppercased() })
+                }
             }
             if capabilities.isEmpty { try await refreshCapabilities() }
         } catch {
@@ -155,9 +175,16 @@ actor IMAPClient {
         }
     }
 
+    /// Closes the connection. LOGOUT is only written when no command is in flight: actors are
+    /// re-entrant, so writing it unlocked could land in the middle of another command's literal
+    /// (an APPEND upload) and corrupt the message being stored. A busy connection is simply closed,
+    /// which also ends an IDLE at once; the interrupted command fails with a closed connection.
     func disconnect() async {
         if let s = stream {
-            try? await s.send("Z LOGOUT\r\n")
+            if tryLockCommands() {
+                try? await s.send("Z LOGOUT\r\n")
+                unlockCommands()
+            }
             await s.close()
         }
         stream = nil
@@ -173,15 +200,28 @@ actor IMAPClient {
     }
 
     /// Bounds a read with a watchdog that force-closes the stream, so a silent server can't hang
-    /// a command forever (the pending read fails with NetError.closed once the stream is closed).
+    /// a command forever. The failure the close causes is reported as a timeout, not as "closed".
     private func withReadTimeout<T>(_ seconds: TimeInterval, _ body: @escaping () async throws -> T) async throws -> T {
         let s = stream
+        let fired = FiredFlag()
         let watchdog = Task {
             try await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+            fired.fire()
             await s?.close()
         }
         defer { watchdog.cancel() }
-        return try await body()
+        do { return try await body() } catch {
+            if fired.didFire, !Self.isRefusal(error) { throw NetError.timeout }
+            throw error
+        }
+    }
+
+    /// A tagged NO/BAD (or a failed sign-in): the server answered, so the connection is still in step.
+    private static func isRefusal(_ error: Error) -> Bool {
+        switch error as? NetError {
+        case .server, .auth: return true
+        default: return false
+        }
     }
 
     // MARK: Low-level
@@ -228,8 +268,10 @@ actor IMAPClient {
         defer { unlockCommands() }
         guard let s = stream else { throw NetError.closed }
         let tag = nextTag()
+        let fired = FiredFlag()
         let watchdog = Task { [weak s] in
             try await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+            fired.fire()
             await s?.close()
         }
         defer { watchdog.cancel() }
@@ -242,7 +284,7 @@ actor IMAPClient {
                 try await s.send("\(tag) \(command)\r\n")
                 for (i, lit) in literals.enumerated() {
                     while true {
-                        guard untagged.count <= Limits.maxUntagged else {
+                        guard untagged.count < Limits.maxUntagged else {
                             throw NetError.protocolError("too many untagged responses")
                         }
                         let r = try await readResponse()
@@ -250,6 +292,10 @@ actor IMAPClient {
                         if r.tag == tag { throw NetError.server(r.text) }
                         untagged.append(r)
                     }
+                    // A literal is part of the command line, and the line still ends with CRLF after
+                    // the literal's octets (RFC 3501 §4.3, §6.3.11: "APPEND … {310}" CRLF, 310 octets,
+                    // CRLF). The CRLF below is that terminator (or follows the next segment), not an
+                    // extra empty line.
                     var payload = lit
                     let tail = i < trailing.count ? trailing[i] : ""
                     payload.append(Data((tail + "\r\n").utf8))
@@ -257,7 +303,7 @@ actor IMAPClient {
                 }
             }
             while true {
-                guard untagged.count <= Limits.maxUntagged else {
+                guard untagged.count < Limits.maxUntagged else {
                     throw NetError.protocolError("too many untagged responses")
                 }
                 let r = try await readResponse()
@@ -276,10 +322,11 @@ actor IMAPClient {
             if case .server = e { throw e }
             if case .auth = e { throw e }
             await drop()
-            throw e
+            // The watchdog cut a silent connection: say "took too long", not "closed".
+            throw fired.didFire ? NetError.timeout : e
         } catch {
             await drop()
-            throw NetError.closed
+            throw fired.didFire ? NetError.timeout : NetError.closed
         }
     }
 
@@ -293,7 +340,8 @@ actor IMAPClient {
             // A truncated LIST line means the response was cut short; refusing here keeps the caller
             // from pruning the whole folder cache off a partial list.
             let attrs = r.values[1].list?.compactMap { $0.text } ?? []
-            let delim = r.values[2].text ?? "/"
+            // NIL means a flat namespace: there is no hierarchy separator, which is stored as "".
+            let delim = r.values[2].text ?? ""
             guard let rawName = r.values[3].text else { throw NetError.protocolError("truncated LIST response") }
             out.append(ListedFolder(path: MailboxName.decode(rawName), delimiter: delim, attributes: attrs))
         }
@@ -311,7 +359,7 @@ actor IMAPClient {
             let word = r.values.first?.text?.uppercased()
             if word == "LIST", r.values.count >= 4 {
                 let attrs = r.values[1].list?.compactMap { $0.text } ?? []
-                let delim = r.values[2].text ?? "/"
+                let delim = r.values[2].text ?? ""
                 guard let rawName = r.values[3].text else { throw NetError.protocolError("truncated LIST response") }
                 out.append(ListedFolder(path: MailboxName.decode(rawName), delimiter: delim, attributes: attrs))
             } else if word == "STATUS", r.values.count >= 3, let raw = r.values[1].text, let n = Self.unseen(from: [r]) {
@@ -395,7 +443,7 @@ actor IMAPClient {
                 }
                 // Conditional STORE: a message another client touched after the flag read is refused and
                 // listed in [MODIFIED], so it is never counted as flagged by this command.
-                var refused = Set<UInt32>()
+                var refused: Set<UInt32>? = []
                 do {
                     try await run("UID STORE \(mineSet) (UNCHANGEDSINCE \(since)) +FLAGS.SILENT (\\Deleted)")
                     refused = Self.modifiedUIDs(lastTaggedCode)
@@ -411,6 +459,13 @@ actor IMAPClient {
                     marked += mine
                     throw error
                 }
+                guard let refused else {
+                    // A [MODIFIED] list that can't be read (oversized or malformed) says something was
+                    // refused but not what: stop, and take the flag back from the whole chunk (H-13).
+                    marked += mine
+                    changedElsewhere = true
+                    continue
+                }
                 marked += mine.filter { !refused.contains($0) }
                 if !refused.isEmpty { changedElsewhere = true }
             }
@@ -418,6 +473,14 @@ actor IMAPClient {
                 throw NetError.server("The folder changed while it was being emptied. Try again.")
             }
             if uidplus {
+                // UID EXPUNGE only removes messages that are still \Deleted. One that another client
+                // un-flagged since the STORE would silently survive while the folder is reported
+                // empty, so the snapshot is checked first (H-09).
+                for chunk in ours.chunked(1000) {
+                    guard try await uidSearch("UID \(imapUIDSet(chunk)) UNDELETED").filter({ chunk.contains($0) }).isEmpty else {
+                        throw NetError.server("The folder changed while it was being emptied. Try again.")
+                    }
+                }
                 // UID EXPUNGE only touches the snapshot, so other pending deletions outside it survive.
                 for chunk in ours.chunked(1000) {
                     try await run("UID EXPUNGE \(imapUIDSet(chunk))", timeout: 300)
@@ -442,11 +505,28 @@ actor IMAPClient {
         }
     }
 
-    /// Every UID in the selected mailbox. A big mailbox is read in UID windows: `UID SEARCH ALL` answers
-    /// on one line, and a line over the 1 MB limit would drop the connection.
+    /// Every UID in the selected mailbox. A big mailbox is read in windows: `UID SEARCH ALL` answers
+    /// on one line, and a line over the 1 MB limit would drop the connection. The windows are message
+    /// sequence ranges, which are dense, so the cost follows the message count and not how sparse the
+    /// UIDs are (H-11). Sequence numbers shift when another client expunges, so an EXPUNGE seen during
+    /// the walk falls back to UID windows, which never shift.
     private func snapshotUIDs() async throws -> [UInt32] {
         let info = lastSelectInfo
         guard info.exists > 50_000 else { return try await uidSearch("ALL") }
+        var bySequence: [UInt32] = []
+        var shifted = false
+        var first: UInt64 = 1
+        let count = UInt64(info.exists)
+        while first <= count, !shifted {
+            let last = min(count, first + 19_999)
+            let rs = try await run("UID SEARCH \(first):\(last)")
+            shifted = rs.contains { r in
+                r.isUntagged && r.values.count >= 2 && r.values[1].text?.uppercased() == "EXPUNGE"
+            }
+            bySequence += Self.searchResults(rs)
+            first = last + 1
+        }
+        if !shifted { return bySequence }
         var top = UInt64(info.uidNext > 0 ? info.uidNext - 1 : 0)
         if top == 0 {
             top = UInt64(try await fetch("*", items: "(UID)", uid: false).compactMap { $0.uid }.max() ?? 0)
@@ -463,15 +543,20 @@ actor IMAPClient {
     }
 
     /// UIDs from a tagged `[MODIFIED 7,9:12]` response code (RFC 7162); empty for any other code.
-    static func modifiedUIDs(_ code: String?) -> Set<UInt32> {
+    /// nil when the code is MODIFIED but its list can't be read in full (a malformed piece, or a range
+    /// too large to expand): the caller must then treat every UID it sent as possibly refused (H-13).
+    static func modifiedUIDs(_ code: String?) -> Set<UInt32>? {
         let parts = (code ?? "").split(separator: " ")
-        guard parts.count >= 2, parts[0].uppercased() == "MODIFIED" else { return [] }
+        guard let word = parts.first, word.uppercased() == "MODIFIED" else { return [] }
+        guard parts.count == 2 else { return nil }
         var out = Set<UInt32>()
-        for piece in parts[1].split(separator: ",") {
-            let ends = piece.split(separator: ":").compactMap { UInt32($0) }
-            guard let lo = ends.min(), let hi = ends.max() else { continue }
+        for piece in parts[1].split(separator: ",", omittingEmptySubsequences: false) {
+            let raw = piece.split(separator: ":", omittingEmptySubsequences: false)
+            let ends = raw.compactMap { UInt32($0) }
+            guard !ends.isEmpty, ends.count == raw.count, ends.count <= 2,
+                  let lo = ends.min(), let hi = ends.max() else { return nil }
             // A hostile range must not allocate the whole UID space.
-            guard hi - lo <= 100_000 else { continue }
+            guard hi - lo <= 100_000, out.count <= 100_000 else { return nil }
             for u in lo...hi { out.insert(u) }
         }
         return out
@@ -604,26 +689,51 @@ actor IMAPClient {
         let mbox = MailboxName.encode(dest).imapQuoted
         if hasMove {
             try await run("UID MOVE \(set) \(mbox)")
-        } else {
+        } else if capabilities.contains("UIDPLUS") {
             try await run("UID COPY \(set) \(mbox)")
             try await run("UID STORE \(set) +FLAGS.SILENT (\\Deleted)")
-            if capabilities.contains("UIDPLUS") { try await run("UID EXPUNGE \(set)") }
-            // Without UIDPLUS a bare EXPUNGE would also purge messages another client flagged \Deleted;
-            // only expunge when exactly our UIDs are pending deletion.
-            else { try await expungeExactly(uids) }
+            try await run("UID EXPUNGE \(set)")
+        } else {
+            // Without UIDPLUS only a bare EXPUNGE can remove the originals, and that is refused while
+            // another client has deletions pending. Checked before the COPY: refusing afterwards left a
+            // copy in the destination, and trying the move again then made a second one.
+            let already = try await pendingDeletions(among: uids)
+            try await run("UID COPY \(set) \(mbox)")
+            try await run("UID STORE \(set) +FLAGS.SILENT (\\Deleted)")
+            try await expungeExactly(uids, marked: uids.filter { !already.contains($0) })
         }
     }
 
     func expungeUIDs(_ uids: [UInt32]) async throws {
         guard !uids.isEmpty else { return }
         let set = imapUIDSet(uids)
-        try await run("UID STORE \(set) +FLAGS.SILENT (\\Deleted)")
-        if capabilities.contains("UIDPLUS") { try await run("UID EXPUNGE \(set)") } else { try await expungeExactly(uids) }
+        if capabilities.contains("UIDPLUS") {
+            try await run("UID STORE \(set) +FLAGS.SILENT (\\Deleted)")
+            try await run("UID EXPUNGE \(set)")
+        } else {
+            let already = try await pendingDeletions(among: uids)
+            try await run("UID STORE \(set) +FLAGS.SILENT (\\Deleted)")
+            try await expungeExactly(uids, marked: uids.filter { !already.contains($0) })
+        }
+    }
+
+    private static let otherClientDeletions =
+        "The server has pending deletions from another mail client, so the message wasn't removed."
+
+    /// Which of these UIDs are already \Deleted. Throws when a message outside them is pending deletion:
+    /// the bare EXPUNGE that follows would purge it too. Not temporary-refusal wording on purpose:
+    /// AccountEngine drops the op and reports it instead of retrying against the other client forever.
+    private func pendingDeletions(among uids: [UInt32]) async throws -> Set<UInt32> {
+        let deleted = Set(try await uidSearch("DELETED"))
+        guard deleted.isSubset(of: uids) else { throw NetError.server(Self.otherClientDeletions) }
+        return deleted
     }
 
     /// Bare EXPUNGE only when the pending deletions are exactly these UIDs, so other clients' deleted
     /// messages survive (a subset check would still let EXPUNGE purge theirs).
-    private func expungeExactly(_ uids: [UInt32]) async throws {
+    /// `marked` are the UIDs this operation flagged itself; only those are un-flagged on a refusal, so a
+    /// deletion that was already pending on one of them is not reverted.
+    private func expungeExactly(_ uids: [UInt32], marked: [UInt32]) async throws {
         // Only the UIDs that still exist count: one already removed elsewhere (another client, Empty
         // Trash) is simply done, not a mismatch to report.
         let present = Set(try await uidSearch("UID \(imapUIDSet(uids))")).intersection(uids)
@@ -632,10 +742,8 @@ actor IMAPClient {
         guard deleted == present else {
             // Un-flag what we marked: a bare EXPUNGE now would also purge another client's pending
             // deletions, and returning would drop the op as success while the message survives here.
-            try await run("UID STORE \(imapUIDSet(uids)) -FLAGS.SILENT (\\Deleted)")
-            // Not temporary-refusal wording on purpose: AccountEngine drops the op and reports it
-            // instead of retrying against the other client's deletion forever.
-            throw NetError.server("The server has pending deletions from another mail client, so the message wasn't removed.")
+            if !marked.isEmpty { try await run("UID STORE \(imapUIDSet(marked)) -FLAGS.SILENT (\\Deleted)") }
+            throw NetError.server(Self.otherClientDeletions)
         }
         try await run("EXPUNGE")
     }
@@ -763,7 +871,7 @@ actor IMAPClient {
         }
         return ParsedHeader(
             uid: uid, gmailID: gmsgid, threadID: thrid, date: date,
-            size: Int(r.items["RFC822.SIZE"]?.number ?? 0), flags: flags, subject: subject, from: from,
+            size: Int(clamping: r.items["RFC822.SIZE"]?.number ?? 0), flags: flags, subject: subject, from: from,
             toList: h["to"] ?? "", ccList: h["cc"] ?? "", replyTo: h["reply-to"] ?? "",
             messageID: h["message-id"] ?? "", inReplyTo: h["in-reply-to"] ?? "", references: h["references"] ?? "",
             listUnsubscribe: h["list-unsubscribe"] ?? "", structureJSON: structure?.json(),

@@ -1,4 +1,5 @@
 import AppKit
+import WebKit
 
 /// Reply / forward / delete behavior shared by the main window and the message window,
 /// so both validate and load the same way.
@@ -57,7 +58,8 @@ enum MessageActions {
                 } catch {
                     let a = NSAlert(error: error)
                     a.messageText = "Couldn't save the message"
-                    a.beginSheetModal(for: window, completionHandler: nil)
+                    // The window may have closed during the download; the failure is still shown.
+                    a.present(in: window)
                 }
             }
         }
@@ -79,9 +81,33 @@ enum MessageActions {
         alert.addButton(withTitle: "Delete")
         alert.addButton(withTitle: "Cancel")
         alert.buttons.first?.hasDestructiveAction = true
-        guard let window else { return }
-        alert.beginSheetModal(for: window) { resp in
+        alert.present(in: window) { resp in
             if resp == .alertFirstButtonReturn { then() }
         }
+    }
+}
+
+extension NSAlert {
+    /// Shows the alert as a sheet on `window`, or as an app-level alert when that window is gone,
+    /// closed or hidden: a sheet on a window that isn't on screen is never seen, and its completion
+    /// handler never runs.
+    func present(in window: NSWindow?, completion: ((NSApplication.ModalResponse) -> Void)? = nil) {
+        if let window, window.isVisible, !window.isMiniaturized {
+            beginSheetModal(for: window) { completion?($0) }
+        } else {
+            let response = runModal()
+            completion?(response)
+        }
+    }
+}
+
+extension WKWebView {
+    /// Lets the window's own background show through until the page paints. WebKit has no public switch
+    /// for this, only the long-standing `drawsBackground` key; it is used only while WebKit still
+    /// answers to it, so a release that drops it costs a white flash, not an exception.
+    func makeBackgroundTransparent() {
+        guard responds(to: NSSelectorFromString("_setDrawsBackground:"))
+            || responds(to: NSSelectorFromString("setDrawsBackground:")) else { return }
+        setValue(false, forKey: "drawsBackground")
     }
 }

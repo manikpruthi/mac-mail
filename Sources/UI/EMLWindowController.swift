@@ -50,14 +50,18 @@ final class EMLWindowController: NSWindowController, NSWindowDelegate, WKNavigat
         w.contentView = content
         content.onAppearanceChange = { [weak self] in self?.appearanceChanged() }
         w.delegate = self
-        if let last = Self.open.values.compactMap({ $0.window }).last {
+        if let last = Self.lastOpened, last.isVisible {
             w.setFrameTopLeftPoint(NSPoint(x: last.frame.minX + 24, y: last.frame.maxY - 24))
         } else {
             w.center()
         }
+        Self.lastOpened = w
     }
 
     required init?(coder: NSCoder) { fatalError() }
+
+    /// The .eml window opened most recently, to cascade the next one from.
+    private static weak var lastOpened: NSWindow?
 
     /// Reads, parses and decodes on a background thread; the window is already on screen and is filled in after.
     private func load() {
@@ -134,20 +138,7 @@ final class EMLWindowController: NSWindowController, NSWindowDelegate, WKNavigat
             }.value
         }
 
-        let config = WKWebViewConfiguration()
-        config.setURLSchemeHandler(loader, forURLScheme: "lm")
-        config.websiteDataStore = .nonPersistent()
-        config.defaultWebpagePreferences.allowsContentJavaScript = false
-        config.preferences.javaScriptCanOpenWindowsAutomatically = false
-        config.userContentController.addUserScript(WKUserScript(source: DarkReader.script, injectionTime: .atDocumentEnd,
-                                                                forMainFrameOnly: true, in: .defaultClient))
-        let web = WKWebView(frame: .zero, configuration: config)
-        web.navigationDelegate = self
-        web.uiDelegate = self
-        web.setValue(false, forKey: "drawsBackground")
-        self.web = web
-
-        for v in [subject, from, to, date, note, reply, sep, banner, attachmentBar, web] as [NSView] {
+        for v in [subject, from, to, date, note, reply, sep, banner, attachmentBar] as [NSView] {
             v.translatesAutoresizingMaskIntoConstraints = false
             content.addSubview(v)
         }
@@ -180,11 +171,62 @@ final class EMLWindowController: NSWindowController, NSWindowDelegate, WKNavigat
             attachmentBar.topAnchor.constraint(equalTo: banner.bottomAnchor),
             attachmentBar.leadingAnchor.constraint(equalTo: content.leadingAnchor),
             attachmentBar.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+        ])
+        installWebView(in: content)
+    }
+
+    /// Creates the web view under the attachment bar. Separate from the rest of the layout so the view
+    /// can be released while the app is idle and put back when it is used again.
+    private func installWebView(in content: NSView) {
+        let config = WKWebViewConfiguration()
+        config.setURLSchemeHandler(loader, forURLScheme: "lm")
+        config.websiteDataStore = .nonPersistent()
+        config.defaultWebpagePreferences.allowsContentJavaScript = false
+        config.preferences.javaScriptCanOpenWindowsAutomatically = false
+        config.userContentController.addUserScript(WKUserScript(source: DarkReader.script, injectionTime: .atDocumentEnd,
+                                                                forMainFrameOnly: true, in: .defaultClient))
+        let web = WKWebView(frame: .zero, configuration: config)
+        web.navigationDelegate = self
+        web.uiDelegate = self
+        web.makeBackgroundTransparent()
+        web.translatesAutoresizingMaskIntoConstraints = false
+        content.addSubview(web)
+        NSLayoutConstraint.activate([
             web.topAnchor.constraint(equalTo: attachmentBar.bottomAnchor),
             web.leadingAnchor.constraint(equalTo: content.leadingAnchor),
             web.trailingAnchor.constraint(equalTo: content.trailingAnchor),
             web.bottomAnchor.constraint(equalTo: content.bottomAnchor),
         ])
+        self.web = web
+        ruleListAttached = false
+    }
+
+    // MARK: Idle trimming (same as the reading panes)
+
+    /// Releases every .eml window's web view, so WebKit's helper processes can exit while the app is idle.
+    static func releaseWebViews() {
+        for c in open.values { c.releaseWebView() }
+    }
+
+    /// Puts the web views of visible .eml windows back and renders their messages again.
+    static func restoreWebViews() {
+        for c in open.values where c.window?.isVisible == true { c.restoreWebView() }
+    }
+
+    private func releaseWebView() {
+        guard let web, !closed else { return }
+        generation += 1     // a render still being prepared must not land on the next web view
+        loader.cancelAll()
+        web.stopLoading()
+        web.navigationDelegate = nil
+        web.removeFromSuperview()
+        self.web = nil
+    }
+
+    private func restoreWebView() {
+        guard web == nil, !closed, let content = window?.contentView else { return }
+        installWebView(in: content)
+        if doc != nil { render() }
     }
 
     private func render() {
@@ -271,7 +313,9 @@ final class EMLWindowController: NSWindowController, NSWindowDelegate, WKNavigat
 
     @objc func printMessage(_ sender: Any?) {
         guard let web, let window else { return }
-        let op = web.printOperation(with: NSPrintInfo.shared)
+        // A copy: the print panel's choices must not change the shared settings for later prints.
+        let info = (NSPrintInfo.shared.copy() as? NSPrintInfo) ?? NSPrintInfo.shared
+        let op = web.printOperation(with: info)
         op.jobTitle = doc?.subject ?? ""
         op.view?.frame = web.bounds
         op.runModal(for: window, delegate: nil, didRun: nil, contextInfo: nil)
@@ -291,7 +335,8 @@ final class EMLWindowController: NSWindowController, NSWindowDelegate, WKNavigat
                         try data.write(to: dest, options: .atomic)
                     }.value
                 } catch {
-                    NSAlert(error: error).beginSheetModal(for: window, completionHandler: nil)
+                    // The window may have closed while the file was written; the failure is still shown.
+                    NSAlert(error: error).present(in: window)
                 }
             }
         }

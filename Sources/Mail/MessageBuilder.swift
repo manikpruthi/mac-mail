@@ -39,13 +39,13 @@ enum MessageBuilder {
         }
         var out = ""
         let domain = m.from.email.split(separator: "@").last.map(String.init) ?? "macmail.local"
-        out += "From: \(encodeAddress(m.from))\r\n"
+        // Every header is built as one logical line and folded exactly once, by foldHeader.
+        out += foldHeader("From: \(encodeAddress(m.from))") + "\r\n"
         if !to.isEmpty { out += foldHeader("To: " + to.map(encodeAddress).joined(separator: ", ")) + "\r\n" }
         if !cc.isEmpty { out += foldHeader("Cc: " + cc.map(encodeAddress).joined(separator: ", ")) + "\r\n" }
-        // An encoded subject is already folded word by word; a long plain one is folded at its spaces,
-        // so the line stays far below SMTP's 998-byte limit.
-        let subject = encodeHeaderText(m.subject)
-        out += (subject.contains("\r\n") ? "Subject: \(subject)" : foldHeader("Subject: \(subject)")) + "\r\n"
+        // Folded at its spaces (between encoded words when it is encoded), so every line stays far
+        // below SMTP's 998-byte limit.
+        out += foldHeader("Subject: \(encodeHeaderText(m.subject))") + "\r\n"
         out += "Date: \(MIME.rfc2822(date))\r\n"
         let mid = m.messageID.flatMap { id -> String? in
             let bare = MailSafety.stripControls(id).trimmingCharacters(in: CharacterSet(charactersIn: "<> "))
@@ -170,21 +170,38 @@ enum MessageBuilder {
         return lines.joined(separator: "\r\n")
     }
 
-    /// Folds a full header line ("Name: value") at whitespace/commas once it passes ~78 chars.
+    /// Folds a full header line ("Name: value") at its spaces once it passes ~78 bytes. The input must
+    /// be one logical line: it is the only place a header is folded, so a value can never be folded
+    /// twice (which used to put an empty line, the end of the headers, inside To:/Cc:). Any line break
+    /// already in the input is taken out first for the same reason.
     static func foldHeader(_ line: String) -> String {
+        let line = line.replacingOccurrences(of: "\r\n", with: "").replacingOccurrences(of: "\n", with: "")
+            .replacingOccurrences(of: "\r", with: "")
         guard line.utf8.count > 78 else { return line }
         var lines: [String] = []
         var cur = ""
         for w in line.split(separator: " ", omittingEmptySubsequences: false) {
-            if !cur.isEmpty && cur.utf8.count + 1 + w.utf8.count > 78 {
+            // Never break straight after the header name: "To:" alone on a line helps nobody.
+            let nameOnly = lines.isEmpty && cur.hasSuffix(":") && !cur.contains(" ")
+            if !cur.isEmpty && !nameOnly && cur.utf8.count + 1 + w.utf8.count > 78 {
                 lines.append(cur)
                 cur = String(w)
             } else {
                 cur += cur.isEmpty ? String(w) : " " + String(w)
             }
         }
-        lines.append(cur)
+        // A continuation line must carry something: a whitespace-only one is not valid folding.
+        if !cur.trimmingCharacters(in: .whitespaces).isEmpty { lines.append(cur) }
         return lines.joined(separator: "\r\n ")
+    }
+
+    /// A run without spaces can't be folded, and a header line over 998 bytes is refused by mail
+    /// servers. Text with such a run is sent as encoded words instead, which split anywhere.
+    private static let longestUnfoldableRun = 900
+
+    private static func hasUnfoldableRun(_ s: String) -> Bool {
+        s.utf8.count > longestUnfoldableRun
+            && s.split(separator: " ").contains { $0.utf8.count > longestUnfoldableRun }
     }
 
     /// Keeps only well-formed message-ids (<id@domain>) from a header the message supplied.
@@ -212,16 +229,19 @@ enum MessageBuilder {
         return ids.isEmpty ? nil : ids
     }
 
+    /// Header text as it goes on the wire: plain when it is printable ASCII, otherwise RFC 2047 encoded
+    /// words separated by single spaces. One logical line; foldHeader breaks it between words.
     static func encodeHeaderText(_ s: String) -> String {
         let s = MailSafety.stripControls(s)
-        if s.unicodeScalars.allSatisfy({ $0.isASCII && $0.value >= 32 }) { return s }
-        // Split into encoded words of at most 45 source bytes (≤72 chars per word), folded.
+        if s.unicodeScalars.allSatisfy({ $0.isASCII && $0.value >= 32 }), !hasUnfoldableRun(s) { return s }
+        // Encoded words of at most 39 source bytes (≤64 chars per word), so a word fits on a line even
+        // after "Subject: ". Characters are never split across words.
         var words: [String] = []
         var cur = ""
         var bytes = 0
         for ch in s {
             let cb = String(ch).utf8.count
-            if !cur.isEmpty && bytes + cb > 45 {
+            if !cur.isEmpty && bytes + cb > 39 {
                 words.append("=?UTF-8?B?" + Data(cur.utf8).base64EncodedString() + "?=")
                 cur = ""
                 bytes = 0
@@ -230,7 +250,7 @@ enum MessageBuilder {
             bytes += cb
         }
         if !cur.isEmpty { words.append("=?UTF-8?B?" + Data(cur.utf8).base64EncodedString() + "?=") }
-        return words.joined(separator: "\r\n ")
+        return words.joined(separator: " ")
     }
 
     static func encodeAddress(_ a: EmailAddress) -> String {
@@ -238,7 +258,7 @@ enum MessageBuilder {
         guard !a.name.isEmpty else { return email }
         let clean = MailSafety.stripControls(a.name)
         let name: String
-        if clean.unicodeScalars.allSatisfy({ $0.isASCII && $0.value >= 32 && $0.value != 0x7f }) {
+        if clean.unicodeScalars.allSatisfy({ $0.isASCII && $0.value >= 32 && $0.value != 0x7f }), !hasUnfoldableRun(clean) {
             name = "\"" + clean.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"") + "\""
         } else {
             name = encodeHeaderText(clean)

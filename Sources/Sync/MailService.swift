@@ -59,6 +59,7 @@ final class MailService {
         }
         pathMonitor.start(queue: .global(qos: .utility))
         DispatchQueue.main.asyncAfter(deadline: .now() + 8) { MailService.shared.flushOutbox() }
+        recoverInterruptedMoves()
         updateBadge()
     }
 
@@ -88,6 +89,7 @@ final class MailService {
     /// Sends any queued offline actions for every account (used on app activation).
     func flushAll() {
         for e in engines.values { Task { await e.flushOps() } }
+        recoverInterruptedMoves()
     }
 
     private func makeEngine(_ a: Account) {
@@ -175,7 +177,10 @@ final class MailService {
         accounts.removeAll { $0.id == id }
         Prefs.accounts = accounts.filter { $0.provider != .demo }
         if Prefs.defaultAccountID == id { Prefs.defaultAccountID = nil }
-        Keychain.delete(id)
+        if let failure = Keychain.delete(id) {
+            // The account goes either way; a password left behind is recorded, not hidden.
+            DiagnosticsLog.record("Removing an account: \(failure.localizedDescription)")
+        }
         store.deleteAccount(id)
         outbox.remove(account: id)
         NotificationCenter.default.post(name: .mailAccountsChanged, object: nil)
@@ -214,24 +219,27 @@ final class MailService {
 
     // MARK: Actions
 
-    func setFlag(_ rows: [MessageRow], flag: MessageFlags, on: Bool) {
+    /// Returns false when nothing was changed because the cache refused the write.
+    @discardableResult
+    func setFlag(_ rows: [MessageRow], flag: MessageFlags, on: Bool) -> Bool {
         let imapFlag: String
         switch flag {
         case .seen: imapFlag = "\\Seen"
         case .flagged: imapFlag = "\\Flagged"
         case .answered: imapFlag = "\\Answered"
-        default: return
+        default: return false
         }
         let changing = rows.filter { $0.flags.contains(flag) != on }
-        guard !changing.isEmpty else { return }
+        guard !changing.isEmpty else { return true }
         // A write the cache refused changes nothing: no row, no queued server action.
-        guard store.setFlag(messageIDs: changing.map { $0.id }, flag: flag, on: on) else { NSSound.beep(); return }
+        guard store.setFlag(messageIDs: changing.map { $0.id }, flag: flag, on: on) else { NSSound.beep(); return false }
         for r in changing { if on { r.flags.insert(flag) } else { r.flags.remove(flag) } }
         for (acct, list) in Dictionary(grouping: changing, by: { $0.accountID }) {
             engines[acct]?.queue(.flag(set: on, flag: imapFlag), rows: list)
         }
         updateBadge()
         NotificationCenter.default.postMailDataChanged(.flags(ids: changing.map { $0.id }))
+        return true
     }
 
     enum MoveTarget { case archive, trash, spam, inbox, folder(String) }
@@ -275,6 +283,10 @@ final class MailService {
         var parts: [Undoable.Part] = []
         var removedIDs: [Int64] = []
         var creatingArchive: [(AccountEngine, [MessageRow])] = []
+        var missingDestination = false
+        // Each source folder's UIDVALIDITY now, while the rows' UIDs are known to belong to it.
+        var validity: [Int64: UInt32] = [:]
+        for fid in Set(rows.map { $0.folderID }) { validity[fid] = store.folder(fid)?.uidValidity ?? 0 }
         for (acct, list) in Dictionary(grouping: rows, by: { $0.accountID }) {
             guard let engine = engines[acct] else { continue }
             let destination: Folder?
@@ -305,17 +317,19 @@ final class MailService {
             }
             // Deleting from Trash (or Spam) removes the message for good.
             if case .trash = target, list.allSatisfy({ $0.folderRole == .trash || $0.folderRole == .spam }) {
-                parts.append(.init(engine: engine, rows: list, destinationID: nil) { engine.queue(.expunge, rows: list) })
+                parts.append(.init(engine: engine, rows: list, destinationID: nil) {
+                    engine.queue(.expunge, rows: list, validity: validity)
+                })
                 removedIDs += list.map { $0.id }
                 label = "Deleted permanently"
                 done += list.count
                 continue
             }
-            guard let dest = destination else { continue }
+            guard let dest = destination else { missingDestination = true; continue }
             let movable = list.filter { $0.folderID != dest.id }
             guard !movable.isEmpty else { continue }
             parts.append(.init(engine: engine, rows: movable, destinationID: dest.id) {
-                engine.queue(.move(toPath: dest.path), rows: movable)
+                engine.queue(.move(toPath: dest.path), rows: movable, validity: validity)
             })
             removedIDs += movable.map { $0.id }
             done += movable.count
@@ -342,6 +356,7 @@ final class MailService {
             // Until the action is queued, a sync must not bring these rows back from the server.
             for part in parts { part.engine.setHidden(part.rows, true) }
             undoables[id] = Undoable(snapshot: snapshot, timer: timer, parts: parts)
+            writeJournal(id)
             DispatchQueue.main.asyncAfter(deadline: .now() + Self.undoWindow, execute: timer)
             undoID = id
         }
@@ -350,7 +365,11 @@ final class MailService {
         guard done > 0 else {
             if !creatingArchive.isEmpty { return MoveResult(label: "Creating an Archive folder…", undoID: nil) }
             // Everything already lives in the destination (e.g. archiving from All Mail): say so.
-            if case .archive = target { return MoveResult(label: "Already archived", undoID: nil) }
+            if case .archive = target, !missingDestination { return MoveResult(label: "Already archived", undoID: nil) }
+            // The account has no such folder in the cache (yet): say so instead of doing nothing silently.
+            if missingDestination {
+                return MoveResult(label: "Couldn't find the destination folder. Sync and try again.", undoID: nil)
+            }
             return nil
         }
         return MoveResult(label: done == 1 ? label : "\(label) · \(done) messages", undoID: undoID)
@@ -363,6 +382,7 @@ final class MailService {
         u.timer.cancel()
         for part in u.parts { part.engine.setHidden(part.rows, false) }
         store.restore(u.snapshot)
+        writeJournal(id)
         updateBadge()
         NotificationCenter.default.postMailDataChanged(.all)
         return true
@@ -371,6 +391,52 @@ final class MailService {
     private func commitUndoable(_ id: UUID) {
         guard let u = undoables.removeValue(forKey: id) else { return }
         for part in u.parts { commit(part) }
+        writeJournal(id)
+    }
+
+    // MARK: Undo journal
+
+    /// Rows removed for a move or delete that is still inside its Undo window exist nowhere but in
+    /// memory: the cache no longer has them and the server hasn't been told. The journal keeps their
+    /// folder and UIDs on disk for that window, so after a crash the messages are fetched back instead
+    /// of staying invisible (sync only asks the server for UIDs above the newest one it knows).
+    private static let journalPrefix = "undo."
+
+    /// Brings the journal entry for an Undo window in line with what is still waiting in it.
+    private func writeJournal(_ id: UUID) {
+        let key = Self.journalPrefix + id.uuidString
+        guard let u = undoables[id] else { store.setPref(key, nil); return }
+        var byFolder: [String: [UInt32]] = [:]
+        for part in u.parts where !part.engine.isDemo {
+            for r in part.rows { byFolder[String(r.folderID), default: []].append(r.uid) }
+        }
+        let json = (try? JSONEncoder().encode(byFolder)).flatMap { String(data: $0, encoding: .utf8) }
+        store.setPref(key, byFolder.isEmpty ? nil : json)
+    }
+
+    private var recoveringMoves = false
+
+    /// Entries with no live Undo window were left by a crash or forced quit: fetch those messages back.
+    /// An entry goes once all of its folders answered, so being offline just defers it to the next try.
+    private func recoverInterruptedMoves() {
+        guard !AppPaths.isDemo, !recoveringMoves else { return }
+        let live = Set(undoables.keys.map { Self.journalPrefix + $0.uuidString })
+        let entries = store.prefs(prefix: Self.journalPrefix).filter { !live.contains($0.key) }
+        guard !entries.isEmpty else { return }
+        recoveringMoves = true
+        Task {
+            defer { recoveringMoves = false }
+            for entry in entries {
+                let byFolder = (try? JSONDecoder().decode([String: [UInt32]].self, from: Data(entry.value.utf8))) ?? [:]
+                var done = true
+                for (key, uids) in byFolder {
+                    // A folder (or account) that is gone took its messages with it: nothing to bring back.
+                    guard let fid = Int64(key), let folder = store.folder(fid), let engine = engines[folder.accountID] else { continue }
+                    if !(await engine.refetchHeaders(folder: folder, uids: uids)) { done = false }
+                }
+                if done { store.setPref(entry.key, nil) }
+            }
+        }
     }
 
     private func commit(_ part: Undoable.Part) {
@@ -401,6 +467,7 @@ final class MailService {
                 undoables[id]?.parts = rest
                 undoables[id]?.snapshot = u.snapshot.removing(ids: Set(hit.flatMap { $0.rows.map { $0.id } }))
             }
+            writeJournal(id)
         }
         return taken
     }
@@ -633,7 +700,7 @@ final class MailService {
         Task {
             defer { flushingOutbox = false }
             var sent = 0
-            for item in outbox.items where item.lastError == nil || item.attempts < Outbox.maxAttempts {
+            for item in outbox.items where !item.wasDelivered && (item.lastError == nil || item.attempts < Outbox.maxAttempts) {
                 guard let engine = engines[item.accountID], let account = account(item.accountID) else {
                     // The account is gone, so the message can never go out on its own: show it as failed
                     // instead of skipping it forever (F-23).
@@ -642,13 +709,18 @@ final class MailService {
                 }
                 var finishing = false
                 do {
-                    let data = try outbox.data(item)
+                    // Tens of megabytes with attachments: read off the main thread.
+                    let url = outbox.messageURL(item)
+                    let data = try await Task.detached(priority: .userInitiated) {
+                        try Data(contentsOf: url, options: .mappedIfSafe)
+                    }.value
                     let endpoint = try await engine.smtpEndpoint
                     try await SMTPClient.send(endpoint, from: account.email, recipients: item.recipients, message: data,
                                               progress: { if case .finishing = $0 { finishing = true } })
-                    if !engine.isGmail, let sentFolder = store.folder(account: account.id, role: .sent) {
-                        Task { try? await engine.appendCopy(data, to: sentFolder) }
-                    }
+                    // Accepted. Recorded before anything else, so neither a crash nor a failed delete of
+                    // the queued copy can deliver it a second time.
+                    outbox.markDelivered(item.id)
+                    await engine.fileSentCopy(data)
                     let rows = store.rows(ids: [item.safetyDraftID, item.replyToID, item.draftToDeleteID].compactMap { $0 })
                     afterSent(engine: engine, safetyDraft: rows.first { $0.id == item.safetyDraftID },
                               replyTo: rows.first { $0.id == item.replyToID },

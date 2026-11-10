@@ -21,6 +21,9 @@ final class ImagePage {
     /// Requests already started for this page (budget is reserved before contacting a host).
     var requestsStarted = 0
     var hostRequests: [String: Int] = [:]
+    /// Images refused because their host resolves to a private address. They don't use up the request
+    /// budget (nothing was contacted), but the lookups themselves are capped by this count.
+    var privateRejections = 0
     /// Dark placeholders when the page is shown in dark mode.
     var dark = false
 
@@ -175,11 +178,19 @@ final class ImageLoader: NSObject, WKURLSchemeHandler {
             Debug.log("image rejected \(original)")
             return (Self.transparentGIF, "image/gif")
         }
-        if let cached = await ImageDiskCache.shared.load(url) { return cached }
-
         let perImage = Prefs.imageMaxBytes
         let perMessage = Prefs.imageMessageMaxBytes
         let unlimited = forced || page.ignoreLimits
+        if let cached = await ImageDiskCache.shared.load(url) {
+            // No network is involved, but the per-message size limit still applies: an image cached
+            // under "Load all" must not come back without limits in a message that has them.
+            if !unlimited, page.bytesLoaded + cached.0.count > perMessage {
+                return hold(id: id, bytes: cached.0.count, isBackground: isBackground, page: page)
+            }
+            page.bytesLoaded += cached.0.count
+            return cached
+        }
+
         // Budget and request caps are reserved before contacting the host, so a crafted message can't
         // queue unlimited fetches; user-forced images still get through.
         if !unlimited {
@@ -192,6 +203,14 @@ final class ImageLoader: NSObject, WKURLSchemeHandler {
             page.hostRequests[host, default: 0] += 1
         }
         if await Self.resolvesToPrivateAddress(host) {
+            // Nothing was contacted, so the reservation is handed back: a message that points dozens of
+            // images at private hosts must not use up the budget of its real ones. Only up to a point,
+            // so it can't buy unlimited name lookups either.
+            if !unlimited, page.privateRejections < Self.maxRequestsPerPage {
+                page.privateRejections += 1
+                page.requestsStarted = max(0, page.requestsStarted - 1)
+                page.hostRequests[host] = max(0, (page.hostRequests[host] ?? 1) - 1)
+            }
             Debug.log("image blocked \(url) (private address)")
             return (Self.transparentGIF, "image/gif")
         }

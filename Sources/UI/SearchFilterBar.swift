@@ -121,6 +121,9 @@ final class SearchFilterBar: NSView, NSPopoverDelegate {
         if folderName == nil, filters.scope == .folder {
             filters.scope = .all
             scope.selectItem(at: 0)
+            // Listeners keep their own copy of the filters; without this they went on searching a
+            // folder scope the bar no longer shows.
+            onChange?(filters)
         }
     }
 
