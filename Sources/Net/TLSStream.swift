@@ -343,6 +343,13 @@ actor TLSStream {
         transport = security == .tls ? NWTransport(host: host, port: port) : StartTLSTransport(host: host, port: port)
     }
 
+    /// A stream over a caller-supplied transport (the self-test's scripted server).
+    init(transport: ByteTransport) {
+        security = .tls
+        isEncrypted = true
+        self.transport = transport
+    }
+
     func open() async throws {
         transport.setClosedHandler { [weak self] in Task { await self?.markClosed() } }
         let t = transport

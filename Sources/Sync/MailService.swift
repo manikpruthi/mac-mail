@@ -243,6 +243,8 @@ final class MailService {
         let snapshot: Store.Snapshot
         let commit: () -> Void
         let timer: DispatchWorkItem
+        /// The rows hidden from header fetches until the action is queued or undone.
+        let hidden: [(engine: AccountEngine, rows: [MessageRow])]
     }
 
     private var undoables: [UUID: Undoable] = [:]
@@ -255,6 +257,7 @@ final class MailService {
         var done = 0
         var label = ""
         var commits: [() -> Void] = []
+        var hidden: [(engine: AccountEngine, rows: [MessageRow])] = []
         var removedIDs: [Int64] = []
         var creatingArchive: [(AccountEngine, [MessageRow])] = []
         for (acct, list) in Dictionary(grouping: rows, by: { $0.accountID }) {
@@ -288,6 +291,7 @@ final class MailService {
             // Deleting from Trash (or Spam) removes the message for good.
             if case .trash = target, list.allSatisfy({ $0.folderRole == .trash || $0.folderRole == .spam }) {
                 commits.append { engine.queue(.expunge, rows: list) }
+                hidden.append((engine, list))
                 removedIDs += list.map { $0.id }
                 label = "Deleted permanently"
                 done += list.count
@@ -297,6 +301,7 @@ final class MailService {
             let movable = list.filter { $0.folderID != dest.id }
             guard !movable.isEmpty else { continue }
             commits.append { engine.queue(.move(toPath: dest.path), rows: movable) }
+            hidden.append((engine, movable))
             removedIDs += movable.map { $0.id }
             done += movable.count
         }
@@ -320,7 +325,9 @@ final class MailService {
             let id = UUID()
             let commitAll = { for c in commits { c() } }
             let timer = DispatchWorkItem { MainActor.assumeIsolated { MailService.shared.commitUndoable(id) } }
-            undoables[id] = Undoable(snapshot: snapshot, commit: commitAll, timer: timer)
+            // Until the action is queued, a sync must not bring these rows back from the server.
+            for h in hidden { h.engine.setHidden(h.rows, true) }
+            undoables[id] = Undoable(snapshot: snapshot, commit: commitAll, timer: timer, hidden: hidden)
             DispatchQueue.main.asyncAfter(deadline: .now() + Self.undoWindow, execute: timer)
             undoID = id
         }
@@ -340,6 +347,7 @@ final class MailService {
     func undo(_ id: UUID) -> Bool {
         guard let u = undoables.removeValue(forKey: id) else { return false }
         u.timer.cancel()
+        for h in u.hidden { h.engine.setHidden(h.rows, false) }
         store.restore(u.snapshot)
         updateBadge()
         NotificationCenter.default.postMailDataChanged(.all)
@@ -348,7 +356,9 @@ final class MailService {
 
     private func commitUndoable(_ id: UUID) {
         guard let u = undoables.removeValue(forKey: id) else { return }
+        // Queued first, then un-hidden: the queued action keeps the rows out of header fetches from here.
         u.commit()
+        for h in u.hidden { h.engine.setHidden(h.rows, false) }
     }
 
     func commitAllUndoables() {
@@ -369,6 +379,9 @@ final class MailService {
             }
             NotificationCenter.default.postMailDataChanged(.folder(folder.id))
         } else {
+            // Moves and deletes still inside their Undo window are sent first, so the folder is emptied
+            // as the user sees it (a message just deleted goes too; one just moved out is kept).
+            commitAllUndoables()
             try await e.emptyFolder(folder)
         }
         updateBadge()
@@ -471,15 +484,25 @@ final class MailService {
     }
 
     private func afterSent(engine: AccountEngine, safetyDraft: MessageRow?, replyTo: MessageRow?, draftToDelete: MessageRow?) {
-        // The server copies are expunged either way. A draft row the cache couldn't drop is recorded,
-        // and goes when the next Drafts sync sees it missing on the server.
-        var cacheOK = true
-        if let d = safetyDraft { engine.queue(.expunge, rows: [d]); cacheOK = store.deleteMessages(ids: [d.id]) && cacheOK }
+        if let d = safetyDraft { discardDraft(d, engine: engine) }
         if let r = replyTo { setFlag([r], flag: .answered, on: true) }
-        if let d = draftToDelete { engine.queue(.expunge, rows: [d]); cacheOK = store.deleteMessages(ids: [d.id]) && cacheOK }
-        if !cacheOK {
-            DiagnosticsLog.record("\(engine.account.email): the sent message's draft couldn't be removed from the mail cache; it will go on the next Drafts sync.")
+        if let d = draftToDelete, d.id != safetyDraft?.id { discardDraft(d, engine: engine) }
+    }
+
+    /// Removes a draft that was sent or replaced: its server copy is queued for expunge and its row
+    /// leaves the cache. A row the cache couldn't drop is logged and the user is told (H-07); it goes
+    /// when the next Drafts sync sees it missing on the server. Returns whether the row was removed.
+    @discardableResult
+    func discardDraft(_ row: MessageRow, engine: AccountEngine) -> Bool {
+        engine.queue(.expunge, rows: [row])
+        guard store.deleteMessages(ids: [row.id]) else {
+            DiagnosticsLog.record("\(engine.account.email): an old draft couldn't be removed from the mail cache; it will go on the next Drafts sync.")
+            (NSApp.delegate as? AppDelegate)?.mainWindow?.showToast(
+                "The old draft is still listed in Drafts. It was removed on the server and will go after the next sync.")
+            return false
         }
+        NotificationCenter.default.postMailDataChanged(.folder(row.folderID))
+        return true
     }
 
     /// Connection-level failures (no route, timeout, closed) mean "try later"; refusals and auth errors don't.

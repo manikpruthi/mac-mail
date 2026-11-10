@@ -37,10 +37,15 @@ over TLS; capabilities are asked for again.
    prefetched in batches, decoded off the main actor, then written.
 2. **Actions** — optimistic local change, then a row in `pending_ops` bound to folder id + UIDVALIDITY.
    Moves/deletes first wait out an 8 s Undo window (`MailService.undoables`, restored from `Store.Snapshot`).
-   Empty Trash/Spam flags every message and uses `UID EXPUNGE` where the server has UIDPLUS; without it a
-   bare `EXPUNGE` runs only when the server's `\Deleted` set is exactly the UIDs just flagged (the ones
-   present when the command started). ALL is snapshotted before DELETED, only messages not already
-   `\Deleted` are flagged, and any failure (STORE chunk, search, mismatch, EXPUNGE) takes back exactly those flags.
+   Empty Trash/Spam (`IMAPClient.expungeAll`) first sends the queued actions for the folder, selects it
+   fresh, snapshots its UIDs and flags only snapshot messages that are not already `\Deleted`. With
+   CONDSTORE each chunk is read with `UID FETCH (FLAGS MODSEQ)` and stored with `UNCHANGEDSINCE`, so a
+   message another client changed in between comes back in `[MODIFIED]` and is never counted as ours;
+   without it the `\Deleted` set is read immediately before each `STORE` (best effort). UIDPLUS expunges
+   the snapshot with `UID EXPUNGE <set>`; otherwise a bare `EXPUNGE` runs only when the server's `\Deleted`
+   set is exactly the snapshot. Any failure takes back exactly the flags the command added.
+   Rows removed locally but still on the server (Undo window or queued) are skipped by header fetches
+   (`AccountEngine.locallyRemovedUIDs`), so a sync or search in between can't bring them back.
 3. **Sending** — `MailService.queueSend`: *waiting* (undoable) → *uploading* → done. A safety draft is
    appended while uploading; connection failures move the finished MIME into the `Outbox` folder on disk.
    Each record (`item.json` plus `message.eml`) is written into a `.tmp` staging folder, renamed into place

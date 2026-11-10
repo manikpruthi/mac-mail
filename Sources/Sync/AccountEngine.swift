@@ -366,6 +366,8 @@ final class AccountEngine {
                     let since = Date().addingTimeInterval(-Double(Prefs.offlineDays) * 86400)
                     uids.formUnion(try await c.uidSearch("SINCE \(MIME.imapSearchDate(since))"))
                 }
+                // Read after the searches: something removed while they were in flight is skipped too.
+                uids.subtract(locallyRemovedUIDs(folderID: folderID, folder: folder))
                 // Newest first, so the top of the list fills in within the first round trip.
                 for chunk in uids.sorted(by: >).chunked(200) {
                     let headers = try await c.fetchHeaders(imapUIDSet(chunk))
@@ -490,6 +492,30 @@ final class AccountEngine {
             .flatMap { $0.uids })
     }
 
+    /// Messages removed locally whose server action is still inside its Undo window (not queued yet).
+    private var undoHidden: [Int64: Set<UInt32>] = [:]
+
+    /// Marks rows as removed locally but not yet queued for the server (the Undo window), or clears it.
+    func setHidden(_ rows: [MessageRow], _ hidden: Bool) {
+        for r in rows {
+            if hidden { undoHidden[r.folderID, default: []].insert(r.uid) }
+            else { undoHidden[r.folderID]?.remove(r.uid) }
+        }
+    }
+
+    /// UIDs the user already moved or deleted here that the server still has: inside the Undo window,
+    /// or queued and not sent yet. A header fetch must skip them, or the messages would reappear in the
+    /// list until the next sync notices they are gone.
+    private func locallyRemovedUIDs(folderID: Int64, folder: Folder) -> Set<UInt32> {
+        var out = undoHidden[folderID] ?? []
+        for op in store.ops(account: account.id) {
+            guard let kind = PendingOpKind(op), kind.needsRefetchOnRefusal,
+                  op.folderID == folderID || (op.folderID == 0 && op.folderPath == folder.path) else { continue }
+            out.formUnion(op.uids)
+        }
+        return out
+    }
+
     /// Waits until no sync is running for the folder, so a caller can then run one that is not coalesced.
     private func waitForSyncToFinish(folderID: Int64) async {
         while syncing.contains(folderID) {
@@ -584,7 +610,8 @@ final class AccountEngine {
                     hi = lo - 1
                     window = min(window * 2, 20_000)
                 }
-                let older = found.sorted(by: >).prefix(200)
+                let removed = self.locallyRemovedUIDs(folderID: folderID, folder: folder)
+                let older = found.filter { !removed.contains($0) }.sorted(by: >).prefix(200)
                 guard !older.isEmpty else { return [] }
                 return try await c.fetchHeaders(imapUIDSet(older))
             }
@@ -763,9 +790,16 @@ final class AccountEngine {
     /// Permanently deletes everything in Trash or Spam (F-10). Refuses any other folder.
     func emptyFolder(_ folder: Folder) async throws {
         guard folder.role == .trash || folder.role == .spam else { throw NetError.server("Only Trash and Spam can be emptied.") }
+        // Queued actions go first: a message just moved here must be emptied with the rest, and one
+        // just rescued from here must have left before the folder is wiped.
+        try await settleOps(for: folder)
         try await syncGate.run {
             let c = try await client(.sync)
-            try self.verifySelection(try await c.ensureSelected(folder.path, readOnly: false), folder: folder)
+            // A fresh SELECT, not the "already selected" shortcut: the emptying works from the
+            // message count and MODSEQ the server reports now, not from an earlier sync.
+            guard let info = try await c.select(folder.path, readOnly: false) else { throw NetError.closed }
+            try self.verifySelection(info, folder: folder)
+            guard !info.readOnly else { throw NetError.server("\"\(folder.name)\" is read-only on the server.") }
             try await c.expungeAll()
         }
         guard store.deleteMessages(folderID: folder.id, uids: store.localUIDs(folderID: folder.id)) else {
@@ -773,6 +807,23 @@ final class AccountEngine {
         }
         store.setServerUnread(folderID: folder.id, 0)
         NotificationCenter.default.postMailDataChanged(.folder(folder.id))
+    }
+
+    /// Sends the queued actions and waits until none concern this folder (as source or as the
+    /// destination of a move). Throws when they can't be sent right now.
+    private func settleOps(for folder: Folder) async throws {
+        for _ in 0..<40 {
+            await flushOps()
+            let waiting = store.ops(account: account.id).contains { op in
+                op.folderID == folder.id || (op.folderID == 0 && op.folderPath == folder.path)
+                    || (op.kind == "move" && op.arg == folder.path)
+            }
+            if !waiting { return }
+            // Our own flush gave up (offline, or the server refused): don't wait for it.
+            if !flushing { break }
+            try await Task.sleep(nanoseconds: 250_000_000)
+        }
+        throw NetError.server("Some actions for \"\(folder.name)\" haven't reached the server yet. Try again in a moment.")
     }
 
     /// Mailbox storage use (KB used, KB limit), nil when the server doesn't support QUOTA (F-27).
@@ -843,7 +894,8 @@ final class AccountEngine {
                     uids = try await c.uidSearch(query.imapCriteria)
                 }
                 let newest = Array(uids.sorted(by: >).prefix(200))
-                let missing = newest.filter { !known.contains($0) }
+                let removed = self.locallyRemovedUIDs(folderID: scope.id, folder: scope)
+                let missing = newest.filter { !known.contains($0) && !removed.contains($0) }
                 try Task.checkCancellation()
                 let headers = missing.isEmpty ? [] : try await c.fetchHeaders(imapUIDSet(missing))
                 try self.store.insertChecked(folderID: scope.id, headers)

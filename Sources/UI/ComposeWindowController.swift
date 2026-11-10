@@ -1188,10 +1188,12 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
                 // the replacement came out empty (V2-04, B-01).
                 let hasContent = !message.textBody.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                     || !message.attachments.isEmpty
+                var removedOld = true
                 if let old, hasContent, newID != nil || engine.isDemo {
-                    engine.queue(.expunge, rows: [old]); MailService.shared.store.deleteMessages(ids: [old.id])
+                    removedOld = MailService.shared.discardDraft(old, engine: engine)
                 }
-                (NSApp.delegate as? AppDelegate)?.mainWindow?.showToast("Draft saved")
+                // A failed cleanup shows its own message; "Draft saved" must not replace it.
+                if removedOld { (NSApp.delegate as? AppDelegate)?.mainWindow?.showToast("Draft saved") }
                 self.discardAutosave()
                 self.cleanUpAndForget()
                 done(true)

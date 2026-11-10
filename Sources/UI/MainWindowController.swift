@@ -694,13 +694,19 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSSearc
         alert.beginSheetModal(for: window) { [weak self] r in
             guard r == .alertFirstButtonReturn else { return }
             Task {
+                // One account's failure must not stop the others from being emptied.
                 var failure: String?
+                var failed = 0
                 for f in folders {
                     do { try await MailService.shared.emptyFolder(f) }
-                    catch { failure = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription; break }
+                    catch {
+                        failed += 1
+                        if failure == nil { failure = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription }
+                    }
                 }
                 if let failure {
-                    self?.toast.show("Couldn't empty \(name): \(failure)")
+                    let scope = folders.count > 1 ? " in \(failed) of \(folders.count) accounts" : ""
+                    self?.toast.show("Couldn't empty \(name)\(scope): \(failure)")
                 } else {
                     self?.toast.show("All \(name) emptied")
                 }

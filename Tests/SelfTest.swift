@@ -826,5 +826,238 @@ MainActor.assumeIsolated {
     }
 }
 
+// MARK: Scripted IMAP server (W-12): Empty Trash failure injection, SELECT and IDLE state
+
+/// An in-memory mailbox behind a ByteTransport, so IMAPClient runs its real wire code against it.
+final class FakeIMAP: ByteTransport, @unchecked Sendable {
+    private let lock = NSLock()
+    private var toClient = Data()
+    private var waiter: CheckedContinuation<Data, Error>?
+    private var inbox = Data()
+    private var closed = false
+    private var idleTag: String?
+
+    // Mailbox state and switches, set before the client connects.
+    var capabilities = "IMAP4rev1 UIDPLUS CONDSTORE IDLE"
+    var deleted: [UInt32: Bool] = [:]           // uid → has \Deleted
+    var failCommands: [String] = []             // a command starting with one of these answers NO
+    var refuseSelect: Set<String> = []
+    /// Conditional STOREs report these UIDs as [MODIFIED] and flag them as another client would have.
+    var modifiedOnStore: Set<UInt32> = []
+    var untaggedBeforeIdle = false
+    private(set) var commands: [String] = []
+
+    func setClosedHandler(_ handler: @escaping @Sendable () -> Void) {}
+    func open() async throws { push("* OK ready\r\n") }
+    func startTLS() async throws {}
+    func discardBuffered() {}
+    func close() {
+        lock.lock(); closed = true; let w = waiter; waiter = nil; lock.unlock()
+        w?.resume(throwing: NetError.closed)
+    }
+
+    private func push(_ text: String) {
+        lock.lock()
+        if let w = waiter { waiter = nil; lock.unlock(); w.resume(returning: Data(text.utf8)); return }
+        toClient.append(Data(text.utf8))
+        lock.unlock()
+    }
+
+    func receive() async throws -> Data {
+        try await withCheckedThrowingContinuation { (c: CheckedContinuation<Data, Error>) in
+            lock.lock()
+            if !toClient.isEmpty { let d = toClient; toClient = Data(); lock.unlock(); c.resume(returning: d) }
+            else if closed { lock.unlock(); c.resume(throwing: NetError.closed) }
+            else { waiter = c; lock.unlock() }
+        }
+    }
+
+    func send(_ data: Data) async throws {
+        for l in takeLines(data) { push(answer(l)) }
+    }
+
+    private func takeLines(_ data: Data) -> [String] {
+        lock.lock(); defer { lock.unlock() }
+        inbox.append(data)
+        var lines: [String] = []
+        while let r = inbox.range(of: Data("\r\n".utf8)) {
+            lines.append(String(decoding: inbox.subdata(in: inbox.startIndex..<r.lowerBound), as: UTF8.self))
+            inbox.removeSubrange(inbox.startIndex..<r.upperBound)
+        }
+        return lines
+    }
+
+    private func uids(_ set: String) -> [UInt32] {
+        var out: [UInt32] = []
+        for piece in set.split(separator: ",") {
+            let ends = piece.split(separator: ":").compactMap { UInt32($0) }
+            guard let lo = ends.min(), let hi = ends.max() else { continue }
+            out += deleted.keys.filter { $0 >= lo && $0 <= hi }
+        }
+        return out.sorted()
+    }
+
+    private func answer(_ line: String) -> String {
+        if line == "DONE" { let t = idleTag ?? "X"; idleTag = nil; return "\(t) OK idle done\r\n" }
+        let sp = line.firstIndex(of: " ") ?? line.endIndex
+        let tag = String(line[..<sp])
+        let cmd = sp < line.endIndex ? String(line[line.index(after: sp)...]) : ""
+        commands.append(cmd)
+        if failCommands.contains(where: { cmd.hasPrefix($0) }) { return "\(tag) NO refused\r\n" }
+        let words = cmd.split(separator: " ").map(String.init)
+        var out = ""
+        var code = ""
+        if cmd.hasPrefix("LOGIN") { code = "[CAPABILITY \(capabilities)] " }
+        else if cmd.hasPrefix("SELECT") || cmd.hasPrefix("EXAMINE") {
+            let name = words[1].trimmingCharacters(in: CharacterSet(charactersIn: "\""))
+            if refuseSelect.contains(name) { return "\(tag) NO no such mailbox\r\n" }
+            out += "* \(deleted.count) EXISTS\r\n* OK [UIDVALIDITY 7] ok\r\n* OK [UIDNEXT 100] ok\r\n"
+            if capabilities.contains("CONDSTORE") { out += "* OK [HIGHESTMODSEQ 5] ok\r\n" }
+            code = "[READ-WRITE] "
+        } else if cmd == "UID SEARCH ALL" {
+            out += "* SEARCH " + deleted.keys.sorted().map(String.init).joined(separator: " ") + "\r\n"
+        } else if cmd == "UID SEARCH DELETED" {
+            out += "* SEARCH " + deleted.filter { $0.value }.keys.sorted().map(String.init).joined(separator: " ") + "\r\n"
+        } else if cmd.hasPrefix("UID SEARCH UID ") {
+            let hits = uids(words[3]).filter { !cmd.hasSuffix("DELETED") || deleted[$0] == true }
+            out += "* SEARCH " + hits.map(String.init).joined(separator: " ") + "\r\n"
+        } else if cmd.hasPrefix("UID FETCH ") {
+            for (i, u) in uids(words[2]).enumerated() {
+                out += "* \(i + 1) FETCH (UID \(u) FLAGS (\(deleted[u] == true ? "\\Deleted" : "\\Seen")) MODSEQ (5))\r\n"
+            }
+        } else if cmd.hasPrefix("UID STORE ") {
+            let conditional = cmd.contains("UNCHANGEDSINCE")
+            var refused: [UInt32] = []
+            for u in uids(words[2]) {
+                if conditional, modifiedOnStore.contains(u) { refused.append(u); deleted[u] = true; continue }
+                deleted[u] = cmd.contains("+FLAGS")
+            }
+            if !refused.isEmpty { code = "[MODIFIED \(refused.map(String.init).joined(separator: ","))] " }
+        } else if cmd.hasPrefix("UID EXPUNGE ") {
+            for u in uids(words[2]) where deleted[u] == true { deleted[u] = nil }
+        } else if cmd == "EXPUNGE" {
+            for (u, d) in deleted where d { deleted[u] = nil }
+        } else if cmd == "IDLE" {
+            idleTag = tag
+            return (untaggedBeforeIdle ? "* 4 EXISTS\r\n" : "") + "+ idling\r\n"
+        }
+        return out + "\(tag) OK \(code)done\r\n"
+    }
+}
+
+/// Runs async test code to completion from this synchronous script; returns what it reported.
+func runAsync(_ body: @escaping @Sendable () async -> [(String, Bool)]) {
+    let done = DispatchSemaphore(value: 0)
+    let results = ResultBox()
+    Task.detached { results.set(await body()); done.signal() }
+    done.wait()
+    for (name, ok) in results.get() { check(name, ok) }
+}
+
+final class ResultBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: [(String, Bool)] = []
+    func set(_ v: [(String, Bool)]) { lock.lock(); value = v; lock.unlock() }
+    func get() -> [(String, Bool)] { lock.lock(); defer { lock.unlock() }; return value }
+}
+
+/// A connected client on a scripted server holding UIDs 1…3, where another client already deleted UID 2.
+func fakeClient(_ configure: (FakeIMAP) -> Void = { _ in }) -> (IMAPClient, FakeIMAP) {
+    let server = FakeIMAP()
+    server.deleted = [1: false, 2: true, 3: false]
+    configure(server)
+    return (IMAPClient(host: "fake", port: 993, username: "u", password: "p", transport: { server }), server)
+}
+
+runAsync {
+    var out: [(String, Bool)] = []
+    func emptied(_ c: IMAPClient) async -> Bool {
+        do { try await c.connect(); try await c.select("Trash"); try await c.expungeAll(); return true } catch { return false }
+    }
+
+    // H-06: UIDPLUS empties from a snapshot, never 1:*.
+    var (c, s) = fakeClient()
+    var ok = await emptied(c)
+    out.append(("empty trash (UIDPLUS + CONDSTORE) empties the folder", ok && s.deleted.isEmpty))
+    out.append(("empty trash never uses 1:*", !s.commands.contains { $0.contains("1:*") }))
+    out.append(("empty trash stores conditionally", s.commands.contains { $0.contains("UNCHANGEDSINCE 5") }))
+
+    // H-06: a refused UID EXPUNGE takes back our flags and leaves the other client's.
+    (c, s) = fakeClient { $0.failCommands = ["UID EXPUNGE"] }
+    ok = await emptied(c)
+    out.append(("failed UID EXPUNGE reports failure", !ok))
+    out.append(("failed UID EXPUNGE rolls back only our flags", s.deleted == [1: false, 2: true, 3: false]))
+
+    // A refused STORE rolls back too.
+    (c, s) = fakeClient { $0.failCommands = ["UID STORE 1,3 (UNCHANGEDSINCE"] }
+    ok = await emptied(c)
+    out.append(("failed STORE leaves the folder as it was", !ok && s.deleted == [1: false, 2: true, 3: false]))
+
+    // H-08: a message another client flagged between the read and the STORE keeps its flag.
+    (c, s) = fakeClient { $0.modifiedOnStore = [3] }
+    ok = await emptied(c)
+    out.append(("[MODIFIED] stops the emptying", !ok))
+    out.append(("[MODIFIED] message keeps the other client's flag", s.deleted == [1: false, 2: true, 3: true]))
+
+    // No UIDPLUS, no CONDSTORE: same snapshot, bare EXPUNGE, same rollback.
+    (c, s) = fakeClient { $0.capabilities = "IMAP4rev1" }
+    ok = await emptied(c)
+    out.append(("empty trash (plain IMAP) empties the folder", ok && s.deleted.isEmpty
+                && s.commands.contains("EXPUNGE") && !s.commands.contains { $0.contains("1:*") }))
+    (c, s) = fakeClient { $0.capabilities = "IMAP4rev1"; $0.failCommands = ["EXPUNGE"] }
+    ok = await emptied(c)
+    out.append(("failed EXPUNGE (plain IMAP) rolls back only our flags", !ok && s.deleted == [1: false, 2: true, 3: false]))
+
+    // An empty folder sends no STORE or EXPUNGE at all.
+    (c, s) = fakeClient { $0.deleted = [:] }
+    ok = await emptied(c)
+    out.append(("empty folder is a no-op", ok && !s.commands.contains { $0.hasPrefix("UID STORE") || $0.contains("EXPUNGE") }))
+
+    // A failed SELECT deselects on the server, so the next "already selected" check must not skip.
+    (c, s) = fakeClient { $0.refuseSelect = ["Gone"] }
+    do {
+        try await c.connect()
+        try await c.ensureSelected("Trash", readOnly: false)
+        _ = try? await c.ensureSelected("Gone", readOnly: false)
+        try await c.ensureSelected("Trash", readOnly: false)
+        out.append(("failed SELECT forgets the old selection", s.commands.filter { $0.hasPrefix("SELECT \"Trash\"") }.count == 2))
+    } catch { out.append(("failed SELECT forgets the old selection", false)) }
+
+    // IDLE: an untagged update before the "+" must not leave IDLE running under the next command.
+    (c, s) = fakeClient { $0.untaggedBeforeIdle = true }
+    do {
+        try await c.connect()
+        try await c.select("Trash")
+        let changed = try await c.idle(maxSeconds: 5)
+        let after = try await c.uidSearch("ALL")
+        out.append(("IDLE reads through early untagged data", changed && after == [1, 2, 3]))
+    } catch { out.append(("IDLE reads through early untagged data", false)) }
+
+    // Queued permanent deletes without UIDPLUS: a message already gone is done, not an error; another
+    // client's pending deletion still blocks the bare EXPUNGE and our flag is taken back.
+    (c, s) = fakeClient { $0.capabilities = "IMAP4rev1"; $0.deleted = [1: false, 3: false] }
+    do {
+        try await c.connect(); try await c.select("Trash")
+        try await c.expungeUIDs([9])
+        try await c.expungeUIDs([1])
+        out.append(("expunge of a vanished message is not an error", s.deleted == [3: false]))
+    } catch { out.append(("expunge of a vanished message is not an error", false)) }
+    (c, s) = fakeClient { $0.capabilities = "IMAP4rev1" }
+    do {
+        try await c.connect(); try await c.select("Trash")
+        var refused = false
+        do { try await c.expungeUIDs([1]) } catch { refused = true }
+        out.append(("expunge spares another client's pending deletion", refused && s.deleted == [1: false, 2: true, 3: false]))
+    } catch { out.append(("expunge spares another client's pending deletion", false)) }
+
+    out.append(("MODIFIED code parsed", IMAPClient.modifiedUIDs("MODIFIED 7,9:11") == [7, 9, 10, 11]
+                && IMAPClient.modifiedUIDs("READ-WRITE").isEmpty))
+    return out
+}
+
+// A flag-only FETCH that lands inside a header fetch is not a message row.
+let strayFetch = FetchResult.from(IMAPParser.parse(parts(["* 5 FETCH (UID 99 FLAGS (\\Seen))"])))
+check("unsolicited flag FETCH is not stored as a header", strayFetch != nil && IMAPClient.parseHeader(strayFetch!, gmail: false) == nil)
+
 print(failures == 0 ? "ALL PASS" : "\(failures) FAILED")
 exit(failures == 0 ? 0 : 1)

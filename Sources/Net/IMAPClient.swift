@@ -80,7 +80,12 @@ actor IMAPClient {
         if commandWaiters.isEmpty { commandBusy = false } else { commandWaiters.removeFirst().resume() }
     }
 
-    init(host: String, port: UInt16, username: String, password: String, security: ConnectionSecurity = .tls) {
+    /// Builds the byte transport; nil uses the real network. Injectable so tests can script a server.
+    private let makeTransport: (@Sendable () -> ByteTransport)?
+
+    init(host: String, port: UInt16, username: String, password: String, security: ConnectionSecurity = .tls,
+         transport: (@Sendable () -> ByteTransport)? = nil) {
+        makeTransport = transport
         self.host = host
         self.port = port
         self.username = username
@@ -105,7 +110,7 @@ actor IMAPClient {
     /// TLS, then LOGIN. Gmail (and most servers) send their capabilities in the LOGIN reply, so the separate
     /// CAPABILITY round trip is only made when they don't; CONDSTORE turns on with the first SELECT (CONDSTORE).
     func connect() async throws {
-        let s = TLSStream(host: host, port: port, security: security)
+        let s = makeTransport.map { TLSStream(transport: $0()) } ?? TLSStream(host: host, port: port, security: security)
         try await s.open()
         stream = s
         do {
@@ -343,48 +348,133 @@ actor IMAPClient {
     }
 
     /// Marks every message in the selected mailbox deleted and expunges (Empty Trash / Empty Spam, F-10).
+    /// The same snapshot-and-rollback runs with and without UIDPLUS (H-06):
+    ///  - ALL is snapshotted first and only the snapshot is flagged and expunged, never `1:*`, so mail
+    ///    that arrives meanwhile is left alone.
+    ///  - Messages another client already flagged \Deleted are not flagged again, so a rollback never
+    ///    takes their flag back. With CONDSTORE the flag read and the STORE are tied together by
+    ///    UNCHANGEDSINCE, which closes the gap between the two (H-08); without it the read happens
+    ///    immediately before each STORE, which is the narrowest window plain IMAP allows.
+    ///  - Any failure takes back exactly the flags this command added, so a later EXPUNGE from any
+    ///    client can't purge the folder after the user was told it failed.
     func expungeAll() async throws {
-        guard lastSelectInfo.exists > 0 else { return }
-        if capabilities.contains("UIDPLUS") {
-            try await run("UID STORE 1:* +FLAGS.SILENT (\\Deleted)")
-            try await run("UID EXPUNGE 1:*", timeout: 300)
-        } else {
-            // Without UIDPLUS a bare EXPUNGE would also purge messages another client flagged \Deleted;
-            // expunge only when the pending deletions are exactly the ones we just made.
-            // ALL is snapshotted first: a message that arrives after it is in neither set, and one that
-            // another client deleted before the DELETED snapshot is in `before`, so it is never taken
-            // for a flag this command added.
-            let ours = try await uidSearch("ALL")
-            guard !ours.isEmpty else { return }
-            let before = Set(try await uidSearch("DELETED"))
-            // Only the snapshot is flagged, never 1:*, so mail that arrives meanwhile is left alone;
-            // messages another client already flagged are not flagged again.
-            let mine = ours.filter { !before.contains($0) }
-            var marked: [UInt32] = []
-            do {
-                for chunk in mine.chunked(1000) {
-                    // Recorded before the command: a STORE that fails may still have been applied.
-                    marked += chunk
-                    try await run("UID STORE \(imapUIDSet(chunk)) +FLAGS.SILENT (\\Deleted)")
+        let ours = try await snapshotUIDs()
+        guard !ours.isEmpty else { return }
+        let uidplus = capabilities.contains("UIDPLUS")
+        let conditional = hasCondstore && lastSelectInfo.highestModseq > 0
+        var marked: [UInt32] = []
+        do {
+            var changedElsewhere = false
+            for chunk in ours.chunked(1000) {
+                let set = imapUIDSet(chunk)
+                var already = Set<UInt32>()
+                var since: UInt64?
+                if conditional {
+                    let rows = try await fetch(set, items: "(UID FLAGS MODSEQ)")
+                    var highest: UInt64 = 0
+                    var complete = true
+                    for r in rows {
+                        guard let uid = r.uid else { continue }
+                        let flags = r.items["FLAGS"]?.list?.compactMap { $0.text?.lowercased() } ?? []
+                        if flags.contains("\\deleted") { already.insert(uid) }
+                        if let m = r.items["MODSEQ"]?.list?.first?.number { highest = max(highest, m) } else { complete = false }
+                    }
+                    if complete, highest > 0 { since = highest }
+                    else { already = Set(try await uidSearch("UID \(set) DELETED")) }
+                } else {
+                    already = Set(try await uidSearch("UID \(set) DELETED"))
                 }
+                let mine = chunk.filter { !already.contains($0) }
+                guard !mine.isEmpty else { continue }
+                let mineSet = imapUIDSet(mine)
+                guard let since else {
+                    // Recorded before the command: a STORE that fails may still have been applied.
+                    marked += mine
+                    try await run("UID STORE \(mineSet) +FLAGS.SILENT (\\Deleted)")
+                    continue
+                }
+                // Conditional STORE: a message another client touched after the flag read is refused and
+                // listed in [MODIFIED], so it is never counted as flagged by this command.
+                var refused = Set<UInt32>()
+                do {
+                    try await run("UID STORE \(mineSet) (UNCHANGEDSINCE \(since)) +FLAGS.SILENT (\\Deleted)")
+                    refused = Self.modifiedUIDs(lastTaggedCode)
+                } catch NetError.server(let message) {
+                    // Some servers answer NO [MODIFIED …] when nothing could be changed.
+                    let code = lastTaggedCode ?? ""
+                    guard code.uppercased().hasPrefix("MODIFIED") else {
+                        marked += mine
+                        throw NetError.server(message)
+                    }
+                    refused = Self.modifiedUIDs(code)
+                } catch {
+                    marked += mine
+                    throw error
+                }
+                marked += mine.filter { !refused.contains($0) }
+                if !refused.isEmpty { changedElsewhere = true }
+            }
+            guard !changedElsewhere else {
+                throw NetError.server("The folder changed while it was being emptied. Try again.")
+            }
+            if uidplus {
+                // UID EXPUNGE only touches the snapshot, so other pending deletions outside it survive.
+                for chunk in ours.chunked(1000) {
+                    try await run("UID EXPUNGE \(imapUIDSet(chunk))", timeout: 300)
+                }
+            } else {
+                // A bare EXPUNGE purges every \Deleted message, so it only runs when the pending
+                // deletions are exactly the snapshot. Anything else (a message that arrived already
+                // deleted by another client) is reported instead of telling the user the folder is empty.
                 let deleted = Set(try await uidSearch("DELETED"))
-                // A message arrived already deleted by another client. Not expunged: reporting success
-                // here would tell the user the folder is empty when it isn't.
                 guard deleted == Set(ours) else {
                     throw NetError.server("The folder changed while it was being emptied. Try again.")
                 }
                 try await run("EXPUNGE", timeout: 300)
-            } catch {
-                // Any failure (a chunk STORE, the DELETED search, the EXPUNGE or the mismatch above):
-                // take back only the flags this command added (theirs stay), so a later EXPUNGE from any
-                // client can't purge the folder after the user was told it failed. Best effort: on a dead
-                // connection there is nothing left to send.
-                for chunk in marked.chunked(1000) {
-                    _ = try? await run("UID STORE \(imapUIDSet(chunk)) -FLAGS.SILENT (\\Deleted)")
-                }
-                throw error
             }
+        } catch {
+            // Best effort: on a dead connection there is nothing left to send. UIDs that were already
+            // expunged are simply ignored by the server.
+            for chunk in marked.chunked(1000) {
+                _ = try? await run("UID STORE \(imapUIDSet(chunk)) -FLAGS.SILENT (\\Deleted)")
+            }
+            throw error
         }
+    }
+
+    /// Every UID in the selected mailbox. A big mailbox is read in UID windows: `UID SEARCH ALL` answers
+    /// on one line, and a line over the 1 MB limit would drop the connection.
+    private func snapshotUIDs() async throws -> [UInt32] {
+        let info = lastSelectInfo
+        guard info.exists > 50_000 else { return try await uidSearch("ALL") }
+        var top = UInt64(info.uidNext > 0 ? info.uidNext - 1 : 0)
+        if top == 0 {
+            top = UInt64(try await fetch("*", items: "(UID)", uid: false).compactMap { $0.uid }.max() ?? 0)
+        }
+        var out: [UInt32] = []
+        var lo: UInt64 = 1
+        while lo <= top {
+            let hi = min(top, lo + 19_999)
+            // `lo:hi` past the last message can still return the last one (RFC 3501 ranges); keep the window.
+            out += try await uidSearch("UID \(lo):\(hi)").filter { UInt64($0) >= lo && UInt64($0) <= hi }
+            lo = hi + 1
+        }
+        return out
+    }
+
+    /// UIDs from a tagged `[MODIFIED 7,9:12]` response code (RFC 7162); empty for any other code.
+    static func modifiedUIDs(_ code: String?) -> Set<UInt32> {
+        let parts = (code ?? "").split(separator: " ")
+        guard parts.count >= 2, parts[0].uppercased() == "MODIFIED" else { return [] }
+        var out = Set<UInt32>()
+        for piece in parts[1].split(separator: ",") {
+            let ends = piece.split(separator: ":").compactMap { UInt32($0) }
+            guard let lo = ends.min(), let hi = ends.max() else { continue }
+            // A hostile range must not allocate the whole UID space.
+            guard hi - lo <= 100_000 else { continue }
+            for u in lo...hi { out.insert(u) }
+        }
+        return out
     }
 
     /// Storage quota for the account's root (F-27): (used KB, limit KB), nil when the server has no QUOTA.
@@ -427,6 +517,10 @@ actor IMAPClient {
         if !force, selectedPath == path, readOnly || !selectedReadOnly { return nil }
         let verb = readOnly ? "EXAMINE" : "SELECT"
         let suffix = hasCondstore ? " (CONDSTORE)" : ""
+        // A failed SELECT leaves the connection with no mailbox selected (RFC 3501 §6.3.1), so the old
+        // selection is forgotten first; otherwise the next "already selected" shortcut would be wrong.
+        selectedPath = nil
+        lastSelectInfo = SelectInfo()
         let rs = try await run("\(verb) \(MailboxName.encode(path).imapQuoted)\(suffix)")
         selectedPath = path
         var info = SelectInfo()
@@ -530,8 +624,12 @@ actor IMAPClient {
     /// Bare EXPUNGE only when the pending deletions are exactly these UIDs, so other clients' deleted
     /// messages survive (a subset check would still let EXPUNGE purge theirs).
     private func expungeExactly(_ uids: [UInt32]) async throws {
+        // Only the UIDs that still exist count: one already removed elsewhere (another client, Empty
+        // Trash) is simply done, not a mismatch to report.
+        let present = Set(try await uidSearch("UID \(imapUIDSet(uids))")).intersection(uids)
+        guard !present.isEmpty else { return }
         let deleted = Set(try await uidSearch("DELETED"))
-        guard deleted == Set(uids) else {
+        guard deleted == present else {
             // Un-flag what we marked: a bare EXPUNGE now would also purge another client's pending
             // deletions, and returning would drop the op as success while the message survives here.
             try await run("UID STORE \(imapUIDSet(uids)) -FLAGS.SILENT (\\Deleted)")
@@ -559,11 +657,32 @@ actor IMAPClient {
         guard let s = stream else { throw NetError.closed }
         let tag = nextTag()
         try await s.send("\(tag) IDLE\r\n")
-        // The initial "+" is as unbound as any other read: a silent server must not hang the idle lane.
-        let first = try await withReadTimeout(Limits.greetingTimeout) { try await self.readResponse() }
-        guard first.isContinuation else {
-            if first.tag == tag { throw NetError.server(first.text) }
-            return true
+        // Untagged updates may arrive before the "+": returning on one would leave IDLE running on the
+        // wire and desynchronise the next command, so read on until the continuation (or a refusal).
+        // The wait is as unbound as any other read: a silent server must not hang the idle lane.
+        var changedEarly = false
+        do {
+            try await withReadTimeout(Limits.greetingTimeout) {
+                var turns = 0
+                while true {
+                    turns += 1
+                    guard turns <= Limits.maxUntagged else { throw NetError.protocolError("too many untagged responses") }
+                    let r = try await self.readResponse()
+                    if r.isContinuation { return }
+                    if r.tag == tag { throw NetError.server(r.text.isEmpty ? "IDLE failed" : r.text) }
+                    if r.isUntagged && r.status == "BYE" { throw NetError.closed }
+                    if r.isUntagged, r.values.count >= 2, let word = r.values[1].text?.uppercased(),
+                       word == "EXISTS" || word == "EXPUNGE" || word == "FETCH" { changedEarly = true }
+                }
+            }
+        } catch let e as NetError {
+            // A tagged refusal leaves the connection usable; anything else means it is out of step.
+            if case .server = e { throw e }
+            await drop()
+            throw e
+        } catch {
+            await drop()
+            throw error
         }
         idleTag = tag
         idleDoneSent = false
@@ -578,9 +697,10 @@ actor IMAPClient {
             await s.close()
         }
         defer { timer.cancel(); watchdog.cancel(); idleTag = nil }
-        var changed = false
+        var changed = changedEarly
         var turns = 0
         do {
+            if changedEarly { await endIdle() }
             while true {
                 turns += 1
                 guard turns <= Limits.maxUntagged else {
@@ -624,8 +744,9 @@ actor IMAPClient {
     }
 
     static func parseHeader(_ r: FetchResult, gmail: Bool) -> ParsedHeader? {
-        guard let uid = r.uid else { return nil }
-        let headerData = r.item(prefix: "BODY[HEADER")?.data ?? Data()
+        // An unsolicited flag update (`* 5 FETCH (UID 9 FLAGS (..))`) can arrive in the middle of a header
+        // fetch; without the header block it is not a message row and must not be stored as a blank one.
+        guard let uid = r.uid, let headerData = r.item(prefix: "BODY[HEADER")?.data else { return nil }
         let h = MIME.parseHeaders(headerData)
         let flags = MessageFlags.from(imapFlags: r.items["FLAGS"]?.list?.compactMap { $0.text } ?? [])
         let date = r.items["INTERNALDATE"]?.text.flatMap { MIME.parseInternalDate($0) } ?? Date()
