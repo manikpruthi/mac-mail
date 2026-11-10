@@ -742,6 +742,18 @@ final class Store {
         fileprivate var messages: [(columns: [String], values: [Any?])] = []
         fileprivate var bodies: [(columns: [String], values: [Any?])] = []
         var isEmpty: Bool { messages.isEmpty }
+
+        /// The snapshot without these messages (and their bodies).
+        func removing(ids: Set<Int64>) -> Snapshot {
+            func keeps(_ r: (columns: [String], values: [Any?]), _ column: String) -> Bool {
+                guard let i = r.columns.firstIndex(of: column), let id = r.values[i] as? Int64 else { return true }
+                return !ids.contains(id)
+            }
+            var out = Snapshot()
+            out.messages = messages.filter { keeps($0, "id") }
+            out.bodies = bodies.filter { keeps($0, "message_id") }
+            return out
+        }
     }
 
     func snapshot(ids: [Int64]) -> Snapshot {

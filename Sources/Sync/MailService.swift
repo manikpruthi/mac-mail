@@ -166,6 +166,10 @@ final class MailService {
     }
 
     func removeAccount(_ id: String) {
+        // Moves and deletes of this account still inside their Undo window are dropped, not sent: the
+        // account's queue is about to go, and a later commit or Undo would write rows for an account
+        // that no longer exists.
+        _ = takeParts { $0.engine.account.id == id }
         engines[id]?.shutdown()
         engines[id] = nil
         accounts.removeAll { $0.id == id }
@@ -240,11 +244,23 @@ final class MailService {
 
     /// An optimistic local change whose server operation waits out the Undo window (F-08).
     private struct Undoable {
-        let snapshot: Store.Snapshot
-        let commit: () -> Void
+        var snapshot: Store.Snapshot
         let timer: DispatchWorkItem
-        /// The rows hidden from header fetches until the action is queued or undone.
-        let hidden: [(engine: AccountEngine, rows: [MessageRow])]
+        /// One part per account. Its rows stay hidden from header fetches until it is queued or undone.
+        var parts: [Part]
+
+        struct Part {
+            let engine: AccountEngine
+            let rows: [MessageRow]
+            /// The folder the rows are moving into; nil for a permanent delete.
+            let destinationID: Int64?
+            let commit: () -> Void
+
+            /// Whether this part takes messages out of the folder or puts them into it.
+            func touches(_ folderID: Int64) -> Bool {
+                destinationID == folderID || rows.contains { $0.folderID == folderID }
+            }
+        }
     }
 
     private var undoables: [UUID: Undoable] = [:]
@@ -256,8 +272,7 @@ final class MailService {
     func move(_ rows: [MessageRow], to target: MoveTarget) -> MoveResult? {
         var done = 0
         var label = ""
-        var commits: [() -> Void] = []
-        var hidden: [(engine: AccountEngine, rows: [MessageRow])] = []
+        var parts: [Undoable.Part] = []
         var removedIDs: [Int64] = []
         var creatingArchive: [(AccountEngine, [MessageRow])] = []
         for (acct, list) in Dictionary(grouping: rows, by: { $0.accountID }) {
@@ -290,8 +305,7 @@ final class MailService {
             }
             // Deleting from Trash (or Spam) removes the message for good.
             if case .trash = target, list.allSatisfy({ $0.folderRole == .trash || $0.folderRole == .spam }) {
-                commits.append { engine.queue(.expunge, rows: list) }
-                hidden.append((engine, list))
+                parts.append(.init(engine: engine, rows: list, destinationID: nil) { engine.queue(.expunge, rows: list) })
                 removedIDs += list.map { $0.id }
                 label = "Deleted permanently"
                 done += list.count
@@ -300,8 +314,9 @@ final class MailService {
             guard let dest = destination else { continue }
             let movable = list.filter { $0.folderID != dest.id }
             guard !movable.isEmpty else { continue }
-            commits.append { engine.queue(.move(toPath: dest.path), rows: movable) }
-            hidden.append((engine, movable))
+            parts.append(.init(engine: engine, rows: movable, destinationID: dest.id) {
+                engine.queue(.move(toPath: dest.path), rows: movable)
+            })
             removedIDs += movable.map { $0.id }
             done += movable.count
         }
@@ -323,11 +338,10 @@ final class MailService {
             // Rows the cache couldn't remove stay where they are, and the server is told nothing.
             guard store.deleteMessages(ids: removedIDs) else { return nil }
             let id = UUID()
-            let commitAll = { for c in commits { c() } }
             let timer = DispatchWorkItem { MainActor.assumeIsolated { MailService.shared.commitUndoable(id) } }
             // Until the action is queued, a sync must not bring these rows back from the server.
-            for h in hidden { h.engine.setHidden(h.rows, true) }
-            undoables[id] = Undoable(snapshot: snapshot, commit: commitAll, timer: timer, hidden: hidden)
+            for part in parts { part.engine.setHidden(part.rows, true) }
+            undoables[id] = Undoable(snapshot: snapshot, timer: timer, parts: parts)
             DispatchQueue.main.asyncAfter(deadline: .now() + Self.undoWindow, execute: timer)
             undoID = id
         }
@@ -347,7 +361,7 @@ final class MailService {
     func undo(_ id: UUID) -> Bool {
         guard let u = undoables.removeValue(forKey: id) else { return false }
         u.timer.cancel()
-        for h in u.hidden { h.engine.setHidden(h.rows, false) }
+        for part in u.parts { part.engine.setHidden(part.rows, false) }
         store.restore(u.snapshot)
         updateBadge()
         NotificationCenter.default.postMailDataChanged(.all)
@@ -356,9 +370,39 @@ final class MailService {
 
     private func commitUndoable(_ id: UUID) {
         guard let u = undoables.removeValue(forKey: id) else { return }
+        for part in u.parts { commit(part) }
+    }
+
+    private func commit(_ part: Undoable.Part) {
         // Queued first, then un-hidden: the queued action keeps the rows out of header fetches from here.
-        u.commit()
-        for h in u.hidden { h.engine.setHidden(h.rows, false) }
+        part.commit()
+        part.engine.setHidden(part.rows, false)
+    }
+
+    /// Sends the waiting moves and deletes that take messages out of this folder or put them into it,
+    /// and nothing else: other folders and other accounts keep their Undo window.
+    private func commitUndoables(touching folderID: Int64) {
+        for part in takeParts({ $0.touches(folderID) }) { commit(part) }
+    }
+
+    /// Takes the matching parts out of the Undo window and returns them. An action that spans accounts
+    /// is split: Undo then puts back only what is still waiting.
+    private func takeParts(_ matches: (Undoable.Part) -> Bool) -> [Undoable.Part] {
+        var taken: [Undoable.Part] = []
+        for (id, u) in undoables {
+            let hit = u.parts.filter(matches)
+            guard !hit.isEmpty else { continue }
+            taken += hit
+            let rest = u.parts.filter { !matches($0) }
+            if rest.isEmpty {
+                u.timer.cancel()
+                undoables[id] = nil
+            } else {
+                undoables[id]?.parts = rest
+                undoables[id]?.snapshot = u.snapshot.removing(ids: Set(hit.flatMap { $0.rows.map { $0.id } }))
+            }
+        }
+        return taken
     }
 
     func commitAllUndoables() {
@@ -366,6 +410,21 @@ final class MailService {
             undoables[id]?.timer.cancel()
             commitUndoable(id)
         }
+    }
+
+    /// Delete Folder. Moves into or out of the folder that are still inside their Undo window are sent
+    /// first (then the queued ones, in the engine), so a message just moved out is not deleted with it.
+    func deleteFolder(_ folder: Folder) async throws {
+        guard let e = engines[folder.accountID] else { throw NetError.server("Account not found") }
+        commitUndoables(touching: folder.id)
+        try await e.deleteFolder(folder)
+    }
+
+    /// Rename Folder. Waiting moves name the folder by its old path, so they are sent first.
+    func renameFolder(_ folder: Folder, to name: String) async throws {
+        guard let e = engines[folder.accountID] else { throw NetError.server("Account not found") }
+        commitUndoables(touching: folder.id)
+        try await e.renameFolder(folder, to: name)
     }
 
     /// Mark everything in a folder read — F-11 is deliberately not offered (risky bulk action).
@@ -379,9 +438,10 @@ final class MailService {
             }
             NotificationCenter.default.postMailDataChanged(.folder(folder.id))
         } else {
-            // Moves and deletes still inside their Undo window are sent first, so the folder is emptied
-            // as the user sees it (a message just deleted goes too; one just moved out is kept).
-            commitAllUndoables()
+            // Moves and deletes into or out of this folder that are still inside their Undo window are
+            // sent first, so the folder is emptied as the user sees it (a message just deleted goes too;
+            // one just moved out is kept). Actions elsewhere keep their Undo window.
+            commitUndoables(touching: folder.id)
             try await e.emptyFolder(folder)
         }
         updateBadge()
@@ -405,7 +465,9 @@ final class MailService {
         case sent
         /// Couldn't reach the server: the message is in the outbox and goes out when the network is back (F-07).
         case queued
-        case failed(Error)
+        /// `safetyDraft` is the copy written to Drafts while the send ran, when there is one. It is now
+        /// the message's only draft (the one it was opened from is gone), so the composer takes it over.
+        case failed(Error, safetyDraft: MessageRow?)
     }
 
     /// Shown when the final "." went out but no reply confirmed it: the server may have delivered the
@@ -438,7 +500,9 @@ final class MailService {
             self.sendStates[p.id] = .uploading
             NotificationCenter.default.post(name: .mailSendStateChanged, object: nil)
             defer { self.forgetSend(p.id) }
-            guard let engine = self.engines[p.accountID] else { onResult(.failed(NetError.server("Account not found"))); return }
+            guard let engine = self.engines[p.accountID] else {
+                onResult(.failed(NetError.server("Account not found"), safetyDraft: nil)); return
+            }
             if engine.isDemo { onResult(.sent); return }
             // A draft copy is written while the send runs so a quit or a failure can't lose the message
             // (the composer is hidden by then); it is deleted once SMTP accepts (V2-08).
@@ -453,7 +517,20 @@ final class MailService {
             } catch {
                 // The safety copy failed; the send itself can still go out.
             }
+            // The Bcc line never travels in draft MIME; it is kept on the row so reopening restores it.
+            if let id = safetyDraftID, !message.bcc.isEmpty {
+                self.store.setBcc(ids: [id], bcc: message.bcc.map { $0.full }.joined(separator: ", "))
+            }
             let safetyDraft = safetyDraftID.flatMap { self.store.rows(ids: [$0]).first }
+            // A send that failed leaves exactly one draft: the safety copy, which is the newest full
+            // version and is confirmed on the server. The draft the message was opened from goes, and the
+            // composer takes the safety copy over, so sending again or saving replaces it, not adds to it.
+            let failed = { (error: Error) in
+                if let safetyDraft, let old = p.draftToDelete, old.id != safetyDraft.id {
+                    self.discardDraft(old, engine: engine)
+                }
+                onResult(.failed(error, safetyDraft: safetyDraft))
+            }
             var finishing = false
             do {
                 try await engine.send(message, progress: { if case .finishing = $0 { finishing = true } })
@@ -463,7 +540,7 @@ final class MailService {
                 if finishing, Self.isOffline(error) {
                     // The final "." went out but the reply never came: queueing the same MIME could deliver
                     // it twice (F-01). Keep the safety draft and tell the user to check Sent.
-                    onResult(.failed(DeliveryUncertainError()))
+                    failed(DeliveryUncertainError())
                 } else if Self.isOffline(error) {
                     // Network trouble, not a refusal: park it in the outbox instead of failing (F-07).
                     do {
@@ -472,10 +549,10 @@ final class MailService {
                                             mime: mime)
                         onResult(.queued)
                     } catch {
-                        onResult(.failed(error))
+                        failed(error)
                     }
                 } else {
-                    onResult(.failed(error))
+                    failed(error)
                 }
             }
         }

@@ -474,8 +474,14 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSSearc
     @objc func archiveMessages(_ sender: Any?) { move(rows(for: sender), to: .archive) }
     @objc func deleteMessages(_ sender: Any?) {
         let rows = rows(for: sender)
-        if !rows.isEmpty, rows.allSatisfy({ $0.folderRole == .trash || $0.folderRole == .spam }) {
-            MessageActions.confirmPermanentDelete(rows, in: window) { [weak self] in
+        // MailService.move deletes for good, per account, when everything chosen in that account is
+        // already in Trash or Spam. Ask about exactly those rows, also in a selection that mixes
+        // accounts (a unified view or search), where the others are only moved to Trash.
+        let permanent = Dictionary(grouping: rows, by: { $0.accountID }).values
+            .filter { $0.allSatisfy { $0.folderRole == .trash || $0.folderRole == .spam } }
+            .flatMap { $0 }
+        if !permanent.isEmpty {
+            MessageActions.confirmPermanentDelete(permanent, in: window) { [weak self] in
                 self?.move(rows, to: .trash)
             }
             return

@@ -97,7 +97,8 @@ enum MIME {
         var currentValue = ""
         func flush() {
             if let n = currentName, result[n] == nil {
-                result[n] = decodeEncodedWords(currentValue.trimmingCharacters(in: .whitespaces))
+                let value = currentValue.trimmingCharacters(in: .whitespaces)
+                result[n] = addressHeaders.contains(n) ? decodeAddressHeader(value) : decodeEncodedWords(value)
             }
         }
         for line in raw.components(separatedBy: "\n") {
@@ -120,6 +121,18 @@ enum MIME {
         return result
     }
 
+    private static let addressHeaders: Set<String> = ["from", "to", "cc", "bcc", "reply-to", "sender"]
+
+    /// Decodes the encoded words of an address header one address at a time. Decoding the whole line
+    /// first would let a decoded comma, quote or bracket in a display name ("Müller, Hans") split one
+    /// address into two; each decoded name is written back quoted where it needs to be.
+    static func decodeAddressHeader(_ raw: String) -> String {
+        guard raw.contains("=?") else { return raw }
+        return parseAddresses(raw)
+            .map { EmailAddress(name: decodeEncodedWords($0.name), email: $0.email).full }
+            .joined(separator: ", ")
+    }
+
     private static let encodedWord = try! NSRegularExpression(pattern: "=\\?([^?\\s]+)\\?([bBqQ])\\?([^?]*)\\?=")
 
     /// Decodes RFC 2047 encoded words ("=?UTF-8?B?...?="). Whitespace between adjacent words is dropped.
@@ -131,24 +144,32 @@ enum MIME {
         var out = ""
         var last = 0
         var previousWasWord = false
+        // Adjacent words in one charset are joined as bytes before the charset conversion: senders
+        // split long text wherever the length limit falls, which can be in the middle of a character.
+        var pending = Data()
+        var pendingCharset = ""
+        func flush() {
+            if !pending.isEmpty { out += string(from: pending, charset: pendingCharset) }
+            pending = Data()
+        }
         for m in matches {
             let gap = ns.substring(with: NSRange(location: last, length: m.range.location - last))
-            if !(previousWasWord && gap.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty) {
-                out += gap
-            }
-            let charset = ns.substring(with: m.range(at: 1)).components(separatedBy: "*").first ?? "utf-8"
+            let adjacent = previousWasWord && gap.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            let charset = (ns.substring(with: m.range(at: 1)).components(separatedBy: "*").first ?? "utf-8").lowercased()
+            if !adjacent || charset != pendingCharset { flush() }
+            if !adjacent { out += gap }
             let mode = ns.substring(with: m.range(at: 2)).uppercased()
             let text = ns.substring(with: m.range(at: 3))
-            let data: Data
             if mode == "B" {
-                data = decodeBase64(Data(text.utf8))
+                pending.append(decodeBase64(Data(text.utf8)))
             } else {
-                data = decodeQuotedPrintable(Data(text.utf8), underscoreIsSpace: true)
+                pending.append(decodeQuotedPrintable(Data(text.utf8), underscoreIsSpace: true))
             }
-            out += string(from: data, charset: charset)
+            pendingCharset = charset
             last = m.range.location + m.range.length
             previousWasWord = true
         }
+        flush()
         out += ns.substring(from: last)
         return out
     }
@@ -200,7 +221,11 @@ enum MIME {
         var current = ""
         var inQuote = false
         var inAngle = false
+        var escaped = false
         for ch in s {
+            // A backslash inside a quoted name escapes the next character ("Bob \"the\" Smith").
+            if escaped { escaped = false; current.append(ch); continue }
+            if inQuote, ch == "\\" { escaped = true; current.append(ch); continue }
             switch ch {
             case "\"": inQuote.toggle(); current.append(ch)
             case "<" where !inQuote: inAngle = true; current.append(ch)
@@ -220,8 +245,17 @@ enum MIME {
         if let lt = s.lastIndex(of: "<"), let gt = s.lastIndex(of: ">"), lt < gt {
             let email = String(s[s.index(after: lt)..<gt]).trimmingCharacters(in: .whitespaces)
             var name = String(s[..<lt]).trimmingCharacters(in: .whitespaces)
-            if name.hasPrefix("\"") && name.hasSuffix("\"") && name.count >= 2 { name = String(name.dropFirst().dropLast()) }
-            name = name.replacingOccurrences(of: "\\\"", with: "\"")
+            if name.hasPrefix("\"") && name.hasSuffix("\"") && name.count >= 2 {
+                // Quoted: drop the quotes and undo the backslash escapes (\" and \\).
+                var plain = ""
+                var escaped = false
+                for ch in name.dropFirst().dropLast() {
+                    if !escaped, ch == "\\" { escaped = true; continue }
+                    plain.append(ch)
+                    escaped = false
+                }
+                name = plain
+            }
             return EmailAddress(name: name, email: cleanEmail(email))
         }
         // "addr (Name)" comment form.

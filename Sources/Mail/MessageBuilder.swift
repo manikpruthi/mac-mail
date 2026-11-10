@@ -42,7 +42,10 @@ enum MessageBuilder {
         out += "From: \(encodeAddress(m.from))\r\n"
         if !to.isEmpty { out += foldHeader("To: " + to.map(encodeAddress).joined(separator: ", ")) + "\r\n" }
         if !cc.isEmpty { out += foldHeader("Cc: " + cc.map(encodeAddress).joined(separator: ", ")) + "\r\n" }
-        out += "Subject: \(encodeHeaderText(m.subject))\r\n"
+        // An encoded subject is already folded word by word; a long plain one is folded at its spaces,
+        // so the line stays far below SMTP's 998-byte limit.
+        let subject = encodeHeaderText(m.subject)
+        out += (subject.contains("\r\n") ? "Subject: \(subject)" : foldHeader("Subject: \(subject)")) + "\r\n"
         out += "Date: \(MIME.rfc2822(date))\r\n"
         let mid = m.messageID.flatMap { id -> String? in
             let bare = MailSafety.stripControls(id).trimmingCharacters(in: CharacterSet(charactersIn: "<> "))

@@ -39,6 +39,8 @@ enum HTMLPrep {
     // Bodyless tags that can still trigger loads or rewrites (meta refresh, base, remote styles).
     private static let voidActive = try! NSRegularExpression(
         pattern: "<(?:meta\\b[^>]*http-equiv[^>]*|base\\b[^>]*|link\\b[^>]*)>", options: [.caseInsensitive])
+    private static let leadingDoctype = try! NSRegularExpression(
+        pattern: "^(?:\\s|\u{FEFF}|<!--[\\s\\S]*?-->|<\\?[^>]*>)*<!doctype[^>]*>", options: [.caseInsensitive])
     private static let headOpen = try! NSRegularExpression(pattern: "<head\\b[^>]*>", options: [.caseInsensitive])
     private static let urlLink = try! NSRegularExpression(pattern: "(https?://[^\\s<>\"]+)", options: [])
 
@@ -175,8 +177,17 @@ enum HTMLPrep {
         \(darkCSS)
         """
         let ns = s as NSString
-        if let m = headOpen.firstMatch(in: s, range: NSRange(location: 0, length: ns.length)) {
-            s = ns.replacingCharacters(in: NSRange(location: m.range.location + m.range.length, length: 0), with: style)
+        if headOpen.firstMatch(in: s, range: NSRange(location: 0, length: ns.length)) != nil {
+            // The policy goes in a head of its own at the very start, never after the email's own
+            // "<head>": that text can sit inside a comment, <title> or <style>, where a policy placed
+            // after it would be inert. The parser merges the email's <html>/<head>/<body> into this
+            // one. A leading doctype stays first so the page keeps its rendering mode.
+            let own = "<head>\(style)</head>"
+            if let d = leadingDoctype.firstMatch(in: s, range: NSRange(location: 0, length: ns.length)) {
+                s = ns.replacingCharacters(in: NSRange(location: d.range.location + d.range.length, length: 0), with: own)
+            } else {
+                s = own + s
+            }
         } else {
             s = "<!doctype html><html><head>\(style)</head><body>\(s)</body></html>"
         }

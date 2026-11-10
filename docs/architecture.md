@@ -37,6 +37,10 @@ over TLS; capabilities are asked for again.
    prefetched in batches, decoded off the main actor, then written.
 2. **Actions** — optimistic local change, then a row in `pending_ops` bound to folder id + UIDVALIDITY.
    Moves/deletes first wait out an 8 s Undo window (`MailService.undoables`, restored from `Store.Snapshot`).
+   An undoable holds one part per account (rows, destination folder, commit). Empty Trash/Spam, Delete
+   Folder and Rename Folder take out and commit only the parts that touch that folder (`takeParts`),
+   trimming the snapshot (`Snapshot.removing`) so Undo restores just what is still waiting; removing an
+   account drops its parts unsent. Delete/Rename Folder then settle the folder's queued ops like Empty does.
    Empty Trash/Spam (`IMAPClient.expungeAll`) first sends the queued actions for the folder, selects it
    fresh, snapshots its UIDs and flags only snapshot messages that are not already `\Deleted`. With
    CONDSTORE each chunk is read with `UID FETCH (FLAGS MODSEQ)` and stored with `UNCHANGEDSINCE`, so a
@@ -48,6 +52,9 @@ over TLS; capabilities are asked for again.
    (`AccountEngine.locallyRemovedUIDs`), so a sync or search in between can't bring them back.
 3. **Sending** — `MailService.queueSend`: *waiting* (undoable) → *uploading* → done. A safety draft is
    appended while uploading; connection failures move the finished MIME into the `Outbox` folder on disk.
+   Any other failure reports `.failed(error, safetyDraft:)`: the draft the message was opened from is
+   discarded (the safety copy is newer and confirmed on the server) and the composer adopts the safety
+   copy as its `draftRow`, so the next send or save replaces it instead of leaving two drafts.
    Each record (`item.json` plus `message.eml`) is written into a `.tmp` staging folder, renamed into place
    and read back before the queue reports it; an unreadable record is moved to `Outbox Corrupt` off the main
    thread instead of being dropped. A decision the item's own folder can't store (it refused a delete) is
@@ -73,6 +80,7 @@ never hands out a connection opened with the old settings.
 
 ## Rendering
 
-One reused `WKWebView` per reading pane, scripts off, a content rule list plus CSP blocking the network,
+One reused `WKWebView` per reading pane, scripts off, a content rule list plus CSP blocking the network (the CSP sits in a head of its own at the start of the
+document, after a leading doctype only, never after the email's own `<head>` text),
 every image routed through `lm://` to `ImageLoader`, which enforces size budgets, SSRF checks and
 downsampling. Web views are torn down a minute after the app goes to the background.

@@ -755,6 +755,8 @@ final class AccountEngine {
         guard folder.role == .none else { throw NetError.server("System folders can't be renamed.") }
         let clean = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !clean.isEmpty, !clean.contains(folder.delimiter) else { throw NetError.server("Enter a valid folder name.") }
+        // Queued actions name the folder by its current path; they are sent before it changes.
+        try await settleOps(for: folder)
         var comps = folder.path.components(separatedBy: folder.delimiter)
         comps[comps.count - 1] = clean
         let newPath = comps.joined(separator: folder.delimiter)
@@ -770,6 +772,9 @@ final class AccountEngine {
 
     func deleteFolder(_ folder: Folder) async throws {
         guard folder.role == .none else { throw NetError.server("System folders can't be deleted.") }
+        // Queued actions go first: a message just moved out of this folder must have left it before
+        // the server deletes the folder with everything in it.
+        try await settleOps(for: folder)
         try await syncGate.run {
             let c = try await client(.sync)
             try await c.deleteMailbox(folder.path)

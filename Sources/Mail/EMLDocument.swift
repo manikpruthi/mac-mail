@@ -67,6 +67,15 @@ struct EMLDocument {
     /// Splits at the first empty line (CRLF CRLF or LF LF). Works on a slice of the byte array; no copies.
     static func splitHeader(_ bytes: ArraySlice<UInt8>) -> (ArraySlice<UInt8>, ArraySlice<UInt8>) {
         var i = bytes.startIndex
+        // An entity with no headers starts with the empty line itself (a MIME part may have none);
+        // looking further would take the first paragraph of its body for a header block.
+        if let first = bytes.first {
+            if first == 10 { return (bytes[i..<i], bytes[bytes.index(after: i)...]) }
+            let second = bytes.index(after: i)
+            if first == 13, second < bytes.endIndex, bytes[second] == 10 {
+                return (bytes[i..<i], bytes[bytes.index(after: second)...])
+            }
+        }
         while i < bytes.endIndex {
             if bytes[i] == 10 {
                 let next = bytes.index(after: i)

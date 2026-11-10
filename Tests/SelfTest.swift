@@ -105,6 +105,22 @@ for chunk in stride(from: 0, to: encoded.count, by: 777) { decoded.append(sb.fee
 decoded.append(sb.finish())
 check("streaming base64", decoded == original)
 check("addresses", MIME.parseAddresses("\"Doe, Jane\" <jane@x.com>, bob@y.com").map { $0.email } == ["jane@x.com", "bob@y.com"])
+// Encoded display names are decoded per address: a decoded comma or quote must not split one address.
+let encFrom = MIME.parseHeaders(Data("From: =?UTF-8?Q?M=C3=BCller=2C_Hans?= <hans@x.de>\r\nTo: =?UTF-8?B?RG9lLCAiSiI=?= <j@x.com>, bob@y.com\r\n".utf8))
+check("encoded name with comma stays one address", MIME.parseAddresses(encFrom["from"] ?? "").map { $0.email } == ["hans@x.de"]
+      && MIME.parseAddresses(encFrom["from"] ?? "").first?.name == "Müller, Hans")
+check("encoded name with quotes round-trips", MIME.parseAddresses(encFrom["to"] ?? "").map { $0.email } == ["j@x.com", "bob@y.com"]
+      && MIME.parseAddresses(encFrom["to"] ?? "").first?.name == "Doe, \"J\"")
+check("escaped quote inside a quoted name", MIME.parseAddresses("\"Smith \\\"Bob, Jr\" <b@x.com>, c@y.com").map { $0.email } == ["b@x.com", "c@y.com"])
+// A character split across two adjacent encoded words (bytes C3 | BC) is joined before decoding.
+check("split multibyte encoded words", MIME.decodeEncodedWords("=?UTF-8?Q?M=C3?= =?UTF-8?Q?=BCller?=") == "Müller"
+      && MIME.decodeEncodedWords("=?UTF-8?B?w7w=?= x =?ISO-8859-1?Q?=FC?=") == "ü x ü")
+// A MIME part with no headers starts with its empty line; its first paragraph is body, not headers.
+let noHeaderPart = try! EMLDocument.parse(Data("From: a@b.com\r\nContent-Type: multipart/mixed; boundary=zz\r\n\r\n--zz\r\n\r\nHello\r\n\r\nWorld\r\n--zz--\r\n".utf8))
+check("headerless part keeps its first paragraph", noHeaderPart.bodies().text == "Hello\r\n\r\nWorld")
+let plainLongSubject = try! MessageBuilder.build(OutgoingMessage(from: EmailAddress(name: "", email: "a@b.com"), to: [EmailAddress(name: "", email: "c@d.com")], cc: [], bcc: [], subject: Array(repeating: "word", count: 300).joined(separator: " "), textBody: "x", htmlBody: "x", inReplyTo: nil, references: nil, attachments: []))
+check("long plain subject folded", String(decoding: plainLongSubject, as: UTF8.self).components(separatedBy: "\r\n").allSatisfy { $0.utf8.count <= 100 }
+      && MIME.parseHeaders(plainLongSubject)["subject"]?.components(separatedBy: " ").count == 300)
 check("mailto address cleaned", MIME.parseAddresses("<mailto:customer.service@hdfc.bank.in.>, Bank <MAILTO:a@b.com?subject=x>").map { $0.email } == ["customer.service@hdfc.bank.in", "a@b.com"])
 check("plain from html", MIME.plainText(fromHTML: "<style>p{}</style><p>Hello&nbsp;<b>world</b> &amp; co</p>") == "Hello world & co")
 check("literal length", IMAPParser.literalLength(Array("BODY[] {42}".utf8)) == 42 && IMAPParser.literalLength(Array("x {7+}".utf8)) == 7)
@@ -287,6 +303,12 @@ check("quote keeps only https images", quoted.contains("https://ok.example/b.png
 let display = HTMLPrep.prepare(html: #"<p>a</p><script>alert(1)</script><iframe src="https://x"></iframe><img src="https://h/i.png" width="1" height="1"><img src="https://h/real.png">"#, text: nil)
 check("display strips active content", !display.html.contains("<script") && !display.html.contains("<iframe")
       && display.trackersRemoved == 1 && display.remote.count == 1 && display.html.contains("Content-Security-Policy"))
+// The policy must come before anything the sender wrote: a "<head>" inside a comment or <title> is not a head.
+let hiddenHead = HTMLPrep.prepare(html: "<!-- <head> --><html><head><title><head></title></head><body>hi</body></html>", text: nil).html
+check("CSP precedes sender markup", (hiddenHead.range(of: "Content-Security-Policy")?.lowerBound ?? hiddenHead.endIndex)
+      < (hiddenHead.range(of: "<!--")?.lowerBound ?? hiddenHead.startIndex))
+let withDoctype = HTMLPrep.prepare(html: "<?xml version=\"1.0\"?>\n<!DOCTYPE html PUBLIC \"x\">\n<html><head></head><body>hi</body></html>", text: nil).html
+check("leading doctype stays first", withDoctype.hasPrefix("<?xml version=\"1.0\"?>\n<!DOCTYPE html PUBLIC \"x\"><head><meta http-equiv=\"Content-Security-Policy\""))
 
 // Save As / open .eml (F-17): what the builder writes, the reader reads back — text, HTML and attachments.
 let attURL = scratchDir("misc").appendingPathComponent("macmail-eml-test.pdf")
@@ -393,6 +415,13 @@ MainActor.assumeIsolated {
         store.restore(snap)
         check("undo restores row+body+index", store.rows(ids: [id]).count == 1 && store.body(id) != nil
               && store.search(SearchQuery.parse("forecast")).count == 1 && store.search(SearchQuery.parse("budget")).count == 1)
+        // A split Undo: a snapshot with a committed message taken out restores nothing for it.
+        store.deleteMessages(ids: [id])
+        store.restore(store.snapshot(ids: []).removing(ids: [id]))
+        store.restore(snap.removing(ids: [id]))
+        check("split undo leaves committed rows out", store.rows(ids: [id]).isEmpty && store.body(id) == nil)
+        store.restore(snap.removing(ids: [id + 1_000_000]))
+        check("split undo keeps the rest", store.rows(ids: [id]).count == 1 && store.body(id) != nil)
     }
     // B-14: deleting an account leaves no FTS rows or contacts behind.
     store.deleteAccount("acc")

@@ -481,16 +481,16 @@ final class SidebarViewController: NSViewController, NSOutlineViewDataSource, NS
 
     @objc private func renameFolder(_ sender: NSMenuItem) {
         guard let id = (sender.representedObject as? NSNumber)?.int64Value, let f = MailService.shared.store.folder(id),
-              let e = MailService.shared.engine(f.accountID) else { return }
+              MailService.shared.engine(f.accountID) != nil else { return }
         let leaf = f.path.components(separatedBy: f.delimiter).last ?? f.name
         ask("Rename “\(f.name)”", value: leaf, button: "Rename") { [weak self] name in
-            self?.run("Renaming the folder") { try await e.renameFolder(f, to: name) }
+            self?.run("Renaming the folder") { try await MailService.shared.renameFolder(f, to: name) }
         }
     }
 
     @objc private func deleteFolder(_ sender: NSMenuItem) {
         guard let id = (sender.representedObject as? NSNumber)?.int64Value, let f = MailService.shared.store.folder(id),
-              let e = MailService.shared.engine(f.accountID), let w = view.window else { return }
+              MailService.shared.engine(f.accountID) != nil, let w = view.window else { return }
         let alert = NSAlert()
         alert.messageText = "Delete the folder “\(f.name)”?"
         alert.informativeText = "The folder and every message in it are deleted from the server. This can't be undone."
@@ -499,7 +499,7 @@ final class SidebarViewController: NSViewController, NSOutlineViewDataSource, NS
         alert.buttons.first?.hasDestructiveAction = true
         alert.beginSheetModal(for: w) { [weak self] r in
             guard r == .alertFirstButtonReturn else { return }
-            self?.run("Deleting the folder") { try await e.deleteFolder(f) }
+            self?.run("Deleting the folder") { try await MailService.shared.deleteFolder(f) }
         }
     }
 

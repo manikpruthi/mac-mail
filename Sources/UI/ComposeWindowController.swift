@@ -52,6 +52,9 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
     private var references: String?
     private var replyRow: MessageRow?
     private var draftRow: MessageRow?
+    /// True while `draftRow` is the safety copy of a failed send of a message that had no draft before:
+    /// "Don't Save" then removes it, as it would have left nothing behind without the failed send.
+    private var draftIsSafetyCopyOnly = false
     private var dirty = false
     private var sentOrDiscarded = false
     private var pendingSendID: UUID?
@@ -624,6 +627,8 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
         }
         removeInlineTokens()
         undo?.endUndoGrouping()
+        let failed = cids.indices.filter { images[$0] == nil }.count
+        if failed > 0 { missingAttachments += Array(repeating: "Image in the message text", count: failed) }
     }
 
     /// Removes any token still left over, undoably.
@@ -777,6 +782,7 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
             defer { self?.pipelineEnded() }
             var used = Set<String>()
             var urls: [URL] = []
+            var failed: [String] = []
             for p in parts {
                 if Task.isCancelled { return }
                 let url = dir.appendingPathComponent(PreviewViewController.uniqueName(p.suggestedFilename, used: &used))
@@ -784,12 +790,20 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
                     try await engine.download(messageID: d.id, part: p, to: url)
                     urls.append(url)
                 } catch {
-                    self?.status.stringValue = "Couldn't fetch \(p.suggestedFilename)"
+                    failed.append(p.suggestedFilename)
                 }
             }
-            guard !Task.isCancelled else { return }
-            self?.addAttachments(urls)
-            if self?.status.stringValue.hasPrefix("Fetching") == true { self?.status.stringValue = "" }
+            guard !Task.isCancelled, let self else { return }
+            self.addAttachments(urls)
+            if self.status.stringValue.hasPrefix("Fetching") { self.status.stringValue = "" }
+            // An attachment that didn't arrive is recorded, not just mentioned: Send asks before going
+            // without it, and saving keeps the draft that still has it.
+            if !failed.isEmpty {
+                self.missingAttachments += failed
+                self.status.stringValue = failed.count == 1 ? "Couldn't fetch \(failed[0])"
+                    : "Couldn't fetch \(failed.count) attachments"
+                self.status.textColor = .systemRed
+            }
         }
     }
 
@@ -889,7 +903,7 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
         if total > 25 * 1_048_576 {
             status.stringValue = "Attachments total \(MIME.formatSize(total)) — Gmail's limit is 25 MB."
             status.textColor = .systemRed
-        } else if status.textColor == .systemRed {
+        } else if status.textColor == .systemRed, missingAttachments.isEmpty {
             status.stringValue = ""
             status.textColor = .secondaryLabelColor
         }
@@ -921,6 +935,23 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
     private func addresses(_ field: NSTokenField) -> [EmailAddress] {
         let tokens = (field.objectValue as? [Any])?.compactMap { $0 as? String } ?? [field.stringValue]
         return tokens.flatMap { MIME.parseAddresses($0) }.filter { $0.email.contains("@") }
+    }
+
+    /// What was typed in To, Cc or Bcc that can't be sent to: a bare name, an address with a space or
+    /// no domain. `addresses` and the message builder leave these out, so Send has to refuse them.
+    private func unusableRecipients() -> [String] {
+        commitEditing()
+        var out: [String] = []
+        for field in [toField, ccField, bccField] {
+            let tokens = (field.objectValue as? [Any])?.compactMap { $0 as? String } ?? [field.stringValue]
+            for token in tokens where !token.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                let parsed = MIME.parseAddresses(token)
+                if parsed.isEmpty || parsed.contains(where: { !MailSafety.isValidAddrSpec($0.email) || !$0.email.contains(".") }) {
+                    out.append(token.trimmingCharacters(in: .whitespacesAndNewlines))
+                }
+            }
+        }
+        return out
     }
 
     private func buildMessage() -> OutgoingMessage? {
@@ -1037,13 +1068,15 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
             alert("Choose a From account before sending.")
             return
         }
-        if message.allRecipients.isEmpty {
-            alert("Add at least one recipient.")
+        // Anything typed that isn't a complete address stops the send: dropping it quietly would
+        // deliver the message to everyone else and leave that person out.
+        if let bad = unusableRecipients().first {
+            alert("Check the address “\(bad)”.",
+                  info: "It isn't a complete email address. Correct or remove it, then send again.")
             return
         }
-        let invalid = (addresses(toField) + addresses(ccField) + addresses(bccField)).filter { !$0.email.contains(".") }
-        if !invalid.isEmpty {
-            alert("Check the address \(invalid[0].email).")
+        if message.allRecipients.isEmpty {
+            alert("Add at least one recipient.")
             return
         }
         if message.subject.trimmingCharacters(in: .whitespaces).isEmpty {
@@ -1077,8 +1110,17 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
                 main?.showToast("You're offline — message saved to the Outbox and will be sent automatically")
                 self.discardAutosave()
                 self.cleanUpAndForget()
-            case .failed(let error):
+            case .failed(let error, let safetyDraft):
+                // The safety copy is now this message's draft: the next send or save replaces it
+                // instead of leaving a duplicate in Drafts.
+                if let safetyDraft {
+                    self.draftIsSafetyCopyOnly = self.draftRow == nil || self.draftIsSafetyCopyOnly
+                    self.draftRow = safetyDraft
+                }
                 self.sentOrDiscarded = false
+                // The autosave record must name the new draft, or a crash now would bring back a
+                // composer that no longer replaces it.
+                self.autosaveNow()
                 self.status.stringValue = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
                 self.status.textColor = .systemRed
                 self.showWindow(nil)
@@ -1130,6 +1172,7 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
             case .alertFirstButtonReturn: self.saveDraftAndClose()
             case .alertSecondButtonReturn:
                 self.sentOrDiscarded = true
+                self.discardSafetyCopy()
                 self.discardAutosave()
                 self.window?.close()
             default: break
@@ -1139,6 +1182,14 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
     }
 
     private func saveDraftAndClose() { saveDraft { _ in } }
+
+    /// "Don't Save" on a message whose only draft is the safety copy of a failed send: the copy goes too.
+    private func discardSafetyCopy() {
+        guard draftIsSafetyCopyOnly, let row = draftRow, let engine = MailService.shared.engine(row.accountID) else { return }
+        MailService.shared.discardDraft(row, engine: engine)
+        draftRow = nil
+        draftIsSafetyCopyOnly = false
+    }
 
     /// Saves the draft (server APPEND), then runs `done` with whether it saved. Used by the close prompt
     /// and, at quit time, to keep the app alive until the save lands.
@@ -1175,6 +1226,8 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
         sentOrDiscarded = true
         window?.orderOut(nil)
         let old = draftRow
+        // A draft whose attachments or images couldn't all be loaded back is not a full replacement.
+        let complete = missingAttachments.isEmpty
         let bccLine = addresses(bccField).map { $0.full }.joined(separator: ", ")
         Task { [weak self] in
             guard let self else { done(false); return }
@@ -1189,11 +1242,16 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
                 let hasContent = !message.textBody.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                     || !message.attachments.isEmpty
                 var removedOld = true
-                if let old, hasContent, newID != nil || engine.isDemo {
+                if let old, hasContent, complete, newID != nil || engine.isDemo {
                     removedOld = MailService.shared.discardDraft(old, engine: engine)
                 }
                 // A failed cleanup shows its own message; "Draft saved" must not replace it.
-                if removedOld { (NSApp.delegate as? AppDelegate)?.mainWindow?.showToast("Draft saved") }
+                if old != nil, !complete {
+                    (NSApp.delegate as? AppDelegate)?.mainWindow?.showToast(
+                        "Draft saved. The earlier draft was kept: some of its attachments couldn't be loaded.")
+                } else if removedOld {
+                    (NSApp.delegate as? AppDelegate)?.mainWindow?.showToast("Draft saved")
+                }
                 self.discardAutosave()
                 self.cleanUpAndForget()
                 done(true)
@@ -1227,6 +1285,7 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
             case .alertFirstButtonReturn: self.saveDraft(done)
             case .alertSecondButtonReturn:
                 self.sentOrDiscarded = true
+                self.discardSafetyCopy()
                 self.discardAutosave()
                 done(true)
             default: done(false)
