@@ -56,6 +56,9 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
     /// "Don't Save" then removes it, as it would have left nothing behind without the failed send.
     private var draftIsSafetyCopyOnly = false
     private var dirty = false
+    /// True only while a reopened draft's own inline images are put back into the text, so restoring
+    /// them is not treated as an edit.
+    private var restoringDraftContent = false
     private var sentOrDiscarded = false
     private var pendingSendID: UUID?
     private var tempDirs: [URL] = []
@@ -429,7 +432,7 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
             currentSignature = MailService.shared.account(d.accountID)?.signature
             // A saved draft's attachments come back too; Send/Save wait until they're downloaded, and the
             // old draft is only replaced once the new one (with them) is on the server (B-01).
-            fetchMessageAttachments(d)
+            fetchMessageAttachments(d, restoring: true)
             window?.title = d.subject.isEmpty ? "Draft" : d.subject
             window?.makeFirstResponder(textView)
         case .restored(let r):
@@ -641,6 +644,10 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
     /// fetched) as a single undoable edit (C-22).
     private func replaceInlineTokens(_ cids: [(cid: String, width: CGFloat?)], with images: [Int: NSTextAttachment]) {
         guard let storage = textView.textStorage else { return }
+        // Synchronous, so the flag covers only these edits: anything the user types while the images were
+        // downloading still marks the composer dirty.
+        restoringDraftContent = true
+        defer { restoringDraftContent = false }
         let undo = textView.undoManager
         undo?.beginUndoGrouping()
         // Images that couldn't be fetched and whose place in the text still exists. One the user deleted
@@ -835,7 +842,10 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
         } else {
             quotedHTML = "<div class=\"gmail_quote\"><div>\(headerHTML)</div><br>\(originalHTML)</div>"
         }
-        let plain = body?.text ?? MIME.plainText(fromHTML: body?.html ?? "", limit: 200_000)
+        // An empty or whitespace-only text/plain alternative is not the original. ?? alone keeps it, and
+        // the outgoing plain part would lose everything the HTML part still quotes.
+        let plain = body?.text.flatMap { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0 }
+            ?? MIME.plainText(fromHTML: body?.html ?? "", limit: 200_000)
         quotedText = header + "\n" + (blockquote ? plain.split(separator: "\n", omittingEmptySubsequences: false).map { "> " + $0 }.joined(separator: "\n") : plain)
         includeOriginal.isHidden = false
         includeOriginal.title = blockquote ? "Include original message" : "Include forwarded message"
@@ -843,7 +853,8 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
 
     /// Downloads a message's attachments (forward, or a saved draft being reopened). Send stays disabled
     /// until the pipeline drains, and the task is cancelled with the window (V2-09/V2-10).
-    private func fetchMessageAttachments(_ d: MessageDetail) {
+    /// `restoring` marks the draft case: the files are the draft's own, not something the user added.
+    private func fetchMessageAttachments(_ d: MessageDetail, restoring: Bool = false) {
         guard let parts = d.structure?.attachments(), !parts.isEmpty, let engine = MailService.shared.engine(d.accountID) else { return }
         status.stringValue = "Fetching \(parts.count) attachment\(parts.count == 1 ? "" : "s")…"
         let dir = AppPaths.tempDir("forward")
@@ -865,7 +876,7 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
                 }
             }
             guard !Task.isCancelled, let self else { return }
-            self.addAttachments(urls)
+            self.addAttachments(urls, restoring: restoring)
             if self.status.stringValue.hasPrefix("Fetching") { self.status.stringValue = "" }
             // An attachment that didn't arrive is recorded, not just mentioned: Send asks before going
             // without it, and saving keeps the draft that still has it.
@@ -900,7 +911,7 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
 
     // MARK: Attachments
 
-    func addAttachments(_ urls: [URL]) {
+    func addAttachments(_ urls: [URL], restoring: Bool = false) {
         for url in urls {
             var isDir: ObjCBool = false
             guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir) else { continue }
@@ -919,6 +930,9 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
         }
         refreshAttachments()
         Debug.log("compose attachments: \(attachments.map { $0.filename })")
+        // A reopened draft's own attachments come back from the server, so bringing them back is not an
+        // edit: marking it dirty would ask to save a draft nobody touched, and autosave it for recovery.
+        guard !restoring else { return }
         dirty = true
         scheduleAutosave()
     }
@@ -1410,8 +1424,39 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
             out.append((Self.composersNeedingSave.contains(self) ? "PASS" : "FAIL") + " dirty composer is asked on quit")
             out += formatSelfTest()
             out += inlineImageSelfTest()
+            out += draftAndQuoteSelfTest()
             done(out)
         }
+    }
+
+    /// BUG-01: bringing a reopened draft's own attachments back is not an edit. BUG-03: a reply whose
+    /// source has an empty text/plain alternative still quotes the original in the outgoing plain part.
+    private func draftAndQuoteSelfTest() -> [String] {
+        var out: [String] = []
+        let wasDirty = dirty
+        let dir = AppPaths.tempDir("selftest-restore")
+        tempDirs.append(dir)
+        let probe = dir.appendingPathComponent("restore-probe.txt")
+        try? Data("x".utf8).write(to: probe)
+        dirty = false
+        addAttachments([probe], restoring: true)
+        out.append((!dirty ? "PASS" : "FAIL") + " restoring a draft's own attachments is not an edit (dirty=\(dirty))")
+        addAttachments([probe])
+        out.append((dirty ? "PASS" : "FAIL") + " a file the user attached is an edit (dirty=\(dirty))")
+        attachments.removeAll { $0.url == probe }
+        attachmentSizes[probe] = nil
+        refreshAttachments()
+
+        let d = MessageDetail(id: -1, folderID: -1, accountID: account?.id ?? "", uid: 1, date: Date(), flags: [],
+                              subject: "Q4 budget", from: EmailAddress(name: "Priya", email: "priya@studio.example"),
+                              toList: "manik@example.com", ccList: "", replyTo: "", messageIDHeader: "<probe@example.com>",
+                              references: "", listUnsubscribe: "", structure: nil, size: 0, folderRole: .inbox)
+        setQuote(d, StoredBody(html: "<p>The original budget text</p>", text: ""), header: "On a date, Priya wrote:")
+        let plain = buildMessage()?.textBody ?? ""
+        out.append((plain.contains("The original budget text") ? "PASS" : "FAIL")
+                   + " reply quotes the original in text/plain when the source's plain part is empty")
+        dirty = wasDirty
+        return out
     }
 
     /// Selects a word, sets Georgia 18 bold from the format bar, and checks the bar and the sent HTML follow.
@@ -1570,8 +1615,10 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
     }
 
     func textDidChange(_ notification: Notification) {
-        dirty = true
-        scheduleAutosave()
+        if !restoringDraftContent {
+            dirty = true
+            scheduleAutosave()
+        }
         formatBar.refresh()
     }
 

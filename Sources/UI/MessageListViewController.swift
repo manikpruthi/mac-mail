@@ -28,6 +28,8 @@ final class MessageListViewController: NSViewController, NSOutlineViewDataSource
     private var allCaughtUp = false
     private var nodes: [ListNode] = []
     private(set) var source: MailSource = .unified
+    /// The view the outline's expansion belongs to, so switching folders or queries starts collapsed.
+    private var expandedSource: MailSource?
     private(set) var grouped = false
     private var searchRows: [MessageRow] = []
     /// Message ids the last finished server search contributed; re-merged on live refreshes so
@@ -149,6 +151,14 @@ final class MessageListViewController: NSViewController, NSOutlineViewDataSource
         filterCollapsed.isActive = true
         view = root
         NotificationCenter.default.addObserver(self, selector: #selector(dataChanged(_:)), name: .mailDataChanged, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(foldersChanged), name: .mailFoldersChanged, object: nil)
+    }
+
+    /// A rename keeps the folder id, so the sidebar re-selects the same row without telling the list:
+    /// the rows are still right but the header would keep the old name until the next reload.
+    @objc private func foldersChanged() {
+        guard case .folder(let id) = source, let folder = MailService.shared.store.folder(id) else { return }
+        titleLabel.stringValue = folder.name
     }
 
     // MARK: Loading
@@ -347,12 +357,18 @@ final class MessageListViewController: NSViewController, NSOutlineViewDataSource
         if keepSelection {
             previousFocus = focusedRow?.id
             previousCount = selectedRows.count
+        }
+        // Expansion is independent of the selection: a delete reloads with keepSelection: false and must
+        // not collapse every open thread. A different view's expansion never carries over.
+        let sameView = expandedSource == source
+        expandedSource = source
+        if sameView || keepSelection {
             for r in 0..<outline.numberOfRows {
                 guard let n = outline.item(atRow: r) as? ListNode else { continue }
                 // Keyed by conversation, not by the header message, which changes when newer mail arrives.
-                if n.children != nil && outline.isItemExpanded(n) { expandedThreads.insert(Self.threadKey(n.row)) }
+                if sameView, n.children != nil, outline.isItemExpanded(n) { expandedThreads.insert(Self.threadKey(n.row)) }
                 // Only rows that were actually selected are restored (Y-r-list-1).
-                guard outline.selectedRowIndexes.contains(r) else { continue }
+                guard keepSelection, outline.selectedRowIndexes.contains(r) else { continue }
                 if outline.parent(forItem: n) != nil { selectedMessages.insert(n.row.id) }
                 else { selectedThreads.insert(n.row.id) }
             }
@@ -780,6 +796,17 @@ final class MessageListViewController: NSViewController, NSOutlineViewDataSource
 
     var selectedIndex: Int { outline.selectedRow }
 
+    /// The first visible row holding one of `rows`. After a removal the cursor belongs at the top of the
+    /// removed range: `selectedRow` is the last row of a multi-selection and would overshoot it.
+    func firstIndex(of rows: [MessageRow]) -> Int? {
+        let ids = Set(rows.map { $0.id })
+        for r in 0..<outline.numberOfRows {
+            guard let n = outline.item(atRow: r) as? ListNode else { continue }
+            if ids.contains(n.row.id) { return r }
+        }
+        return nil
+    }
+
     /// Messages just below (and one above) the selection — the ones you're likely to open next.
     func neighborRows(of row: MessageRow) -> [MessageRow] {
         let i = outline.selectedRow
@@ -960,6 +987,70 @@ final class MessageListViewController: NSViewController, NSOutlineViewDataSource
         move.image = NSImage(systemSymbolName: "folder", accessibilityDescription: nil)
         move.submenu = w.moveMenu(for: rows)
         menu.addItem(move)
+    }
+
+    // MARK: Demo self-test
+
+    /// MAC_MAIL_DEMO_SELFTEST: a delete keeps open threads expanded (BUG-02) and leaves the cursor at the
+    /// top of the removed range (BUG-04); renaming the folder being viewed refreshes the header (BUG-05).
+    /// The rows it moves are put back, so the demo mailbox is left as it was found.
+    func demoSelfTest() -> [String] {
+        guard let w = (NSApp.delegate as? AppDelegate)?.mainWindow,
+              case .folder(let fid) = source, let folder = MailService.shared.store.folder(fid) else {
+            return ["FAIL list self-test needs a folder view"]
+        }
+        let store = MailService.shared.store
+        var out: [String] = []
+        setGrouped(false)
+        reload(keepSelection: false)
+        guard outline.numberOfRows >= 6 else { return ["FAIL list self-test needs six rows"] }
+        let ids = (0..<outline.numberOfRows).compactMap { (outline.item(atRow: $0) as? ListNode)?.row.id }
+        let snap = store.snapshot(ids: ids)
+        defer { _ = store.restore(snap); reload(keepSelection: false) }
+
+        outline.selectRowIndexes(IndexSet(integersIn: 2...4), byExtendingSelection: false)
+        let block = selectedRows
+        let top = firstIndex(of: block) ?? -1
+        w.moveRows(block, to: .trash)
+        out.append((top == 2 && selectedIndex == 2 ? "PASS" : "FAIL")
+                   + " block delete leaves the cursor at the deletion site (top=\(top) cursor=\(selectedIndex))")
+        // Put the block back: two of its messages belong to the conversation the next check expands.
+        _ = store.restore(snap)
+
+        setGrouped(true)
+        reload(keepSelection: false)
+        guard let thread = nodes.first(where: { $0.isThread }) else {
+            out.append("FAIL list self-test needs a conversation")
+            setGrouped(false)
+            return out
+        }
+        outline.expandItem(thread)
+        let key = Self.threadKey(thread.row)
+        let standalone = (0..<outline.numberOfRows).first { r in
+            guard let n = outline.item(atRow: r) as? ListNode else { return false }
+            return n.children == nil && outline.parent(forItem: n) == nil && n.row.id != thread.row.id
+        }
+        if let r = standalone, let row = (outline.item(atRow: r) as? ListNode)?.row {
+            outline.selectRowIndexes([r], byExtendingSelection: false)
+            w.moveRows([row], to: .trash)
+            // reloadData rebuilds the nodes, so the thread is found again by conversation, not by identity.
+            let open = nodes.contains { $0.isThread && Self.threadKey($0.row) == key && outline.isItemExpanded($0) }
+            out.append((open ? "PASS" : "FAIL") + " deleting another message keeps the open thread expanded")
+        } else {
+            out.append("FAIL list self-test needs a standalone message")
+        }
+        setGrouped(false)
+
+        if let f = store.addFolder(account: folder.accountID, path: "Selftest-Rename", name: "Work", role: .none, delimiter: "/") {
+            show(.folder(f.id))
+            let renamed = store.renameFolder(f.id, path: "Selftest-Renamed", name: "Projects")
+            NotificationCenter.default.post(name: .mailFoldersChanged, object: nil)
+            out.append((renamed && titleLabel.stringValue == "Projects" ? "PASS" : "FAIL")
+                       + " renaming the open folder refreshes the header (\(titleLabel.stringValue))")
+            _ = store.deleteFolder(f.id)
+            show(.folder(fid))
+        }
+        return out
     }
 }
 

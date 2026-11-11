@@ -583,7 +583,9 @@ final class MainWindowController: NSWindowController, NSToolbarDelegate, NSSearc
 
     private func move(_ rows: [MessageRow], to target: MailService.MoveTarget) {
         guard !rows.isEmpty else { NSSound.beep(); return }
-        let index = max(0, list.selectedIndex)
+        // The cursor goes to the top of the removed range. selectedIndex is the LAST row of a
+        // multi-selection, so after a block delete it lands that many rows past the deletion site.
+        let index = list.firstIndex(of: rows) ?? max(0, list.selectedIndex)
         // Only move the cursor when the open/selected message is the one that left the list.
         let selectedIDs = Set(list.selectedRows.map { $0.id })
         let touchesSelection = rows.contains { selectedIDs.contains($0.id) }

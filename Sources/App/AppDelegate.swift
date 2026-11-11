@@ -602,6 +602,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             let f = mw?.frame.size ?? .zero
             log((f.width >= 800 && f.height >= 600 ? "PASS" : "FAIL") + " message window opens full size (\(Int(f.width))x\(Int(f.height)))")
             mw?.close()
+            w.list.demoSelfTest().forEach(log)
             ComposeWindowController.open(.new)
         }
         step(2.5) {

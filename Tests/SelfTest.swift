@@ -132,6 +132,23 @@ let built = String(data: (try? MessageBuilder.build(msg)) ?? Data(), encoding: .
 check("builder headers", built.contains("Subject: =?UTF-8?B?") && built.contains("To: =?UTF-8?B?") && built.contains("multipart/alternative"))
 check("dot stuffing", String(data: SMTPClient.dotStuffed(Data("a\r\n.b\r\n".utf8)), encoding: .utf8) == "a\r\n..b\r\n")
 
+// A draft is routinely saved before any address is typed, so an empty envelope must build; the send
+// refuses it instead. Bcc still never travels in the MIME.
+let emptyEnvelope = OutgoingMessage(from: EmailAddress(name: "Manik", email: "m@example.com"), to: [], cc: [], bcc: [],
+                                    subject: "Half-written", textBody: "so far", htmlBody: "<p>so far</p>",
+                                    inReplyTo: nil, references: nil, attachments: [])
+let draftMIME = String(data: (try? MessageBuilder.build(emptyEnvelope)) ?? Data(), encoding: .utf8) ?? ""
+check("draft with no recipients builds", !draftMIME.isEmpty && draftMIME.contains("Subject: Half-written")
+      && !draftMIME.contains("\r\nTo:") && !draftMIME.contains("\r\nCc:") && !draftMIME.contains("\r\nBcc:"))
+var bccOnly = emptyEnvelope
+bccOnly.bcc = [EmailAddress(name: "", email: "hidden@example.com")]
+let bccMIME = String(data: (try? MessageBuilder.build(bccOnly)) ?? Data(), encoding: .utf8) ?? ""
+check("bcc-only draft builds, Bcc stays out of the MIME", !bccMIME.isEmpty && !bccMIME.contains("hidden@example.com"))
+check("smtp refuses an empty envelope", (try? SMTPClient.validateAddresses(from: "m@example.com", recipients: [])) == nil)
+var badSender = emptyEnvelope
+badSender.from = EmailAddress(name: "", email: "a\r\nBcc: evil@x.com")
+check("builder still refuses an invalid sender", (try? MessageBuilder.build(badSender)) == nil)
+
 // Search parsing
 let sq1 = SearchQuery.parse("from: divya")
 check("from with space", sq1.from == ["divya"] && sq1.words.isEmpty)

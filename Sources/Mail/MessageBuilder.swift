@@ -33,9 +33,10 @@ enum MessageBuilder {
     static func build(_ m: OutgoingMessage, date: Date = Date()) throws -> Data {
         let to = m.to.filter { MailSafety.isValidAddrSpec($0.email) }
         let cc = m.cc.filter { MailSafety.isValidAddrSpec($0.email) }
-        let bcc = m.bcc.filter { MailSafety.isValidAddrSpec($0.email) }
-        guard MailSafety.isValidAddrSpec(m.from.email), !(to.isEmpty && cc.isEmpty && bcc.isEmpty) else {
-            throw NetError.protocolError("no valid recipients")
+        // A draft is routinely saved before any address is typed, so an empty envelope is not a build
+        // failure. SMTPClient.validateAddresses refuses it where it matters: at the send.
+        guard MailSafety.isValidAddrSpec(m.from.email) else {
+            throw NetError.protocolError("invalid sender address")
         }
         var out = ""
         let domain = m.from.email.split(separator: "@").last.map(String.init) ?? "macmail.local"

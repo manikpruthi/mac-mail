@@ -20,9 +20,11 @@ enum SMTPClient {
     /// The final "." gets extra time per megabyte uploaded: servers scan large messages before answering.
     static func dataDeadline(bytes: Int) -> TimeInterval { 120 + Double(bytes) / 1_048_576 * 10 }
 
-    /// Refuses addresses that could break out of the envelope commands (injection, splitting).
+    /// Refuses addresses that could break out of the envelope commands (injection, splitting), and an
+    /// empty envelope: with no RCPT TO the message would be accepted by some servers and delivered nowhere.
     static func validateAddresses(from: String, recipients: [String]) throws {
         guard MailSafety.isValidAddrSpec(from) else { throw NetError.protocolError("invalid sender address") }
+        guard !recipients.isEmpty else { throw NetError.protocolError("no valid recipients") }
         guard recipients.allSatisfy({ MailSafety.isValidAddrSpec($0) }) else {
             throw NetError.protocolError("invalid recipient address")
         }
