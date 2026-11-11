@@ -91,6 +91,20 @@ let search = IMAPParser.parse(parts(["* SEARCH 2 84 882"]))
 check("search values", search.values.compactMap { $0.number } == [2, 84, 882])
 let list = IMAPParser.parse(parts(["* LIST (\\HasNoChildren \\Sent) \"/\" \"[Gmail]/Sent Mail\""]))
 check("list parse", list.values.count == 4 && list.values[3].text == "[Gmail]/Sent Mail")
+// A server may leave the special-use attributes out of LIST (RFC 6154 requires them only on request).
+// Gmail's system folders must still get their roles: with none, saving a draft finds no Drafts folder.
+let gmailRoles: [String: FolderRole] = ["INBOX": .inbox, "[Gmail]/Drafts": .drafts, "[Gmail]/Sent Mail": .sent,
+                                        "[Gmail]/All Mail": .all, "[Gmail]/Spam": .spam, "[Gmail]/Trash": .trash,
+                                        "[Gmail]/Starred": .starred, "[Gmail]/Important": .important]
+check("Gmail roles without special-use attributes",
+      gmailRoles.allSatisfy { ListedFolder(path: $0.key, delimiter: "/", attributes: ["\\HasNoChildren"]).role == $0.value })
+check("Gmail parent stays roleless",
+      ListedFolder(path: "[Gmail]", delimiter: "/", attributes: ["\\Noselect", "\\HasChildren"]).role == FolderRole.none)
+check("a user folder under [Gmail] is not a system folder",
+      ListedFolder(path: "[Gmail]/Drafts of mine", delimiter: "/", attributes: []).role == FolderRole.none)
+check("Google Mail locale", ListedFolder(path: "[Google Mail]/Drafts", delimiter: "/", attributes: []).role == .drafts)
+check("special-use attributes still win",
+      ListedFolder(path: "Mail/Drafts", delimiter: "/", attributes: ["\\Drafts"]).role == .drafts)
 check("mutf7 roundtrip", MailboxName.decode(MailboxName.encode("Rechnungen/März & Co")) == "Rechnungen/März & Co")
 check("mutf7 known", MailboxName.encode("台北") == "&U,BTFw-")
 check("uid set", imapUIDSet([1, 2, 3, 7, 9, 10]) == "1:3,7,9:10")
@@ -1067,6 +1081,19 @@ final class FakeIMAP: ByteTransport, @unchecked Sendable {
             for u in uids(words[2]) where deleted[u] == true { deleted[u] = nil }
         } else if cmd == "EXPUNGE" {
             for (u, d) in deleted where d { deleted[u] = nil }
+        } else if cmd.hasPrefix("LIST ") {
+            // RFC 6154: the special-use attributes come back only when the client asks for them.
+            // "Mail/Drafts" has no name-based fallback, so its role can only come from the attribute.
+            let asked = cmd.contains("SPECIAL-USE")
+            let mailboxes: [(String, String)] = [("INBOX", ""), ("Mail/Drafts", "\\Drafts"),
+                                                 ("Mail/Sent", "\\Sent"), ("[Gmail]/Trash", "\\Trash")]
+            for (path, use) in mailboxes {
+                let attrs = asked && !use.isEmpty ? "\\HasNoChildren \(use)" : "\\HasNoChildren"
+                out += "* LIST (\(attrs)) \"/\" \"\(path)\"\r\n"
+            }
+            if cmd.contains("STATUS (UNSEEN)") {
+                for (path, _) in mailboxes { out += "* STATUS \"\(path)\" (UNSEEN 0)\r\n" }
+            }
         } else if cmd == "IDLE" {
             idleTag = tag
             return (untaggedBeforeIdle ? "* 4 EXISTS\r\n" : "") + "+ idling\r\n"
@@ -1345,6 +1372,37 @@ MainActor.assumeIsolated {
         check("delivered item is cleaned up on relaunch", Outbox(directory: dir).items.isEmpty
               && !FileManager.default.fileExists(atPath: dir.appendingPathComponent(id).path))
     } else { check("outbox item added", false) }
+}
+
+// "Couldn't save the draft": the client must ask for the special-use attributes, and a server that
+// leaves them out must still give Gmail's folders their roles.
+runAsync {
+    var out: [(String, Bool)] = []
+    func fetch(_ caps: String) async -> ([ListedFolder], [String: Int], [String]) {
+        let (c, s) = fakeClient { $0.capabilities = caps }
+        do {
+            try await c.connect()
+            let (l, counts) = try await c.listWithStatus()
+            await c.disconnect()
+            return (l, counts, s.commands)
+        } catch {
+            await c.disconnect()
+            return ([], [:], s.commands)
+        }
+    }
+
+    let both = await fetch("IMAP4rev1 SPECIAL-USE LIST-STATUS")
+    out.append(("LIST asks for SPECIAL-USE", both.2.contains { $0.contains("RETURN (SPECIAL-USE") }))
+    out.append(("the attribute gives a non-Gmail folder its role", both.0.first { $0.path == "Mail/Drafts" }?.role == .drafts))
+    out.append(("LIST-STATUS still combines the unread counts", both.1.count == 4 && both.1["INBOX"] == 0))
+
+    let noSpecialUse = await fetch("IMAP4rev1 LIST-STATUS")
+    out.append(("no SPECIAL-USE option when it isn't advertised", !noSpecialUse.2.contains { $0.contains("SPECIAL-USE") }))
+    out.append(("Gmail Trash keeps its role without the attribute", noSpecialUse.0.first { $0.path == "[Gmail]/Trash" }?.role == .trash))
+
+    let plain = await fetch("IMAP4rev1")
+    out.append(("plain LIST when neither option is advertised", plain.2.contains("LIST \"\" \"*\"")))
+    return out
 }
 
 print(failures == 0 ? "ALL PASS" : "\(failures) FAILED")

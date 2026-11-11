@@ -1365,6 +1365,10 @@ final class ComposeWindowController: NSWindowController, NSWindowDelegate, NSTok
                 self.cleanUpAndForget()
                 done(true)
             } catch {
+                // The alert is transient; without this the reason a draft couldn't be saved is nowhere
+                // on disk, and Settings ▸ Export Diagnostics Log has nothing to show for it.
+                DiagnosticsLog.record("saveDraft (\(account.email)): "
+                                      + ((error as? LocalizedError)?.errorDescription ?? error.localizedDescription))
                 self.sentOrDiscarded = false
                 self.showWindow(nil)
                 let a = NSAlert(error: error)

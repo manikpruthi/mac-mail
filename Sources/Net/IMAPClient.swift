@@ -28,6 +28,21 @@ struct ListedFolder {
         if a.contains("\\important") { return .important }
         if a.contains("\\archive") { return .archive }
         let lower = path.lowercased()
+        // Gmail names its system folders the same in every account. A server may leave the special-use
+        // attributes out of LIST — RFC 6154 only requires them when the client asks — and without this
+        // fallback Drafts, Sent and Trash all end up with no role, so saving a draft finds no folder.
+        for prefix in ["[gmail]/", "[google mail]/"] where lower.hasPrefix(prefix) {
+            switch String(lower.dropFirst(prefix.count)) {
+            case "all mail": return .all
+            case "sent mail": return .sent
+            case "drafts": return .drafts
+            case "spam": return .spam
+            case "trash": return .trash
+            case "starred": return .starred
+            case "important": return .important
+            default: break
+            }
+        }
         switch lower {
         case "sent", "sent items", "sent messages", "inbox.sent": return .sent
         case "drafts", "inbox.drafts": return .drafts
@@ -332,8 +347,12 @@ actor IMAPClient {
 
     // MARK: Commands
 
+    /// RFC 6154: the special-use attributes are only guaranteed when the client asks for them. Without
+    /// this a server is free to omit them, and no folder but INBOX gets a role.
+    private var specialUseReturn: String { capabilities.contains("SPECIAL-USE") ? " RETURN (SPECIAL-USE)" : "" }
+
     func list() async throws -> [ListedFolder] {
-        let rs = try await run("LIST \"\" \"*\"")
+        let rs = try await run("LIST \"\" \"*\"" + specialUseReturn)
         var out: [ListedFolder] = []
         for r in rs where r.isUntagged {
             guard r.values.count >= 4, r.values[0].text?.uppercased() == "LIST" else { continue }
@@ -351,8 +370,11 @@ actor IMAPClient {
     /// Folder list plus unread counts in one command where the server supports LIST-STATUS (O-07);
     /// the counts map is empty when it doesn't, and the caller falls back to STATUS per folder.
     func listWithStatus() async throws -> ([ListedFolder], [String: Int]) {
-        guard capabilities.contains("LIST-STATUS") else { return (try await list(), [:]) }
-        let rs = try await run("LIST \"\" \"*\" RETURN (STATUS (UNSEEN))")
+        var options: [String] = []
+        if capabilities.contains("SPECIAL-USE") { options.append("SPECIAL-USE") }
+        if capabilities.contains("LIST-STATUS") { options.append("STATUS (UNSEEN)") }
+        guard !options.isEmpty else { return (try await list(), [:]) }
+        let rs = try await run("LIST \"\" \"*\" RETURN (\(options.joined(separator: " ")))")
         var out: [ListedFolder] = []
         var counts: [String: Int] = [:]
         for r in rs where r.isUntagged {
